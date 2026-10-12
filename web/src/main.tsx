@@ -90,8 +90,15 @@ type MineRow = {
   zone: Zone;
   updated_at: string;
   // Each account it waits on, with that account's own reasons: the
-  // connection's account, or the user it watches.
-  waits_on: { account: string; connection_id: string; reasons: Reason[] }[];
+  // connection's account, or the user it watches; and how fresh that
+  // connection's view of it is.
+  waits_on: {
+    account: string;
+    connection_id: string;
+    reasons: Reason[];
+    synced_at: string | null;
+    stale: boolean;
+  }[];
   // The oldest last success of the connections that found it, and whether
   // any of them is stale.
   synced_at: string | null;
@@ -305,7 +312,9 @@ function age(d: Snapshot, offline: boolean, now: number): Snapshot {
   };
 }
 // The Mine view as of `now`, the same way, by the connections that found
-// each row, as `age` left them.
+// each row, as `age` left them. Each is judged by its own last success and
+// interval, so a connection that syncs less often doesn't make another's
+// view stale.
 function ageMine(
   m: MineView,
   connections: Connection[],
@@ -320,7 +329,9 @@ function ageMine(
       offline ||
       r.waits_on.some((w) => {
         const c = byId.get(w.connection_id);
-        return !c || c.schedule.stale || pastThreshold(c, r.synced_at, now);
+        return (
+          w.stale || !c || c.schedule.stale || pastThreshold(c, w.synced_at, now)
+        );
       }),
   });
   return { ...m, mine: m.mine.map(row), watching: m.watching.map(row) };
