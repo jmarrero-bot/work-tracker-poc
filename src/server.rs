@@ -793,6 +793,41 @@ pub struct Options {
     /// Other names a hub is reached by, through an HTTPS front.
     pub hosts: Vec<String>,
 }
+/// The service's routes: the API, which [`Access`] guards, and the page.
+fn router(app: App) -> Router {
+    let api = Router::new()
+        .route("/snapshot", get(snapshot))
+        .route("/mine", get(mine))
+        .route("/bot", get(bot_view))
+        .route("/export/external", get(export_external))
+        .route("/session", post(session))
+        .route("/hub", get(get_hub).put(set_hub).delete(unset_hub))
+        .route(
+            "/companion-token",
+            get(companion_token).post(rotate_companion_token),
+        )
+        .route("/connections", post(connect))
+        .route(
+            "/connections/{id}",
+            axum::routing::delete(disconnect).patch(patch_connection),
+        )
+        .route("/connections/{id}/verify", post(verify))
+        .route("/sync", post(sync))
+        .route("/efforts", post(effort))
+        .route("/efforts/{id}", axum::routing::patch(share_effort))
+        .route("/links", post(link))
+        .route("/items", post(manual))
+        .route("/items/{id}", axum::routing::patch(update_manual))
+        .route("/items/{id}/abandon", post(abandon))
+        .layer(middleware::from_fn_with_state(app.clone(), protect));
+    Router::new()
+        .nest("/api", api)
+        .fallback(assets)
+        .layer(DefaultBodyLimit::max(65536))
+        .layer(middleware::from_fn(headers))
+        .layer(middleware::from_fn(refuse_funnel))
+        .with_state(app)
+}
 pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     #[cfg(not(unix))]
     bail!("This initial server requires Unix file permissions; use Linux or macOS");
@@ -857,38 +892,6 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         scheduler,
         mode,
     };
-    let api = Router::new()
-        .route("/snapshot", get(snapshot))
-        .route("/mine", get(mine))
-        .route("/bot", get(bot_view))
-        .route("/export/external", get(export_external))
-        .route("/session", post(session))
-        .route("/hub", get(get_hub).put(set_hub).delete(unset_hub))
-        .route(
-            "/companion-token",
-            get(companion_token).post(rotate_companion_token),
-        )
-        .route("/connections", post(connect))
-        .route(
-            "/connections/{id}",
-            axum::routing::delete(disconnect).patch(patch_connection),
-        )
-        .route("/connections/{id}/verify", post(verify))
-        .route("/sync", post(sync))
-        .route("/efforts", post(effort))
-        .route("/efforts/{id}", axum::routing::patch(share_effort))
-        .route("/links", post(link))
-        .route("/items", post(manual))
-        .route("/items/{id}", axum::routing::patch(update_manual))
-        .route("/items/{id}/abandon", post(abandon))
-        .layer(middleware::from_fn_with_state(app.clone(), protect));
-    let router = Router::new()
-        .nest("/api", api)
-        .fallback(assets)
-        .layer(DefaultBodyLimit::max(65536))
-        .layer(middleware::from_fn(headers))
-        .layer(middleware::from_fn(refuse_funnel))
-        .with_state(app.clone());
     let running = match mode {
         Mode::Local => "Workboard is running locally",
         Mode::Hub => "Workboard is running as a hub, for external work only",
@@ -903,7 +906,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     );
     println!("{running}. Open this private pairing URL:\n{}\nKeep this URL private. CLI commands use the same data directory.", urls.join("\n"));
     let stop = stop_requested()?;
-    axum::serve(listener, router)
+    axum::serve(listener, router(app))
         .with_graceful_shutdown(stop)
         .await?;
     Ok(())
