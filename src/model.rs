@@ -1,3 +1,4 @@
+pub use crate::outcome::Outcome;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,12 +22,30 @@ pub struct Item {
     pub key: String,
     pub title: String,
     pub url: String,
+    /// The source's own status, unmodified.
     pub status: String,
-    pub terminal: bool,
+    pub outcome: Outcome,
+    /// Why the outcome was chosen.
+    pub outcome_reason: String,
     pub action: String,
     pub updated_at: String,
     pub effort_id: Option<String>,
+    /// When a person marked this synced item abandoned in Workboard. Kept
+    /// through syncs, like the effort link.
+    #[serde(default)]
+    pub abandoned_at: Option<String>,
     pub demo: bool,
+}
+
+impl Item {
+    /// Set a derived outcome. Only open items keep an attention category.
+    pub fn set_outcome(&mut self, (outcome, reason): crate::outcome::Derived) {
+        self.outcome = outcome;
+        self.outcome_reason = reason;
+        if outcome != Outcome::Open {
+            self.action.clear();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +87,8 @@ pub struct ManualInput {
     pub url: String,
     pub status: String,
     pub action: String,
+    #[serde(default)]
+    pub outcome: Outcome,
 }
 
 pub fn is_gitlab(provider: &str) -> bool {

@@ -1,4 +1,4 @@
-use crate::model::*;
+use crate::{model::*, outcome};
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
@@ -40,6 +40,9 @@ pub fn client() -> Result<Client> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
+
+/// The Jira issue fields an item is built from.
+const JIRA_FIELDS: &str = "summary,status,resolution,updated";
 
 pub struct Provider {
     client: Client,
@@ -165,7 +168,7 @@ impl Provider {
             let mut start = 0usize;
             let mut complete = false;
             for _ in 0..100 {
-                let v=self.get("rest/api/2/search",&[("jql","assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC".into()),("fields","summary,status,updated".into()),("maxResults","100".into()),("startAt",start.to_string())]).await?;
+                let v=self.get("rest/api/2/search",&[("jql","assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC".into()),("fields",JIRA_FIELDS.into()),("maxResults","100".into()),("startAt",start.to_string())]).await?;
                 let rows = v["issues"]
                     .as_array()
                     .context("Unexpected Jira search response")?;
@@ -195,7 +198,9 @@ impl Provider {
         let missing: Vec<_> = old
             .iter()
             .filter(|i| {
-                i.connection_id.as_deref() == Some(&c.id) && !i.terminal && !all.contains_key(&i.id)
+                i.connection_id.as_deref() == Some(&c.id)
+                    && matches!(i.outcome, Outcome::Open | Outcome::Unknown)
+                    && !all.contains_key(&i.id)
             })
             .collect();
         for item in missing {
@@ -222,7 +227,7 @@ impl Provider {
                 let row = self
                     .get(
                         &format!("rest/api/2/issue/{}", item.key),
-                        &[("fields", "summary,status,updated".into())],
+                        &[("fields", JIRA_FIELDS.into())],
                     )
                     .await?;
                 jira_item(c, &row, "follow-up")?
@@ -241,11 +246,16 @@ fn string(v: &Value, key: &str) -> Result<String> {
 pub fn jira_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
     let remote_id = string(v, "id")?;
     let key = string(v, "key")?;
-    let terminal = v["fields"]["status"]["statusCategory"]["key"].as_str() == Some("done");
+    let status = string(&v["fields"]["status"], "name")?;
+    let derived = outcome::jira(
+        &status,
+        v["fields"]["status"]["statusCategory"]["key"].as_str(),
+        v["fields"]["resolution"]["name"].as_str(),
+    );
     let url = Url::parse(&c.base_url)?
         .join(&format!("browse/{key}"))?
         .to_string();
-    Ok(Item {
+    let mut item = Item {
         id: format!("{}:jira:{remote_id}", c.id),
         connection_id: Some(c.id.clone()),
         provider: c.provider.clone(),
@@ -253,24 +263,28 @@ pub fn jira_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
         key,
         title: string(&v["fields"], "summary")?,
         url: source_url(&url)?,
-        status: string(&v["fields"]["status"], "name")?,
-        terminal,
-        action: if terminal { "" } else { action }.into(),
+        status,
+        outcome: Outcome::Open,
+        outcome_reason: String::new(),
+        action: action.into(),
         updated_at: string(&v["fields"], "updated")?,
         effort_id: None,
+        abandoned_at: None,
         demo: false,
-    })
+    };
+    item.set_outcome(derived);
+    Ok(item)
 }
 pub fn gitlab_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
     let project = v["project_id"].as_u64().context("Missing project ID")?;
     let iid = v["iid"].as_u64().context("Missing MR number")?;
     let state = string(v, "state")?;
-    let terminal = matches!(state.as_str(), "merged" | "closed");
+    let derived = outcome::gitlab(&state);
     let draft = v["draft"]
         .as_bool()
         .or(v["work_in_progress"].as_bool())
         .unwrap_or(false);
-    Ok(Item {
+    let mut item = Item {
         id: format!("{}:gitlab:{project}:{iid}", c.id),
         connection_id: Some(c.id.clone()),
         provider: c.provider.clone(),
@@ -281,17 +295,21 @@ pub fn gitlab_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
             .unwrap_or(format!("!{iid}")),
         title: string(v, "title")?,
         url: source_url(&string(v, "web_url")?)?,
-        status: if draft && !terminal {
+        status: if draft && state == "opened" {
             "Draft".into()
         } else {
             state
         },
-        terminal,
-        action: if terminal { "" } else { action }.into(),
+        outcome: Outcome::Open,
+        outcome_reason: String::new(),
+        action: action.into(),
         updated_at: string(v, "updated_at")?,
         effort_id: None,
+        abandoned_at: None,
         demo: false,
-    })
+    };
+    item.set_outcome(derived);
+    Ok(item)
 }
 
 #[cfg(test)]
@@ -320,19 +338,49 @@ mod tests {
         assert!(source_url("javascript:alert(1)").is_err());
     }
     #[test]
-    fn merged_mr_is_terminal() {
-        let v = serde_json::json!({"project_id":7,"iid":4,"title":"fix","state":"merged","draft":true,"web_url":"https://example.com/p/-/merge_requests/4","updated_at":"now"});
-        let i = gitlab_item(&c(), &v, "review").unwrap();
-        assert!(i.terminal);
-        assert_eq!(i.action, "");
-        assert_eq!(i.status, "merged");
+    fn gitlab_items_keep_native_state_next_to_outcome() {
+        use Outcome::*;
+        for (state, draft, status, outcome, action) in [
+            ("opened", false, "opened", Open, "review"),
+            ("opened", true, "Draft", Open, "review"),
+            ("locked", false, "locked", Open, "review"),
+            ("merged", true, "merged", Delivered, ""),
+            ("closed", false, "closed", ClosedWithoutDelivery, ""),
+            ("closed", true, "closed", ClosedWithoutDelivery, ""),
+        ] {
+            let v = serde_json::json!({"project_id":7,"iid":4,"title":"fix","state":state,"draft":draft,"web_url":"https://example.com/p/-/merge_requests/4","updated_at":"now"});
+            let i = gitlab_item(&c(), &v, "review").unwrap();
+            assert_eq!(
+                (i.status.as_str(), i.outcome, i.action.as_str()),
+                (status, outcome, action),
+                "{state} draft={draft}"
+            );
+            assert_eq!(i.outcome_reason, outcome::gitlab(state).1);
+            assert_eq!(i.url, "https://example.com/p/-/merge_requests/4");
+        }
     }
     #[test]
-    fn jira_completion_uses_category_not_display_name() {
-        let v = serde_json::json!({"id":"1","key":"RHEL-1","fields":{"summary":"fix","updated":"now","status":{"name":"Released","statusCategory":{"key":"done"}}}});
-        let i = jira_item(&c(), &v, "next").unwrap();
-        assert!(i.terminal);
-        assert_eq!(i.action, "");
+    fn jira_items_use_category_and_resolution_not_display_name() {
+        use Outcome::*;
+        let null = Value::Null;
+        for (category, resolution, outcome) in [
+            ("indeterminate", null.clone(), Open),
+            ("done", serde_json::json!({"name":"Done"}), Delivered),
+            (
+                "done",
+                serde_json::json!({"name":"Won't Do"}),
+                ClosedWithoutDelivery,
+            ),
+            ("done", null.clone(), Delivered),
+            ("undefined", null, Unknown),
+        ] {
+            let v = serde_json::json!({"id":"1","key":"RHEL-1","fields":{"summary":"fix","updated":"now","resolution":resolution.clone(),"status":{"name":"Released","statusCategory":{"key":category}}}});
+            let i = jira_item(&c(), &v, "next").unwrap();
+            assert_eq!(i.outcome, outcome, "{category} {resolution}");
+            assert_eq!(i.status, "Released");
+            assert_eq!(i.url, "https://example.com/browse/RHEL-1");
+            assert_eq!(i.action, if outcome == Open { "next" } else { "" });
+        }
     }
     fn mr(iid: u64, state: &str) -> Value {
         serde_json::json!({"project_id":7,"iid":iid,"title":format!("fix {iid}"),"state":state,"web_url":format!("https://example.com/p/-/merge_requests/{iid}"),"updated_at":"2026-10-06T20:00:00Z"})
@@ -381,12 +429,13 @@ mod tests {
             items.iter().find(|i| i.remote_id == "7:1").unwrap().action,
             "review"
         );
-        assert!(
+        assert_eq!(
             items
                 .iter()
                 .find(|i| i.remote_id == "7:999")
                 .unwrap()
-                .terminal
+                .outcome,
+            Outcome::Delivered
         );
         task.abort();
     }
