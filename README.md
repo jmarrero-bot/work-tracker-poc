@@ -14,7 +14,7 @@ This is jmarrero's Workboard prototype from his handoff, now built and tested by
 4. [Fedora Forge discovery and a Forgejo connector](https://github.com/jmarrero-bot/work-tracker-poc/issues/5) (done), and an [Errata investigation](https://github.com/jmarrero-bot/work-tracker-poc/issues/6)
 5. [Scheduled sync with checkpoints and backoff](https://github.com/jmarrero-bot/work-tracker-poc/issues/7) (done)
 6. [Hub mode: an external-only store on the tailnet](https://github.com/jmarrero-bot/work-tracker-poc/issues/8) (done)
-7. [Bot plugin: the Workstream board, fork PRs and the heartbeat](https://github.com/jmarrero-bot/work-tracker-poc/issues/9)
+7. [Bot plugin: the Workstream board, fork PRs and the heartbeat](https://github.com/jmarrero-bot/work-tracker-poc/issues/9) (done)
 8. [GitHub App login: web on the hub, device flow on the companion](https://github.com/jmarrero-bot/work-tracker-poc/issues/12)
 9. [Commands posted as jmarrero to a control repository](https://github.com/jmarrero-bot/work-tracker-poc/issues/13)
 10. [A bot-board backend over the app's API](https://github.com/jmarrero-bot/work-tracker-poc/issues/14)
@@ -36,7 +36,9 @@ Every connection is in the internal or the external zone, internal unless marked
 
 The hub (`serve --hub`) keeps external work only, refusing anything else at every write, and is meant to be reached over the tailnet through `tailscale serve`. The companion on the work laptop keeps the internal work, pulls the hub's export, read-only, and shows both on one board; it never sends the hub anything but that read. See [docs/hub.md](docs/hub.md).
 
-Connectors are plugins behind one interface: Jira, GitLab, GitHub and Fedora Forge are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
+jmarrero-bot's work is connected read-only too, through the same GitHub client: the items on its Workstream board, its open fork pull requests, and its coordinator's heartbeat, whose workers show as agent runs. Items waiting on jmarrero show in Mine as "bot waiting on you". "Ask the bot" is only a link: a prefilled issue in the bot's tracker, or a comment on an item, that he opens in his browser and submits himself. See [docs/connectors/bot.md](docs/connectors/bot.md).
+
+Connectors are plugins behind one interface: Jira, GitLab, GitHub, Fedora Forge and the bot are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
 
 ## Run
 
@@ -84,6 +86,8 @@ workboard connect gitlab-internal --url https://gitlab.example.com/ --label 'Int
 workboard connect gitlab-public --url https://gitlab.com/ --label 'Public GitLab' --token-env WORKBOARD_PUBLIC_GITLAB_TOKEN
 workboard connect github --url https://github.com/ --label GitHub --external --token-env WORKBOARD_GITHUB_TOKEN
 workboard connect fedora --url https://forge.fedoraproject.org/ --label 'Fedora Forge' --external --token-env WORKBOARD_FEDORA_TOKEN
+workboard connect bot --url https://github.com/ --label Bot --external --token-env WORKBOARD_GITHUB_TOKEN \
+  --board orgs/jmarrero-forge/1 --tracker jmarrero-forge/tracker --heartbeat 1 --bot-login jmarrero-bot --forge-org jmarrero-forge
 workboard connections
 ```
 
@@ -101,6 +105,7 @@ Current live connectors:
 | Internal/public GitLab | Personal API token via `PRIVATE-TOKEN`; `read_api` is recommended | Open MRs authored by you, assigned to you, or requesting your review, and the MRs and issues on your To-Do list |
 | GitHub (github.com or Enterprise Server) | A token, as a bearer token; Workboard only reads, whatever it allows | Open pull requests and issues requesting your review (directly or through a team) or assigned to you, and your open pull requests, noting those with changes requested or failing checks |
 | Fedora Forge (forge.fedoraproject.org, Forgejo) | An access token, `Authorization: token`; `read:user`, `read:issue` and `read:repository` are enough, and Workboard only reads | Open pull requests and issues requesting your review (directly or through a team), assigned to you or mentioning you, and your open pull requests |
+| A harness bot's work on GitHub ([docs/connectors/bot.md](docs/connectors/bot.md)) | A GitHub token that can read the bot's board; Workboard only reads | The items on the bot's board, its open fork pull requests, and its heartbeat's agent runs |
 | Errata through a connector plugin | Whatever the plugin uses; the token reaches it on standard input only | Whatever the plugin lists ([docs/plugins.md](docs/plugins.md)) |
 
 Internal instances require network/VPN reachability from the machine running the service. TLS certificate verification stays enabled; there is no insecure TLS switch. Jira Cloud OAuth/API-token authentication is not implemented.
@@ -109,7 +114,7 @@ Without a plugin, Errata is supported as **manual source links**, not a live con
 
 ## Mine
 
-`workboard mine` (or the Mine tab) lists what waits on the account behind each connection, and why: review requested, team review requested, assigned, mentioned, or your own change needs action because of requested changes or failing checks; GitLab's other To-Do items show as on the to-do list. Each row shows the source's status, the outcome, the zone and the link, and appears once however many listings or connections found it, with each account it waits on and that account's reasons. Internal rows show only here, on this machine; the external export carries the reasons of external items only.
+`workboard mine` (or the Mine tab) lists what waits on the account behind each connection, and why: review requested, team review requested, assigned, mentioned, or your own change needs action because of requested changes or failing checks; GitLab's other To-Do items show as on the to-do list, and the bot's items it marked Needs human or Draft as "bot waiting on you". Each row shows the source's status, the outcome, the zone and the link, and appears once however many listings or connections found it, with each account it waits on and that account's reasons. Internal rows show only here, on this machine; the external export carries the reasons of external items only.
 
 A GitHub connection can also watch another user: their review requests, assignments and open pull requests and issues that the connection's token can see, private repositories included. It is a setting of its own, for a token that isn't theirs, such as the bot's:
 
@@ -151,6 +156,8 @@ workboard update ITEM_ID --status Released --outcome delivered
 workboard abandon ITEM_ID                      # synced, closed without delivery or unknown; --undo reverts
 workboard share-title EFFORT_ID                # let this effort's title leave in the export; --undo stops it
 workboard export --external                    # the external zone only, as JSON
+workboard bot                                  # each bot's heartbeat, agent runs and board counts
+workboard ask [ITEM_ID] [--comment]            # open a link that asks the bot; you submit it
 workboard disconnect CONNECTION_ID
 ```
 

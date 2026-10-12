@@ -2,7 +2,7 @@
 
 One board, in two parts:
 
-- **The hub** runs on the bot machine and is reachable from anywhere on jmarrero's tailnet. It holds and syncs external sources only (GitHub, Fedora Forge, and later the bot's own state), and serves the web UI.
+- **The hub** runs on the bot machine and is reachable from anywhere on jmarrero's tailnet. It holds and syncs external sources only (GitHub, Fedora Forge, and the bot's board, fork pull requests and heartbeat; see [connectors/bot.md](connectors/bot.md)), and serves the web UI.
 - **The companion** runs on the GNOME work laptop, a toolbox with VPN access. It holds the internal sources (Jira, internal GitLab, Errata), pulls the hub's external work, and shows one board with both.
 
 Internal work never leaves the companion. Away from the laptop, the hub shows external work only, with no placeholder for anything internal: it never had any.
@@ -31,6 +31,8 @@ Then connect its sources, always as external, with the same CLI on the same data
 export WB='workboard --data-dir ~/.local/share/workboard-hub'
 $WB connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user jmarrero
 $WB connect fedora --url https://forge.fedoraproject.org/ --external --token-env FEDORA_TOKEN
+$WB connect bot --url https://github.com/ --external --token-env GH_TOKEN --board orgs/jmarrero-forge/1 \
+  --tracker jmarrero-forge/tracker --heartbeat 1 --bot-login jmarrero-bot --forge-org jmarrero-forge
 ```
 
 Open the pairing URL the hub printed for its tailnet name to pair a browser, and print the companion token for the laptop:
@@ -38,6 +40,8 @@ Open the pairing URL the hub printed for its tailnet name to pair a browser, and
 ```sh
 $WB companion-token
 ```
+
+Upgrade the companions before the hub. A companion checks the hub's export whole, and refuses all of it if it has a source or a reason it doesn't know, such as the bot connector's `bot` items and their `bot_waiting` reason, which an older companion doesn't.
 
 Publishing the hub's image and its quadlet in atomic-setup is a later slice ([#11](https://github.com/jmarrero-bot/work-tracker-poc/issues/11)).
 
