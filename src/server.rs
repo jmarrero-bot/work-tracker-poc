@@ -71,9 +71,10 @@ const SESSION_COOKIE: &str = "workboard_session";
 /// Where a hub keeps its companion token, in the data directory.
 const COMPANION_TOKEN: &str = "companion.token";
 
-/// Who may use the service, from where. This is the interim
-/// authentication: a bearer token, and a browser cookie paired with it,
-/// until GitHub App login (#12) replaces it.
+/// Who may use the service, from where: the CLI with the application
+/// token, a browser paired with it where pairing is on, and companions with
+/// a credential that reads the export. Pairing is the interim browser
+/// authentication, until GitHub App login (#12) replaces it.
 struct Access {
     /// `127.0.0.1:PORT`, where the service listens.
     local: String,
@@ -85,6 +86,9 @@ struct Access {
     /// A hub's companion token, which reads the external export and
     /// nothing else. Kept across restarts.
     companion: Option<RwLock<String>>,
+    /// Whether a browser may pair with the application token: always on a
+    /// local service, and on a hub only with `--pairing`.
+    pairing: bool,
 }
 
 /// Why a request was turned away.
@@ -138,25 +142,13 @@ impl Access {
     }
     /// Whether a request may go on.
     fn check(&self, method: &Method, path: &str, headers: &HeaderMap) -> Result<(), Denied> {
-        let text = |name| {
-            headers
-                .get(name)
-                .and_then(|v: &HeaderValue| v.to_str().ok())
-        };
-        let origin = text(header::HOST)
-            .and_then(|host| self.origin(host))
-            .ok_or(Denied::Host)?;
-        let bearer = text(header::AUTHORIZATION).and_then(|v| v.strip_prefix("Bearer "));
-        let cookie = text(header::COOKIE).and_then(|v| {
-            v.split(';').find_map(|s| {
-                s.trim()
-                    .strip_prefix(SESSION_COOKIE)
-                    .and_then(|s| s.strip_prefix('='))
-            })
-        });
-        let bearer_ok = bearer.is_some_and(|v| matches_token(v, &self.token));
-        let cookie_ok = cookie.is_some_and(|v| matches_token(v, &self.token));
-        if !bearer_ok && !cookie_ok {
+        let host = text(headers, header::HOST).ok_or(Denied::Host)?;
+        let origin = self.origin(host).ok_or(Denied::Host)?;
+        let bearer = text(headers, header::AUTHORIZATION).and_then(|v| v.strip_prefix("Bearer "));
+        let app_token = |v: &str| matches_token(v, &self.token);
+        let bearer_ok = bearer.is_some_and(app_token);
+        let paired = self.pairing && cookie(headers, SESSION_COOKIE).is_some_and(app_token);
+        if !bearer_ok && !paired {
             let companion = self.companion.as_ref().is_some_and(|token| {
                 let token = token.read().unwrap_or_else(PoisonError::into_inner);
                 bearer.is_some_and(|v| matches_token(v, &token))
@@ -169,11 +161,34 @@ impl Access {
         }
         // A browser's change must come from the page the service served
         // under the same name.
-        if method != Method::GET && !bearer_ok && text(header::ORIGIN) != Some(origin.as_str()) {
+        if method != Method::GET
+            && !bearer_ok
+            && text(headers, header::ORIGIN) != Some(origin.as_str())
+        {
             return Err(Denied::CrossOrigin);
         }
         Ok(())
     }
+}
+
+/// A header's value, if it is text.
+fn text(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The value of the cookie `name`, from any of the request's cookie
+/// headers.
+fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|s| {
+            s.trim()
+                .strip_prefix(name)
+                .and_then(|s| s.strip_prefix('='))
+        })
 }
 
 async fn protect(State(app): State<App>, req: Request, next: Next) -> Response {
@@ -188,6 +203,10 @@ async fn protect(State(app): State<App>, req: Request, next: Next) -> Response {
     }
 }
 async fn session(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !app.access.pairing {
+        let message = "Browser pairing is off on this hub: start it with --pairing";
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": message }))).into_response();
+    }
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -781,6 +800,32 @@ async fn headers(req: Request, next: Next) -> Response {
     response.headers_mut().insert("content-security-policy",HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
     response
 }
+/// What the service says when it starts: how browsers get in. The pairing
+/// URL carries the application token, so it is printed only while pairing
+/// is on.
+fn welcome(access: &Access, mode: Mode) -> String {
+    let running = match mode {
+        Mode::Local => "Workboard is running locally",
+        Mode::Hub => "Workboard is running as a hub, for external work only",
+    };
+    let cli = "CLI commands use the same data directory.";
+    if !access.pairing {
+        return format!("{running}. No browser can sign in: start it with --pairing. {cli}");
+    }
+    let token = &access.token;
+    let local = &access.local;
+    let mut urls = vec![format!("http://{local}/#token={token}")];
+    urls.extend(
+        access
+            .hosts
+            .iter()
+            .map(|host| format!("https://{host}/#token={token}")),
+    );
+    format!(
+        "{running}. Open this private pairing URL:\n{}\nKeep this URL private. {cli}",
+        urls.join("\n")
+    )
+}
 /// How to serve.
 pub struct Options {
     pub port: u16,
@@ -792,6 +837,8 @@ pub struct Options {
     pub hub: bool,
     /// Other names a hub is reached by, through an HTTPS front.
     pub hosts: Vec<String>,
+    /// Let a hub's browsers pair with the application token.
+    pub pairing: bool,
 }
 /// The service's routes: the API, which [`Access`] guards, and the page.
 fn router(app: App) -> Router {
@@ -837,6 +884,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         interval,
         hub,
         hosts,
+        pairing,
     } = options;
     let mode = if hub { Mode::Hub } else { Mode::Local };
     if hub && demo {
@@ -850,6 +898,9 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     let hosts: Vec<String> = hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
     if let Some(host) = hosts.iter().find(|h| !valid_host(h)) {
         bail!("Enter a host name such as hub.example.ts.net, with a port only if it isn't 443: {host}")
+    }
+    if !hub && pairing {
+        bail!("Only a hub takes --pairing; a local service pairs its browser on loopback")
     }
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let mut db = Db::open_as(&root, mode)?;
@@ -888,23 +939,12 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
             hosts,
             token,
             companion,
+            pairing: mode == Mode::Local || pairing,
         }),
         scheduler,
         mode,
     };
-    let running = match mode {
-        Mode::Local => "Workboard is running locally",
-        Mode::Hub => "Workboard is running as a hub, for external work only",
-    };
-    let token = &app.access.token;
-    let mut urls = vec![format!("http://{local}/#token={token}")];
-    urls.extend(
-        app.access
-            .hosts
-            .iter()
-            .map(|host| format!("https://{host}/#token={token}")),
-    );
-    println!("{running}. Open this private pairing URL:\n{}\nKeep this URL private. CLI commands use the same data directory.", urls.join("\n"));
+    println!("{}", welcome(&app.access, mode));
     let stop = stop_requested()?;
     axum::serve(listener, router(app))
         .with_graceful_shutdown(stop)
@@ -948,12 +988,14 @@ mod tests {
     const TOKEN: &str = "test-only-token";
     const COMPANION: &str = "test-only-companion";
 
+    /// A local service's or a hub's access, the hub's paired with browsers.
     fn access(hub: bool) -> Access {
         Access {
             local: LOCAL.into(),
             hosts: if hub { vec![TAILNET.into()] } else { vec![] },
             token: TOKEN.into(),
             companion: hub.then(|| RwLock::new(COMPANION.into())),
+            pairing: true,
         }
     }
 
@@ -1033,6 +1075,29 @@ mod tests {
         {
             let got = access(hub).check(method, path, &headers(host, credential, origin));
             assert_eq!(got, expected, "case {n}: {method} {path} via {host}");
+        }
+    }
+
+    #[test]
+    fn a_hub_without_pairing_takes_the_cli_token_only() {
+        use Credential::*;
+        let unpaired = Access {
+            pairing: false,
+            ..access(true)
+        };
+        // (host, credential, expected)
+        for (host, credential, expected) in [
+            (TAILNET, Cookie(TOKEN), Err(Denied::Unauthorized)),
+            (LOCAL, Cookie(TOKEN), Err(Denied::Unauthorized)),
+            (TAILNET, Bearer(TOKEN), Ok(())),
+            (LOCAL, Bearer(TOKEN), Ok(())),
+        ] {
+            let got = unpaired.check(
+                &Method::GET,
+                "/api/snapshot",
+                &headers(host, credential, None),
+            );
+            assert_eq!(got, expected, "{host}");
         }
     }
 
