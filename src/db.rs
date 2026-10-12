@@ -16,36 +16,6 @@ pub fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn synchronization_preserves_manual_effort_assignments() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut db = Db::open(&temp.path().join("db")).unwrap();
-        db.seed().unwrap();
-        let mut item = db
-            .items()
-            .unwrap()
-            .into_iter()
-            .find(|i| i.id == "demo-0")
-            .unwrap();
-        let effort = item.effort_id.clone();
-        item.effort_id = None;
-        item.status = "Released".into();
-        item.terminal = true;
-        db.sync_items(&[item]).unwrap();
-        let item = db
-            .items()
-            .unwrap()
-            .into_iter()
-            .find(|i| i.id == "demo-0")
-            .unwrap();
-        assert_eq!(item.effort_id, effort);
-        assert!(item.terminal);
-    }
-}
-
 pub fn write_secret(path: &Path, value: &str) -> Result<()> {
     use std::io::Write;
     let mut opts = fs::OpenOptions::new();
@@ -296,5 +266,35 @@ impl Db {
         }
         self.create_effort(EffortInput {title:"Ship the bootc storage fix".into(),note:"Example effort linking upstream work, a RHEL backport and an advisory. All items are illustrative.".into(),item_ids:(0..4).map(|n|format!("demo-{n}")).collect()})?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn synchronization_preserves_manual_effort_assignments() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&temp.path().join("db")).unwrap();
+        db.seed().unwrap();
+        let mut item = db
+            .items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == "demo-0")
+            .unwrap();
+        let effort = item.effort_id.clone();
+        item.effort_id = None;
+        item.status = "Released".into();
+        item.terminal = true;
+        db.sync_items(&[item]).unwrap();
+        let item = db
+            .items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == "demo-0")
+            .unwrap();
+        assert_eq!(item.effort_id, effort);
+        assert!(item.terminal);
     }
 }
