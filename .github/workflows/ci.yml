@@ -57,12 +57,20 @@ jobs:
         run: cargo test --locked
       - name: cargo build
         run: cargo build --locked
+      # The unit tests' own binary, for the ignored live tests, such as the
+      # anonymous read of a public repository on Fedora Forge.
+      - name: Keep the test binary
+        run: |
+          TESTS=$(cargo test --locked --no-run --message-format=json | jq -rs 'map(select(.profile.test? and .executable)) | .[0].executable')
+          cp "${TESTS}" target/debug/workboard-tests
       # For live tests on a machine that only runs what CI built.
-      - name: Upload the debug binary
+      - name: Upload the debug binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: workboard-debug
-          path: target/debug/workboard
+          path: |
+            target/debug/workboard
+            target/debug/workboard-tests
           retention-days: 1
           if-no-files-found: error
       - name: Smoke test
