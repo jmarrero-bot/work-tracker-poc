@@ -11,7 +11,7 @@ This is jmarrero's Workboard prototype from his handoff, now built and tested by
 1. [Outcome semantics: closed is not delivered](https://github.com/jmarrero-bot/work-tracker-poc/issues/2) (done)
 2. [Connector plugins with per-connection zones](https://github.com/jmarrero-bot/work-tracker-poc/issues/3) (done)
 3. [GitHub connector (read-only) and the Mine view](https://github.com/jmarrero-bot/work-tracker-poc/issues/4) (done)
-4. [Fedora Forge discovery and a Forgejo connector](https://github.com/jmarrero-bot/work-tracker-poc/issues/5), and an [Errata investigation](https://github.com/jmarrero-bot/work-tracker-poc/issues/6)
+4. [Fedora Forge discovery and a Forgejo connector](https://github.com/jmarrero-bot/work-tracker-poc/issues/5) (done), and an [Errata investigation](https://github.com/jmarrero-bot/work-tracker-poc/issues/6)
 5. [Scheduled sync with checkpoints and backoff](https://github.com/jmarrero-bot/work-tracker-poc/issues/7)
 6. [Hub mode: an external-only store on the tailnet](https://github.com/jmarrero-bot/work-tracker-poc/issues/8)
 7. [Bot plugin: the Workstream board, fork PRs and the heartbeat](https://github.com/jmarrero-bot/work-tracker-poc/issues/9)
@@ -28,7 +28,9 @@ Live Jira, internal GitLab and Errata tests aren't possible from the bot, so tho
 
 GitHub is connected read-only, enforced in code: one client is the only way to GitHub, and it refuses any request that could change it (see [docs/architecture.md](docs/architecture.md)). Live tests use the bot's token, so a GitHub connection can also watch jmarrero's activity, as far as that token can see it; that is listed as his, never as the bot's. The Mine view lists what waits on each connected account, and why.
 
-Every connection is in the internal or the external zone, internal unless marked external when connecting. Internal work stays on the machine that syncs it. Work leaves only through the external export (`workboard export --external`), which the hub will read and which carries external work alone. Connectors are plugins behind one interface: Jira and GitLab are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
+Fedora Forge is forge.fedoraproject.org, which runs Forgejo, and it is connected read-only the same way. Fedora's package dist-git, where the bootc, ostree and rpm-ostree packaging pull requests are, is still Pagure on src.fedoraproject.org while Fedora moves it to Forgejo, and takes manual source links until then. [docs/connectors/fedora-forge.md](docs/connectors/fedora-forge.md) has the evidence. The bot has no Fedora account, so the Fedora Forge connector was tested live only without a token, on a public repository.
+
+Every connection is in the internal or the external zone, internal unless marked external when connecting. Internal work stays on the machine that syncs it. Work leaves only through the external export (`workboard export --external`), which the hub will read and which carries external work alone. Connectors are plugins behind one interface: Jira, GitLab, GitHub and Fedora Forge are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
 
 ## Run
 
@@ -75,11 +77,12 @@ workboard connect jira --url https://jira.example.com/ --label 'Work Jira' --tok
 workboard connect gitlab-internal --url https://gitlab.example.com/ --label 'Internal GitLab' --token-env WORKBOARD_INTERNAL_GITLAB_TOKEN
 workboard connect gitlab-public --url https://gitlab.com/ --label 'Public GitLab' --token-env WORKBOARD_PUBLIC_GITLAB_TOKEN
 workboard connect github --url https://github.com/ --label GitHub --external --token-env WORKBOARD_GITHUB_TOKEN
+workboard connect fedora --url https://forge.fedoraproject.org/ --label 'Fedora Forge' --external --token-env WORKBOARD_FEDORA_TOKEN
 workboard connections
 workboard sync
 ```
 
-Each connection is **internal** unless you add `--external` (or turn on **External** in the connection dialog). Internal work, such as Jira, internal GitLab or Errata, is never exported; external work, such as gitlab.com, is what `workboard export --external` prints for the hub. A connection's zone can't be changed later; disconnect and connect again instead. Manual source links are internal. An effort with external work is exported with that work only, and its note never; its title only once you share it (`workboard share-title EFFORT_ID`, or the switch on the effort), since a title can name internal work. Until then the hub sees a neutral label.
+Each connection is **internal** unless you add `--external` (or turn on **External** in the connection dialog). Internal work, such as Jira, internal GitLab or Errata, is never exported; external work, such as gitlab.com or Fedora Forge, is what `workboard export --external` prints for the hub. A connection's zone can't be changed later; disconnect and connect again instead. Manual source links are internal. An effort with external work is exported with that work only, and its note never; its title only once you share it (`workboard share-title EFFORT_ID`, or the switch on the effort), since a title can name internal work. Until then the hub sees a neutral label.
 
 `--token-stdin` also accepts a token from standard input. Tokens are never accepted as CLI argument values. Each connection is verified against the instance's current-user endpoint before saving it. Multiple accounts on an instance are separate connections; no username-based cross-service identity matching is performed.
 
@@ -90,11 +93,12 @@ Current live connectors:
 | Jira Data Center | Personal access token, Bearer authentication | Active issues assigned to the authenticated user |
 | Internal/public GitLab | Personal API token via `PRIVATE-TOKEN`; `read_api` is recommended | Open MRs authored by you, assigned to you, or requesting your review, and the MRs and issues on your To-Do list |
 | GitHub (github.com or Enterprise Server) | A token, as a bearer token; Workboard only reads, whatever it allows | Open pull requests and issues requesting your review (directly or through a team) or assigned to you, and your open pull requests, noting those with changes requested or failing checks |
-| Fedora Forge or Errata through a connector plugin | Whatever the plugin uses; the token reaches it on standard input only | Whatever the plugin lists ([docs/plugins.md](docs/plugins.md)) |
+| Fedora Forge (forge.fedoraproject.org, Forgejo) | An access token, `Authorization: token`; `read:user`, `read:issue` and `read:repository` are enough, and Workboard only reads | Open pull requests and issues requesting your review (directly or through a team), assigned to you or mentioning you, and your open pull requests |
+| Errata through a connector plugin | Whatever the plugin uses; the token reaches it on standard input only | Whatever the plugin lists ([docs/plugins.md](docs/plugins.md)) |
 
 Internal instances require network/VPN reachability from the machine running the service. TLS certificate verification stays enabled; there is no insecure TLS switch. Jira Cloud OAuth/API-token authentication is not implemented.
 
-Without a plugin, Fedora Forge and Errata are supported as **manual source links**, not live connectors. A plugin is an executable named after the source in the data directory's `plugins` directory, such as `~/.local/share/workboard/plugins/errata`; it has to be owned by you and not writable by others, and runs with a minimal environment and a time limit, but as your user, so install only plugins you trust. Errata's live adapter requires the actual instance, API contract and supported authentication method. GitHub CLI, GitLab CLI and OS keychain credential reuse are planned; this version uses explicitly supplied tokens.
+Without a plugin, Errata is supported as **manual source links**, not a live connector, and so is Fedora's Pagure dist-git (src.fedoraproject.org). A plugin is an executable named after the source in the data directory's `plugins` directory, such as `~/.local/share/workboard/plugins/errata`; it has to be owned by you and not writable by others, and runs with a minimal environment and a time limit, but as your user, so install only plugins you trust. Errata's live adapter requires the actual instance, API contract and supported authentication method. GitHub CLI, GitLab CLI and OS keychain credential reuse are planned; this version uses explicitly supplied tokens.
 
 ## Mine
 
@@ -161,7 +165,7 @@ The credential handling follows the separation established in `jmarrero/atomic-s
 
 ## Synchronization behavior
 
-Connectors paginate inbox results, and fail rather than save part of a list. Items that were tracked before but no longer appear in the open inbox are fetched individually to detect completion or merge. Sync preserves manual effort assignments and commits each source's fetched item set transactionally. A source failure keeps its previous cache, records a visible error, and does not prevent other sources from syncing. The CLI exits unsuccessfully if any source sync fails. Rate limits are reported without an automatic retry loop. GitHub requests are conditional where GitHub returns an ETag, and once GitHub says a rate limit is used up, no more requests count against it until it resets. Each GitHub sync result lists the requests it sent by method, and those it refused.
+Connectors paginate inbox results, and fail rather than save part of a list. Items that were tracked before but no longer appear in the open inbox are fetched individually to detect completion or merge. Sync preserves manual effort assignments and commits each source's fetched item set transactionally. A source failure keeps its previous cache, records a visible error, and does not prevent other sources from syncing. The CLI exits unsuccessfully if any source sync fails. Rate limits are reported without an automatic retry loop. Fedora Forge sends no ETags; when it asks to wait (HTTP 429, or 503 with `retry-after`), no more requests go to it with that token until the wait is over. GitHub requests are conditional where GitHub returns an ETag, and once GitHub says a rate limit is used up, no more requests count against it until it resets. Each GitHub sync result lists the requests it sent by method, and those it refused.
 
 If a tracked item becomes inaccessible (HTTP 403 or 404), it is marked unknown with its last known status, never complete, and fetched again on the next sync. Other failures fail that source's sync and keep its previous cache. Manual links do not refresh automatically. GitLab pipelines, Jira release fields/blockers, automatic relationship suggestions, live Errata readiness, and hosted/team mode are not implemented yet.
 
@@ -175,7 +179,7 @@ cargo test
 python3 tests/smoke.py target/debug/workboard
 ```
 
-The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone, the external export and the Mine view, and secret file permissions. GitHub is tested against recorded answers in `cargo test`, since CI has no GitHub token.
+The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone, the external export and the Mine view, and secret file permissions. GitHub and Fedora Forge are tested against recorded answers in `cargo test`, since CI has no token for either. An ignored test reads a public repository on the real Fedora Forge without a token, and prints counts: `cargo test -- --ignored --nocapture live_fedora_forge`, or `workboard-tests --ignored --nocapture live_fedora_forge` with the test binary CI uploads next to `workboard`.
 
 See `docs/architecture.md` for the next implementation boundaries.
 
