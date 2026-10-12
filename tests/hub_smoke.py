@@ -320,6 +320,9 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         # A hub's data directory is never served in normal mode, nor a
         # companion's as a hub.
         refused(hub.command + ['serve'], "hub's")
+        # One service per data directory: the companion's is in use.
+        refused([binary, '--data-dir', str(companion_root), '--port', str(free_port()), 'serve'], 'Another Workboard service')
+        companion.stop()
         refused([binary, '--data-dir', str(companion_root), '--port', str(free_port()), 'serve', '--hub'], "isn't a hub's")
         hub = Service(hub_root, '--hub')
         services.append(hub)

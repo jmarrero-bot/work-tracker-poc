@@ -1,4 +1,11 @@
-use crate::{bot::AgentRuns, hub, model::*, outcome, zone::ExternalSnapshot};
+use crate::{
+    bot::AgentRuns,
+    hub,
+    model::*,
+    outcome,
+    secrets::{self, Secrets},
+    zone::ExternalSnapshot,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection as Sqlite, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -27,6 +34,30 @@ pub fn write_secret(path: &Path, value: &str) -> Result<()> {
     opts.mode(0o600);
     opts.open(path)?.write_all(value.as_bytes())?;
     Ok(())
+}
+
+/// Lock the data directory `root` for this process, as long as the file
+/// returned is open: one service, or credentials migration, at a time.
+pub fn lock(root: &Path) -> Result<fs::File> {
+    let path = root.join("workboard.lock");
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(&path)
+        .with_context(|| format!("Cannot open {}", path.display()))?;
+    #[cfg(unix)]
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => (),
+        // Only this means someone holds it; anything else is said as it is.
+        Err(rustix::io::Errno::WOULDBLOCK) => bail!(
+            "Another Workboard service, or a credentials migration, is using {}; stop it first",
+            root.display()
+        ),
+        Err(e) => return Err(e).with_context(|| format!("Cannot lock {}", path.display())),
+    }
+    Ok(file)
 }
 
 /// Remove the file at `path`, if there is one.
@@ -292,7 +323,7 @@ fn migrate_sync_state(tx: &Transaction) -> Result<()> {
 }
 
 /// Where a data directory keeps credentials, one file each.
-const SECRETS: &str = "secrets";
+const SECRETS: &str = secrets::DIR;
 
 /// Settings of the data directory, by name.
 const SETTINGS_TABLE: &str =
@@ -475,6 +506,9 @@ pub struct Db {
     sql: Sqlite,
     pub root: PathBuf,
     mode: Mode,
+    /// Where credentials are kept: files, unless the service was told
+    /// otherwise.
+    secrets: Secrets,
 }
 impl Db {
     /// The SQL connection, for tests that set up or break what they need.
@@ -507,6 +541,7 @@ impl Db {
             sql,
             root: root.to_path_buf(),
             mode,
+            secrets: Secrets::files(root),
         };
         if mode == Mode::Hub {
             db.check_hub()?;
@@ -515,6 +550,15 @@ impl Db {
     }
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+    /// Keep credentials in `secrets` from now on.
+    pub fn use_secrets(&mut self, secrets: Secrets) {
+        self.secrets = secrets;
+    }
+    /// Keep `value` as the credential of connection `id`, which has none
+    /// yet.
+    pub fn create_secret(&self, id: &str, value: &str) -> Result<()> {
+        self.secrets.create(id, value)
     }
     /// Refuse a hub's database that holds anything not external, as one
     /// changed behind its back would.
@@ -705,28 +749,21 @@ impl Db {
     }
     pub fn secret(&self, id: &str) -> Result<String> {
         Uuid::parse_str(id)?;
-        let value = fs::read_to_string(self.root.join(SECRETS).join(id))?;
-        let value = value.trim().to_string();
-        if value.is_empty() {
-            bail!("Missing credential")
-        }
-        Ok(value)
+        self.secrets.read(id)
     }
-    /// Write `value` as connection `id`'s next credential, beside the one
-    /// in use, for [`Db::install_secret`] to put in place.
-    pub fn stage_secret(&self, id: &str, value: &str) -> Result<PathBuf> {
-        Uuid::parse_str(id)?;
-        let staged = self.root.join(SECRETS).join(format!("{id}.new"));
-        remove_if_there(&staged)?;
-        write_secret(&staged, value)?;
-        Ok(staged)
+    /// Keep `value` as connection `id`'s next credential, beside the one in
+    /// use, for [`Db::install_secret`] to put in place.
+    pub fn stage_secret(&self, id: &str, value: &str) -> Result<()> {
+        self.secrets.stage(id, value)
     }
-    /// Replace connection `id`'s credential with the one staged at
-    /// `staged`, all at once, so a sync reads the old one or the new one.
-    pub fn install_secret(&self, id: &str, staged: &Path) -> Result<()> {
-        Uuid::parse_str(id)?;
-        fs::rename(staged, self.root.join(SECRETS).join(id))?;
-        Ok(())
+    /// Replace connection `id`'s credential with the one staged, so a sync
+    /// reads the old one or the new one.
+    pub fn install_secret(&self, id: &str) -> Result<()> {
+        self.secrets.install(id)
+    }
+    /// Drop the credential staged for connection `id`, if there is one.
+    pub fn discard_staged_secret(&self, id: &str) -> Result<()> {
+        self.secrets.discard_staged(id)
     }
     /// Each connection's zone. An item's zone is always its connection's,
     /// never what its row says; anything without a known connection is
@@ -1132,8 +1169,7 @@ impl Db {
         self.admit(Write::Hub)?;
         let old = self.hub()?;
         let id = Uuid::new_v4().to_string();
-        let secret = self.root.join(SECRETS).join(&id);
-        write_secret(&secret, token)?;
+        self.secrets.create(&id, token)?;
         let saved = (|| -> Result<()> {
             let tx = self.sql.transaction()?;
             if let Some(old) = &old {
@@ -1145,7 +1181,7 @@ impl Db {
             Ok(())
         })();
         if let Err(e) = saved {
-            let _ = fs::remove_file(&secret);
+            let _ = self.secrets.remove(&id);
             return Err(e);
         }
         if let Some(old) = old {
@@ -1194,12 +1230,28 @@ impl Db {
         Ok(())
     }
     /// Remove the credential of `id`, and a new one staged beside it.
-    fn remove_secrets(&self, id: &str) -> Result<()> {
-        let secrets = self.root.join(SECRETS);
-        for path in [secrets.join(id), secrets.join(format!("{id}.new"))] {
-            remove_if_there(&path)?;
+    pub fn remove_secrets(&self, id: &str) -> Result<()> {
+        self.secrets.remove(id)
+    }
+    /// Drop the credentials that nothing stored uses: no connection, and
+    /// not the hub this companion pulls from. What a removal cut short
+    /// left, such as by a crash between dropping a connection and its
+    /// credential. Only once everything stored was read: if any of it
+    /// can't be, nothing is dropped, since a credential in use could look
+    /// unused. Returns how many went.
+    pub fn drop_unused_secrets(&self) -> Result<usize> {
+        let mut live: std::collections::HashSet<String> =
+            self.connections()?.into_iter().map(|c| c.id).collect();
+        let rows: i64 = self
+            .sql
+            .query_row("SELECT COUNT(*) FROM connections", [], |r| r.get(0))?;
+        if usize::try_from(rows).ok() != Some(live.len()) {
+            bail!("Not every connection could be told apart; keeping every credential")
         }
-        Ok(())
+        if let Some(link) = self.hub()? {
+            live.insert(link.id);
+        }
+        self.secrets.reconcile(&live)
     }
     pub fn seed(&mut self) -> Result<()> {
         self.admit(Write::Demo)?;
@@ -1863,6 +1915,56 @@ mod tests {
         assert_eq!(rows, 0);
         let left: Vec<_> = fs::read_dir(&secrets).unwrap().collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A credential nothing stored uses is dropped at start: a removal cut
+    /// short, here between dropping the connection and its credential. One
+    /// in use never is, nor anything while the database can't all be read.
+    #[test]
+    fn drops_only_unused_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("db");
+        let mut db = Db::open(&root).unwrap();
+        let id = Uuid::new_v4().to_string();
+        db.save_connection(&connection(&id, Zone::Internal))
+            .unwrap();
+        db.create_secret(&id, "connection-token").unwrap();
+        // A verify cut short left a new one staged: still the connection's.
+        db.stage_secret(&id, "staged-token").unwrap();
+        let hub = db
+            .set_hub("https://hub.example.ts.net/", "hub-token")
+            .unwrap();
+        let orphan = Uuid::new_v4().to_string();
+        db.create_secret(&orphan, "orphan-token").unwrap();
+        db.create_secret(&Uuid::new_v4().to_string(), "orphan-token")
+            .unwrap();
+        assert_eq!(db.drop_unused_secrets().unwrap(), 2);
+        assert_eq!(db.secret(&id).unwrap(), "connection-token");
+        assert_eq!(db.secret(&hub.id).unwrap(), "hub-token");
+        assert!(db.secret(&orphan).is_err());
+        let secrets = root.join(SECRETS);
+        let mut left: Vec<_> = fs::read_dir(&secrets)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected = vec![id.clone(), format!("{id}.new"), hub.id.clone()];
+        expected.sort();
+        assert_eq!(left, expected);
+        assert_eq!(db.drop_unused_secrets().unwrap(), 0);
+
+        // A connection that can't be read: nothing is dropped.
+        let another = Uuid::new_v4().to_string();
+        db.create_secret(&another, "maybe-in-use").unwrap();
+        db.sql
+            .execute(
+                "INSERT INTO connections VALUES(?1,'not a connection')",
+                [&another],
+            )
+            .unwrap();
+        assert!(db.drop_unused_secrets().is_err());
+        assert_eq!(db.secret(&another).unwrap(), "maybe-in-use");
+        assert_eq!(db.secret(&id).unwrap(), "connection-token");
     }
 
     #[test]

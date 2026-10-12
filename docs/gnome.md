@@ -69,7 +69,10 @@ Notifications, opening links and running in the background go through the deskto
 
 CI also runs `tests/gnome_smoke.py`: a hub and a companion on loopback with a demo connector plugin, and the app against them on a virtual X server. It checks that the app reads what both services answer with the token from the runtime directory alone, that it starts and keeps running, that a new Mine item is announced once and not again after a restart, also with the window closed and no refresh asked for, that `--background` starts it without a window, and that GTK and libadwaita warn of nothing, such as content wider than 360 pixels. It takes screenshots of each view, in the light and dark styles and at a phone's width, uploaded as the `gnome-screenshots` artifact. CI can't reach GitHub, so the bot's part of the screenshots is canned, added by a proxy in front of the companion. The `flatpak` job builds the Flatpak; the Background portal is only reached there, and isn't tested in CI.
 
+## Credentials
+
+The app holds no credential of its own: it reads the service's token, a file, each time. The service can keep the connections' credentials in GNOME Keyring, after `workboard credentials migrate --to keyring` with the service stopped; see the README's [Authentication and storage](../README.md#authentication-and-storage).
+
 ## Not done yet
 
 - A GNOME Shell search provider for items and efforts ([#33](https://github.com/jmarrero-bot/work-tracker-poc/issues/33)).
-- Provider credentials in GNOME Keyring, through the Secret Service, for the service; the app itself holds no credential but the service's token, which it reads each time.

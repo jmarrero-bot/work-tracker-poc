@@ -158,7 +158,7 @@ Live source requests only read: GET, and for GitHub, GraphQL queries checked as 
 1. Validate Jira Data Center and internal GitLab connectors against the user's actual instances. Use dedicated test credentials in the local application, never chat.
 2. Specify Errata's exact API and authentication. Model advisory readiness independently of individual PR completion.
 3. Decide whether Fedora's package dist-git, still Pagure on src.fedoraproject.org while it moves to Forgejo, gets a connector of its own first (see `docs/connectors/fedora-forge.md`).
-4. Add credential backends for OS keychain, mounted Podman secret files and existing CLI logins. Define credential renewal and revocation explicitly.
+4. Add credential backends for the macOS keychain, mounted Podman secret files and existing CLI logins (the Secret Service, GNOME Keyring, is one: `workboard credentials migrate --to keyring`, in `src/secrets.rs`). Define credential renewal and revocation explicitly.
 5. Add configurable prioritization.
 6. For hosted use, add user ownership to every connection, item and effort before exposing a listener. Add OIDC login and per-user encrypted credentials with a separate deployment key.
 7. Evaluate T3 Code MCP as an optional executor. The effort/inbox database remains independent of any agent runtime. Do not assume its internal WebSocket API is a stable integration contract.
