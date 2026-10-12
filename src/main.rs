@@ -162,13 +162,15 @@ enum Command {
         #[arg(long)]
         item: Vec<String>,
         /// Let the title leave this machine with the effort's external
-        /// items. Otherwise the hub shows a neutral label.
+        /// items, in the external export. Otherwise the export shows a
+        /// neutral label.
         #[arg(long)]
         share_title: bool,
     },
-    /// Let an effort's title leave this machine with its external items, for
-    /// the hub. Titles are not shared unless you do this, since they can
-    /// describe internal work; the note never leaves.
+    /// Let an effort's title leave this machine with its external items, in
+    /// the external export, as a hub serves it to its companions. Titles are
+    /// not shared unless you do this, since they can describe internal
+    /// work; the note never leaves.
     ShareTitle {
         effort: String,
         /// Stop sharing it.

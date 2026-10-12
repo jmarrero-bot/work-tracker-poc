@@ -26,7 +26,7 @@ import "./style.css";
 type Provider =
   "jira" | "gitlab-internal" | "gitlab-public" | "github" | "fedora" | "errata";
 // Internal work is shown only on the machine that syncs it; external work
-// may also be shown on the hub.
+// may leave it in the external export, as a hub's does for its companions.
 type Zone = "internal" | "external";
 type Outcome =
   | "open"
@@ -181,7 +181,7 @@ type Effort = {
   id: string;
   title: string;
   note: string;
-  // Whether the title may also be shown on the hub.
+  // Whether the title may leave this machine in the external export.
   share_title: boolean;
   progress: Progress;
   // It came from the hub, and is read-only here.
@@ -1438,10 +1438,9 @@ function App() {
                           onChange={(ev) => shareTitle(e, ev.target.checked)}
                         />
                         <span>
-                          Show this title on the hub with the effort's
-                          external work. Otherwise it appears there as a
-                          neutral label. The note always stays on this
-                          machine.
+                          {hub
+                            ? "Show this title to companions with the effort's work. Otherwise they see a neutral label."
+                            : "Let this title leave this machine with the effort's external work, in the external export. Otherwise the export shows a neutral label. The note always stays on this machine."}
                         </span>
                       </label>
                     )}
@@ -1695,7 +1694,7 @@ function App() {
               {detailItem.from_hub
                 ? "External, from the hub"
                 : detailItem.zone === "external"
-                  ? "External: may also be shown on the hub"
+                  ? "External: may leave this machine in its external export"
                   : "Internal: shown only on this machine"}
             </dd>
             <dt>Last source update</dt>
@@ -1952,7 +1951,7 @@ function App() {
                     <span>
                       {hub
                         ? "External: this hub connects external sources only. Connect internal work such as Jira, internal GitLab or Errata on the companion."
-                        : "External: its work may also be shown away from this machine, on the hub. Leave this off for internal work such as Jira, internal GitLab or Errata. It can't be changed later."}
+                        : "External: its work may leave this machine in its external export, and only external sources can be connected on a hub. Leave this off for internal work such as Jira, internal GitLab or Errata. It can't be changed later."}
                     </span>
                   </label>
                   <p className="token-note">
