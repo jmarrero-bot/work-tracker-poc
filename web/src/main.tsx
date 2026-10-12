@@ -20,6 +20,8 @@ import {
   LayoutGrid,
   Unplug,
   UserCheck,
+  Bot,
+  Copy,
 } from "lucide-react";
 import "./style.css";
 
@@ -98,6 +100,70 @@ type Item = {
   from_hub: boolean;
   bot?: BotFields;
 };
+// One worker the bot's coordinator runs, from its heartbeat. Agent runs
+// aren't items: one that finished delivered nothing by finishing.
+type AgentRun = {
+  name: string;
+  item_url: string;
+  item_key: string;
+  status: string;
+  started_at: string;
+  devspace: string | null;
+};
+// The coordinator's heartbeat.
+type Heartbeat = {
+  updated_at: string;
+  session: string;
+  loop_state: string;
+  next_wake_at: string | null;
+  runs: AgentRun[];
+  // Workers left out as malformed.
+  skipped: number;
+  comment_url: string | null;
+  // Too old to trust: the coordinator may have stopped.
+  stale: boolean;
+};
+// What the last listing of a bot's board found.
+type BoardSummary = {
+  // Board items by board status.
+  statuses: Record<string, number>;
+  fork_prs: number;
+  // Items this token can't read: while there are any, the board shown
+  // isn't all of it.
+  unreadable: number;
+};
+// What a bot connection last read of its heartbeat and its board.
+type AgentRuns = {
+  connection_id: string;
+  // None when the bot publishes none.
+  heartbeat: Heartbeat | null;
+  // Why the last sync couldn't read it: it is what an earlier one read.
+  error: string | null;
+  last_success: string | null;
+  stale: boolean;
+  board: BoardSummary | null;
+};
+// Links that ask the bot for something, which the person opens and
+// submits themselves. Nothing is sent by building them.
+type Ask = {
+  issue_url: string;
+  comment_url: string | null;
+  comment: string | null;
+};
+// A connected bot.
+type BotView = {
+  connection_id: string;
+  label: string;
+  bot_login: string;
+  board_url: string;
+  agents: AgentRuns | null;
+  ask: Ask;
+  // By item ID.
+  asks: Record<string, Ask>;
+};
+// Only links that open a web page are shown as links.
+const webLink = (url: string | null | undefined) =>
+  url && /^https?:\/\//.test(url) ? url : undefined;
 // One thing that waits in the Mine view, once, with every reason.
 type MineRow = {
   id: string;
@@ -573,6 +639,173 @@ function MineList({
     </section>
   );
 }
+// How to ask the bot about an item: a new issue, or a comment on the item,
+// whose start is shown to copy, since GitHub takes no comment text in a link.
+function AskLinks({ ask, about }: { ask: Ask; about: boolean }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="ask-links">
+      <a
+        className="primary"
+        href={webLink(ask.issue_url)}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        <Bot size={15} />
+        {about ? "Ask the bot about this" : "Ask the bot"}
+      </a>
+      {ask.comment_url && ask.comment && (
+        <>
+          <a
+            className="quiet"
+            href={webLink(ask.comment_url)}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Comment on it
+          </a>
+          <span className="ask-comment">
+            Start the comment with <code>{ask.comment}</code>
+            <button
+              className="icon-button"
+              aria-label="Copy the start of the comment"
+              onClick={() =>
+                navigator.clipboard
+                  ?.writeText(ask.comment ?? "")
+                  .then(() => setCopied(true))
+                  .catch(() => setCopied(false))
+              }
+            >
+              {copied ? <Check size={14} /> : <Copy size={14} />}
+            </button>
+          </span>
+        </>
+      )}
+      <p className="token-note">
+        Opens GitHub in your browser, prefilled; nothing is sent until you
+        submit it there, as yourself.
+      </p>
+    </div>
+  );
+}
+// A connected bot: its board's counts, its coordinator's heartbeat, and
+// the agent runs it lists.
+function BotCard({ bot, now }: { bot: BotView; now: number }) {
+  const board = bot.agents?.board;
+  const total = Object.values(board?.statuses ?? {}).reduce(
+    (a, b) => a + b,
+    0,
+  );
+  const heartbeat = bot.agents?.heartbeat;
+  return (
+    <article className="connection-card bot-card">
+      <div className="connection-top">
+        <Mark provider="bot" />
+        <h2>{bot.label}</h2>
+        <a
+          className="connection-kind live"
+          href={webLink(bot.board_url)}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Board
+        </a>
+      </div>
+      {board ? (
+        <>
+          <p className="connection-description">
+            {total} board items
+            {Object.entries(board.statuses).map(([status, n]) => (
+              <em className="reason-tag" key={status}>
+                {n} {status}
+              </em>
+            ))}{" "}
+            · {board.fork_prs} open fork pull requests
+          </p>
+          {board.unreadable > 0 && (
+            <p className="connection-description danger">
+              And {board.unreadable} items this token can't read: the board
+              shown isn't all of it.
+            </p>
+          )}
+        </>
+      ) : (
+        <p className="connection-description">
+          The board hasn't been read yet.
+        </p>
+      )}
+      {!bot.agents ? (
+        <p className="connection-description">
+          The heartbeat hasn't been read yet.
+        </p>
+      ) : !heartbeat ? (
+        <p className="connection-description">
+          {bot.bot_login} publishes no heartbeat.
+        </p>
+      ) : (
+        <>
+          <p
+            className={
+              heartbeat.stale ? "connection-description danger" : "connection-description"
+            }
+          >
+            {heartbeat.stale && "Stale, the coordinator may have stopped: "}
+            Coordinator <code>{heartbeat.session}</code> is{" "}
+            {heartbeat.loop_state}, as of {relative(heartbeat.updated_at, now)}
+            {heartbeat.next_wake_at &&
+              `; next wake ${relative(heartbeat.next_wake_at, now)}`}
+            {bot.agents.stale && (
+              <em className="stale-tag"> · read {bot.agents.last_success ? relative(bot.agents.last_success, now) : "never"}</em>
+            )}
+          </p>
+          <div className="work-list">
+            {heartbeat.runs.length === 0 ? (
+              <div className="empty">
+                <h3>No agent runs</h3>
+                <p>The coordinator runs no workers right now.</p>
+              </div>
+            ) : (
+              heartbeat.runs.map((r) => (
+                <div className="work-row" key={r.name}>
+                  <Bot size={16} />
+                  <a
+                    className="item-title"
+                    href={webLink(r.item_url)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <strong>{r.name}</strong>
+                    <span>
+                      {r.item_key} <span className="meta-dot">·</span> started{" "}
+                      {relative(r.started_at, now)}
+                      {r.devspace && (
+                        <>
+                          <span className="meta-dot">·</span>on {r.devspace}
+                        </>
+                      )}
+                    </span>
+                  </a>
+                  <span className="status">{r.status}</span>
+                </div>
+              ))
+            )}
+          </div>
+          {heartbeat.skipped > 0 && (
+            <p className="detail-note">
+              {heartbeat.skipped} more workers left out, as malformed.
+            </p>
+          )}
+        </>
+      )}
+      {bot.agents?.error && (
+        <p className="connection-description danger">
+          {bot.agents.error}. Showing the last heartbeat read.
+        </p>
+      )}
+      <AskLinks ask={bot.ask} about={false} />
+    </article>
+  );
+}
 function App() {
   // What the service last sent; `data` and `mineView` are it as of now.
   const [fetched, setData] = useState<Snapshot>({
@@ -583,8 +816,12 @@ function App() {
     hub: null,
   });
   const [page, setPage] = useState<
-    "inbox" | "mine" | "efforts" | "connections"
+    "inbox" | "mine" | "bot" | "efforts" | "connections"
   >("inbox");
+  // The bots connected here: their heartbeats, and how to ask them.
+  const [bots, setBots] = useState<BotView[]>([]);
+  // Why the bots' view couldn't be read, if it couldn't.
+  const [botsError, setBotsError] = useState("");
   const [fetchedMine, setMineView] = useState<MineView>({
     mine: [],
     watching: [],
@@ -680,8 +917,21 @@ function App() {
       api<Snapshot>("snapshot"),
       api<MineView>("mine"),
     ]);
+    // Only the bot's section is unavailable if its view fails, not the
+    // page; it keeps what it last had.
+    const bot = await api<BotView[]>("bot").then(
+      (b) => {
+        setBotsError("");
+        return b;
+      },
+      (e: Error) => {
+        setBotsError(e.message);
+        return null;
+      },
+    );
     setData(next);
     setMineView(waiting);
+    if (bot) setBots(bot);
     setPaired(true);
     setFetchedAt(Date.now());
     setNow(Date.now());
@@ -991,6 +1241,24 @@ function App() {
             <UserCheck size={18} />
             Mine<span className="nav-count">{mineView.mine.length}</span>
           </button>
+          {(bots.length > 0 || botsError) && (
+            <button
+              className={page === "bot" ? "nav-item active" : "nav-item"}
+              onClick={() => {
+                setPage("bot");
+                setDetail(null);
+              }}
+            >
+              <Bot size={18} />
+              Bot
+              <span className="nav-count">
+                {bots.reduce(
+                  (n, b) => n + (b.agents?.heartbeat?.runs.length ?? 0),
+                  0,
+                )}
+              </span>
+            </button>
+          )}
           <button
             className={page === "efforts" ? "nav-item active" : "nav-item"}
             onClick={() => {
@@ -1050,9 +1318,11 @@ function App() {
                 ? "Inbox"
                 : page === "mine"
                   ? "Mine"
-                  : page === "efforts"
-                    ? "Efforts"
-                    : "Connections"}
+                  : page === "bot"
+                    ? "Bot"
+                    : page === "efforts"
+                      ? "Efforts"
+                      : "Connections"}
             </strong>
           </span>
           <div className="topbar-right">
@@ -1072,7 +1342,9 @@ function App() {
                   ? "What needs your attention?"
                   : page === "mine"
                     ? "What waits on you?"
-                    : page === "efforts"
+                    : page === "bot"
+                      ? "What is the bot doing?"
+                      : page === "efforts"
                       ? "From upstream to shipped."
                       : "Connect your work."}
               </h1>
@@ -1081,7 +1353,9 @@ function App() {
                   ? "One inbox for reviews, next steps, and work waiting on others."
                   : page === "mine"
                     ? "Review requests, assignments, mentions and your changes that need action, from every account. Each shows once, with every reason."
-                    : page === "efforts"
+                    : page === "bot"
+                      ? "Its coordinator's heartbeat and the agent runs it lists. Its board items and fork pull requests are in your inbox."
+                      : page === "efforts"
                       ? "Keep related tickets, changes, and advisories together."
                       : "Your accounts. Your access. Each service keeps its own identity."}
               </p>
@@ -1095,7 +1369,7 @@ function App() {
                   <Plus size={16} />
                   Connect source
                 </button>
-              ) : page === "mine" ? (
+              ) : page === "mine" || page === "bot" ? (
                 <button className="quiet" onClick={sync} disabled={syncing}>
                   <RefreshCw size={15} className={syncing ? "spin" : ""} />
                   {syncing ? "Syncing…" : "Sync sources"}
@@ -1433,6 +1707,22 @@ function App() {
               )}
             </>
           )}
+          {page === "bot" && botsError && (
+            <div className="message error" role="alert">
+              <AlertCircle size={17} />
+              <span>
+                The bot's view is unavailable: {botsError}. This is what it
+                had before.
+              </span>
+            </div>
+          )}
+          {page === "bot" && (
+            <div className="connection-grid bot-grid">
+              {bots.map((b) => (
+                <BotCard bot={b} now={now} key={b.connection_id} />
+              ))}
+            </div>
+          )}
           {page === "efforts" && (
             <div className="effort-grid">
               {data.efforts.length === 0 && (
@@ -1747,7 +2037,62 @@ function App() {
                 ? new Date(detailItem.updated_at).toLocaleString()
                 : "Unknown"}
             </dd>
+            {detailItem.bot?.priority && (
+              <>
+                <dt>Priority</dt>
+                <dd>{detailItem.bot.priority}</dd>
+              </>
+            )}
+            {detailItem.bot?.why && (
+              <>
+                <dt>Why</dt>
+                <dd>{detailItem.bot.why}</dd>
+              </>
+            )}
+            {detailItem.bot?.news && (
+              <>
+                <dt>News</dt>
+                <dd>{detailItem.bot.news}</dd>
+              </>
+            )}
+            {webLink(detailItem.bot?.branch) && (
+              <>
+                <dt>Branch</dt>
+                <dd>
+                  <a
+                    href={webLink(detailItem.bot?.branch)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {detailItem.bot?.branch}
+                  </a>
+                </dd>
+              </>
+            )}
+            {webLink(detailItem.bot?.board_item) && (
+              <>
+                <dt>On the bot's board as</dt>
+                <dd>
+                  <a
+                    href={webLink(detailItem.bot?.board_item)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {detailItem.bot?.board_item}
+                  </a>
+                </dd>
+              </>
+            )}
           </dl>
+          {bots
+            .filter((b) => b.asks[detailItem.id])
+            .map((b) => (
+              <AskLinks
+                ask={b.asks[detailItem.id]}
+                about={true}
+                key={b.connection_id}
+              />
+            ))}
           {detailItem.from_hub ? (
             <p className="detail-note">
               {detailItem.effort_id

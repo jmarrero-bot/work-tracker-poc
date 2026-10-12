@@ -1349,3 +1349,35 @@ h1 {
   border-top: 1px solid #313b49;
   margin-top: 25px;
 }
+.bot-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+.bot-card .work-list {
+  margin: 12px 0;
+}
+.bot-card .reason-tag {
+  margin-left: 6px;
+}
+.ask-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+}
+.ask-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-decoration: none;
+}
+.ask-comment {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  color: #aeb8c9;
+}
+.ask-links .token-note {
+  flex-basis: 100%;
+}
