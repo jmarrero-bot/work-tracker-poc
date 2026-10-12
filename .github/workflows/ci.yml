@@ -27,7 +27,7 @@ jobs:
         with:
           persist-credentials: false
       - name: cargo fmt
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
   build:
     runs-on: ubuntu-latest
@@ -80,12 +80,34 @@ jobs:
       - name: Hub and companion smoke test
         run: python3 tests/hub_smoke.py target/debug/workboard
 
+  # The GNOME app, on Fedora, as in jmarrero's toolbox: GTK 4 and
+  # libadwaita as Fedora ships them, newer than Ubuntu's.
+  gnome:
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install GTK, libadwaita and Rust
+        run: dnf -y install --setopt=install_weak_deps=False cargo clippy rustfmt gcc git gtk4-devel libadwaita-devel
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: gnome
+      - name: clippy
+        run: cargo clippy --locked -p workboard-gnome --all-targets -- -D warnings
+      # The API client and the view models, without a display.
+      - name: cargo test
+        run: cargo test --locked -p workboard-gnome
+      - name: cargo build
+        run: cargo build --locked -p workboard-gnome
+
   # The one job that decides whether a change may merge. It runs always(),
   # even when a job it needs failed or the run was cancelled, and fails
   # unless every job it needs succeeded. List every job above in needs.
   ci:
     if: always()
-    needs: [fmt, build]
+    needs: [fmt, build, gnome]
     runs-on: ubuntu-latest
     steps:
       - name: Check the jobs it needs

@@ -1,0 +1,120 @@
+{
+  "connections": [
+    {
+      "id": "0b6f6c2e-0000-4000-8000-000000000001",
+      "provider": "jira",
+      "label": "Work Jira",
+      "base_url": "https://jira.example.invalid/",
+      "account_id": "42",
+      "account_name": "jmarrero",
+      "zone": "internal",
+      "watch_user": null,
+      "sync_interval": null,
+      "sync": {
+        "last_success": "2026-10-12T11:40:00Z",
+        "last_attempt": "2026-10-12T11:58:00Z",
+        "next_due": null,
+        "failures": 1,
+        "error_kind": "auth",
+        "error": "Jira rejected the token",
+        "held_until": null
+      },
+      "schedule": {"interval_secs": 300, "running": false, "needs_user": true, "stale": true},
+      "from_hub": false
+    },
+    {
+      "id": "hub:7d1c",
+      "provider": "github",
+      "label": "GitHub",
+      "base_url": "https://github.com/",
+      "account_id": "",
+      "account_name": "jmarrero",
+      "zone": "external",
+      "watch_user": null,
+      "sync_interval": null,
+      "sync": {
+        "last_success": "2026-10-12T11:55:00Z",
+        "last_attempt": null,
+        "next_due": null,
+        "failures": 0,
+        "error_kind": null,
+        "error": null,
+        "held_until": null
+      },
+      "schedule": {"interval_secs": 300, "running": false, "needs_user": false, "stale": false},
+      "from_hub": true
+    }
+  ],
+  "items": [
+    {
+      "id": "hub:github:1",
+      "connection_id": "hub:7d1c",
+      "provider": "github",
+      "remote_id": "1",
+      "key": "bootc-dev/bootc#1234",
+      "title": "Add a composefs fsck",
+      "url": "https://github.com/bootc-dev/bootc/pull/1234",
+      "status": "Open",
+      "outcome": "open",
+      "outcome_reason": "GitHub pull request is open",
+      "action": "review",
+      "updated_at": "2026-10-12T10:00:00Z",
+      "effort_id": null,
+      "abandoned_at": null,
+      "demo": false,
+      "zone": "external",
+      "reasons": ["review_requested"],
+      "synced_at": "2026-10-12T11:55:00Z",
+      "stale": false,
+      "from_hub": true
+    },
+    {
+      "id": "demo-6",
+      "connection_id": null,
+      "provider": "github",
+      "remote_id": "demo-6",
+      "key": "closed-change",
+      "title": "Closed unmerged change",
+      "url": "https://github.com/bootc-dev/bootc",
+      "status": "Closed",
+      "outcome": "closed_without_delivery",
+      "outcome_reason": "Set manually as closed without delivery",
+      "action": "",
+      "updated_at": "2026-10-11T10:00:00Z",
+      "effort_id": "e1",
+      "abandoned_at": null,
+      "demo": true,
+      "zone": "internal",
+      "reasons": [],
+      "synced_at": null,
+      "stale": false,
+      "from_hub": false
+    }
+  ],
+  "efforts": [
+    {
+      "id": "e1",
+      "title": "Ship the bootc storage fix",
+      "note": "Upstream, downstream, release",
+      "share_title": false,
+      "progress": {"delivered": 1, "total": 5, "open": 3, "needs_attention": 1, "abandoned": 0},
+      "from_hub": false
+    }
+  ],
+  "mode": "local",
+  "hub": {
+    "url": "https://hub.example.ts.net/",
+    "sync": {
+      "last_success": "2026-10-12T11:55:00Z",
+      "last_attempt": "2026-10-12T11:55:00Z",
+      "next_due": "2026-10-12T12:00:00Z",
+      "failures": 0,
+      "error_kind": null,
+      "error": null,
+      "held_until": null
+    },
+    "schedule": {"interval_secs": 300, "running": false, "needs_user": false, "stale": false},
+    "connections": 1,
+    "items": 1
+  }
+}

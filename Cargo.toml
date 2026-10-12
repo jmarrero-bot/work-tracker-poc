@@ -1,3 +1,10 @@
+[workspace]
+# The service is the root package, and what a plain `cargo build` builds.
+# The GNOME app needs GTK and libadwaita to build, so it is built only when
+# asked for (`-p workboard-gnome` or `--workspace`).
+members = [".", "gnome"]
+default-members = ["."]
+
 [package]
 name = "workboard"
 version = "0.1.0"

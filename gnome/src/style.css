@@ -1,0 +1,85 @@
+/* Chips: an item's outcome, why it waits, where it comes from, and how
+   fresh it is. Colors come from libadwaita's palette, so they follow the
+   light and dark styles. */
+.chip {
+  border-radius: 999px;
+  padding: 1px 9px;
+  font-size: 0.82em;
+  font-weight: 600;
+  background-color: alpha(currentColor, 0.08);
+}
+.chip image {
+  -gtk-icon-size: 12px;
+}
+.chip.accent {
+  color: @accent_color;
+  background-color: alpha(@accent_bg_color, 0.14);
+}
+.chip.success {
+  color: @success_color;
+  background-color: alpha(@success_bg_color, 0.16);
+}
+.chip.warning {
+  color: @warning_color;
+  background-color: alpha(@warning_bg_color, 0.2);
+}
+.chip.error {
+  color: @error_color;
+  background-color: alpha(@error_bg_color, 0.16);
+}
+.chip.hub {
+  color: mix(@purple_3, @window_fg_color, 0.25);
+  background-color: alpha(@purple_3, 0.16);
+}
+
+/* A source's badge, in the colors the web page gives it. */
+.badge {
+  border-radius: 8px;
+  min-width: 32px;
+  min-height: 32px;
+  font-size: 0.72em;
+  font-weight: 800;
+  color: rgba(0, 0, 0, 0.75);
+  background-color: #c6cdd9;
+}
+.badge.jira { background-color: #6b9bff; }
+.badge.gitlab-internal { background-color: #fc936c; }
+.badge.gitlab-public { background-color: #eab36c; }
+.badge.github { background-color: #c6cdd9; }
+.badge.fedora { background-color: #79bbea; }
+.badge.bot { background-color: #b9a3f0; }
+.badge.errata { background-color: #e9859c; }
+
+/* An item row's outcome icon. */
+.outcome {
+  min-width: 24px;
+}
+.item-title {
+  font-weight: 600;
+}
+
+/* The sidebar's counts. */
+.count {
+  font-size: 0.85em;
+  font-weight: 600;
+  padding: 0 8px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.1);
+}
+.count.attention {
+  color: @warning_color;
+  background-color: alpha(@warning_bg_color, 0.2);
+}
+
+/* An effort's share delivered, thick enough to read at a glance. */
+.effort-progress {
+  min-width: 120px;
+}
+.effort-progress trough,
+.effort-progress progress {
+  min-height: 6px;
+  border-radius: 3px;
+}
+.effort-progress progress {
+  background-color: @success_color;
+}
