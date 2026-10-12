@@ -1,4 +1,5 @@
 pub use crate::{
+    connector::ErrorKind,
     outcome::{Outcome, Progress},
     zone::Zone,
 };
@@ -18,6 +19,10 @@ pub struct Connection {
     /// internal.
     #[serde(default)]
     pub zone: Zone,
+    /// The kind of the last sync's error, which unlike its message may
+    /// leave this machine.
+    #[serde(default)]
+    pub error_kind: Option<ErrorKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +69,11 @@ pub struct Effort {
     pub id: String,
     pub title: String,
     pub note: String,
+    /// Whether the title may leave this machine with the effort's external
+    /// items. A title can describe internal work, so it is off unless a
+    /// person turns it on.
+    #[serde(default)]
+    pub share_title: bool,
 }
 
 /// An effort with its progress, as the snapshot shows it.
@@ -99,6 +109,8 @@ pub struct EffortInput {
     pub note: String,
     #[serde(default)]
     pub item_ids: Vec<String>,
+    #[serde(default)]
+    pub share_title: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

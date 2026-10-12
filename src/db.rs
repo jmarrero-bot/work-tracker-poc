@@ -30,7 +30,7 @@ pub fn write_secret(path: &Path, value: &str) -> Result<()> {
 
 /// The schema version this build writes, kept in SQLite's `user_version`.
 /// Version 0 is the prototype's schema, whose items only had a `terminal` flag.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 fn schema_version(sql: &Sqlite) -> Result<i32> {
     let version = sql.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -59,6 +59,12 @@ fn migrate(sql: &mut Sqlite, root: &Path) -> Result<()> {
     }
     if version < 2 {
         migrate_zones(&tx).context("Cannot add zones to stored connections")?;
+    }
+    if version < 3 {
+        // Version 3: whether an effort's title may leave this machine. No
+        // title was shared before.
+        tx.execute_batch("ALTER TABLE efforts ADD COLUMN share_title INTEGER NOT NULL DEFAULT 0")
+            .context("Cannot add title sharing to stored efforts")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -307,12 +313,13 @@ impl Db {
     pub fn efforts(&self) -> Result<Vec<Effort>> {
         let mut s = self
             .sql
-            .prepare("SELECT id,title,note FROM efforts ORDER BY rowid")?;
+            .prepare("SELECT id,title,note,share_title FROM efforts ORDER BY rowid")?;
         let rows = s.query_map([], |r| {
             Ok(Effort {
                 id: r.get(0)?,
                 title: r.get(1)?,
                 note: r.get(2)?,
+                share_title: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -325,11 +332,12 @@ impl Db {
             id: Uuid::new_v4().to_string(),
             title: input.title.trim().into(),
             note: input.note,
+            share_title: input.share_title,
         };
         let tx = self.sql.transaction()?;
         tx.execute(
-            "INSERT INTO efforts VALUES(?1,?2,?3)",
-            params![e.id, e.title, e.note],
+            "INSERT INTO efforts(id,title,note,share_title) VALUES(?1,?2,?3,?4)",
+            params![e.id, e.title, e.note, e.share_title],
         )?;
         for id in input.item_ids {
             if tx.execute(
@@ -342,6 +350,21 @@ impl Db {
         }
         tx.commit()?;
         Ok(e)
+    }
+    /// Let an effort's title leave this machine with its external items, or
+    /// stop it.
+    pub fn share_title(&self, id: &str, share: bool) -> Result<Effort> {
+        if self.sql.execute(
+            "UPDATE efforts SET share_title=?1 WHERE id=?2",
+            params![share, id],
+        )? != 1
+        {
+            bail!("Effort not found")
+        }
+        self.efforts()?
+            .into_iter()
+            .find(|e| e.id == id)
+            .context("Effort not found")
     }
     pub fn link(&self, item: &str, effort: Option<&str>) -> Result<()> {
         if let Some(e) = effort {
@@ -470,7 +493,7 @@ impl Db {
                 zone: Zone::Internal,
             })?;
         }
-        self.create_effort(EffortInput {title:"Ship the bootc storage fix".into(),note:"Example effort linking upstream work, a RHEL backport and an advisory. All items are illustrative.".into(),item_ids:[0,1,2,3,6].map(|n|format!("demo-{n}")).to_vec()})?;
+        self.create_effort(EffortInput {title:"Ship the bootc storage fix".into(),note:"Example effort linking upstream work, a RHEL backport and an advisory. All items are illustrative.".into(),item_ids:[0,1,2,3,6].map(|n|format!("demo-{n}")).to_vec(),share_title:false})?;
         Ok(())
     }
 }
@@ -726,6 +749,7 @@ mod tests {
             last_sync: None,
             error: None,
             zone,
+            error_kind: None,
         }
     }
 
@@ -795,6 +819,9 @@ mod tests {
                 [legacy.to_string()],
             )
             .unwrap();
+            // Version 1 had no title sharing either.
+            sql.execute_batch("ALTER TABLE efforts DROP COLUMN share_title")
+                .unwrap();
             sql.pragma_update(None, "user_version", 1).unwrap();
         }
         for _ in 0..2 {
@@ -820,6 +847,35 @@ mod tests {
             .query_row("SELECT body FROM connections", [], |r| r.get(0))
             .unwrap();
         assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), legacy);
+    }
+
+    #[test]
+    fn effort_titles_are_not_shared_unless_asked() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("db");
+        let id = {
+            let mut db = Db::open(&root).unwrap();
+            db.seed().unwrap();
+            let e = db.efforts().unwrap().remove(0);
+            assert!(!e.share_title, "the demo effort");
+            let shared = db
+                .create_effort(EffortInput {
+                    title: "Shared".into(),
+                    note: String::new(),
+                    item_ids: vec![],
+                    share_title: true,
+                })
+                .unwrap();
+            assert!(shared.share_title);
+            assert!(db.share_title(&e.id, true).unwrap().share_title);
+            assert!(db.share_title("missing", true).is_err());
+            e.id
+        };
+        // Open it again, as after a restart.
+        let db = Db::open(&root).unwrap();
+        let efforts = db.efforts().unwrap();
+        assert!(efforts.iter().all(|e| e.share_title));
+        assert!(!db.share_title(&id, false).unwrap().share_title);
     }
 
     #[test]

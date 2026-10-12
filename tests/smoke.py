@@ -63,6 +63,21 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert len({i['provider'] for i in snapshot['items']}) == 6
         # Manual items have no connection to make them external.
         assert all(i['zone'] == 'internal' for i in snapshot['items'])
+        # So none of them leaves: the export for the hub is empty.
+        assert call('/api/export/external')[0] == 401
+        exported = subprocess.check_output(command + ['export','--external'], text=True)
+        assert json.loads(exported) == {'zone':'external','connections':[],'items':[],'efforts':[]}, exported
+        assert subprocess.run(command + ['export'], capture_output=True).returncode != 0
+        # Effort titles stay unless shared.
+        def demo_sharing():
+            [demo] = json.loads(subprocess.check_output(command + ['status','bootc','--json']))
+            return demo['effort']['id'], demo['effort']['share_title']
+        demo_id, shared = demo_sharing()
+        assert shared is False
+        subprocess.check_call(command + ['share-title', demo_id], stdout=subprocess.DEVNULL)
+        assert demo_sharing() == (demo_id, True)
+        subprocess.check_call(command + ['share-title', demo_id, '--undo'], stdout=subprocess.DEVNULL)
+        assert demo_sharing() == (demo_id, False)
         # Three next actions, a review, and the closed unmerged change, which needs a decision.
         assert len(json.loads(subprocess.check_output(command + ['next','--json']))) == 5
         without_home = {k:v for k,v in os.environ.items() if k != 'HOME'}

@@ -69,7 +69,14 @@ type Progress = {
   needs_attention: number;
   abandoned: number;
 };
-type Effort = { id: string; title: string; note: string; progress: Progress };
+type Effort = {
+  id: string;
+  title: string;
+  note: string;
+  // Whether the title may also be shown on the hub.
+  share_title: boolean;
+  progress: Progress;
+};
 type Snapshot = { items: Item[]; connections: Connection[]; efforts: Effort[] };
 const providers: Record<
   Provider,
@@ -392,6 +399,14 @@ function App() {
       await reload();
     } catch (e) {
       setError((e as Error).message);
+    }
+  }
+  async function shareTitle(e: Effort, share: boolean) {
+    try {
+      await api(`efforts/${e.id}`, { share_title: share }, "PATCH");
+      await reload();
+    } catch (err) {
+      setError((err as Error).message);
     }
   }
   async function disconnect(c: Connection) {
@@ -902,6 +917,18 @@ function App() {
                     </div>
                     <h2>{e.title}</h2>
                     {e.note && <p>{e.note}</p>}
+                    <label className="zone-choice">
+                      <input
+                        type="checkbox"
+                        checked={e.share_title}
+                        onChange={(ev) => shareTitle(e, ev.target.checked)}
+                      />
+                      <span>
+                        Show this title on the hub with the effort's external
+                        work. Otherwise it appears there as a neutral label.
+                        The note always stays on this machine.
+                      </span>
+                    </label>
                     <div className="progress-track">
                       <div
                         style={{

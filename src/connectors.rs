@@ -446,6 +446,7 @@ mod tests {
             last_sync: None,
             error: None,
             zone: Zone::Internal,
+            error_kind: None,
         }
     }
     #[test]

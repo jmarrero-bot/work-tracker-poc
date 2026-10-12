@@ -506,6 +506,7 @@ mod tests {
             last_sync: None,
             error: None,
             zone: Zone::External,
+            error_kind: None,
         }
     }
     fn target() -> Target {
