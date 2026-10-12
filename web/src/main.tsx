@@ -19,6 +19,7 @@ import {
   AlertCircle,
   LayoutGrid,
   Unplug,
+  UserCheck,
 } from "lucide-react";
 import "./style.css";
 
@@ -33,6 +34,26 @@ type Outcome =
   | "closed_without_delivery"
   | "abandoned"
   | "unknown";
+// Why an item waits on an account.
+type Reason =
+  | "review_requested"
+  | "team_review_requested"
+  | "assigned"
+  | "mentioned"
+  | "changes_requested"
+  | "checks_failing"
+  | "authored"
+  | "todo";
+const reasonLabels: Record<Reason, string> = {
+  review_requested: "Review requested",
+  team_review_requested: "Team review requested",
+  assigned: "Assigned",
+  mentioned: "Mentioned",
+  changes_requested: "Needs action: changes requested",
+  checks_failing: "Needs action: checks failing",
+  authored: "Authored",
+  todo: "On the to-do list",
+};
 type Item = {
   id: string;
   connection_id: string | null;
@@ -50,6 +71,32 @@ type Item = {
   abandoned_at: string | null;
   demo: boolean;
   zone: Zone;
+  reasons: Reason[];
+};
+// One thing that waits in the Mine view, once, with every reason.
+type MineRow = {
+  id: string;
+  provider: Provider;
+  key: string;
+  title: string;
+  url: string;
+  status: string;
+  outcome: Outcome;
+  outcome_reason: string;
+  zone: Zone;
+  updated_at: string;
+  // Each account it waits on, with that account's own reasons: the
+  // connection's account, or the user it watches.
+  waits_on: { account: string; connection_id: string; reasons: Reason[] }[];
+};
+// A watch list its last sync couldn't update.
+type WatchError = { connection_id: string; login: string; error: string };
+// What waits on the connected accounts, and apart from it what watching
+// other users found, which is never theirs.
+type MineView = {
+  mine: MineRow[];
+  watching: MineRow[];
+  watch_errors: WatchError[];
 };
 type Connection = {
   id: string;
@@ -111,13 +158,15 @@ const outcomes: Record<Outcome, string> = {
   unknown: "Unknown",
 };
 const outcomeNames = Object.keys(outcomes) as Outcome[];
+// What shows an outcome: an item, or a row of the Mine view.
+type Outcomed = { status: string; outcome: Outcome; outcome_reason: string };
 // Finished: delivered, or abandoned by a person.
-const settled = (i: Item) =>
+const settled = (i: Outcomed) =>
   i.outcome === "delivered" || i.outcome === "abandoned";
 // Never progress: a person decides what happened.
-const needsDecision = (i: Item) =>
+const needsDecision = (i: Outcomed) =>
   i.outcome === "closed_without_delivery" || i.outcome === "unknown";
-const outcomeClass = (i: Item) =>
+const outcomeClass = (i: Outcomed) =>
   i.outcome === "delivered"
     ? "complete"
     : needsDecision(i)
@@ -125,7 +174,7 @@ const outcomeClass = (i: Item) =>
       : i.outcome === "abandoned"
         ? "abandoned"
         : "";
-function OutcomeIcon({ item, size }: { item: Item; size: number }) {
+function OutcomeIcon({ item, size }: { item: Outcomed; size: number }) {
   if (item.outcome === "delivered") return <Check size={size} />;
   if (needsDecision(item)) return <AlertCircle size={size} />;
   if (item.outcome === "abandoned") return <X size={size} />;
@@ -173,7 +222,7 @@ function Mark({
     </span>
   );
 }
-function Status({ item }: { item: Item }) {
+function Status({ item }: { item: Outcomed }) {
   const kind =
     outcomeClass(item) ||
     (item.status.toLowerCase().includes("fail") ? "failed" : "");
@@ -190,15 +239,94 @@ function Status({ item }: { item: Item }) {
     </span>
   );
 }
+function MineList({
+  title,
+  note,
+  rows,
+  empty,
+}: {
+  title: string;
+  note: string;
+  rows: MineRow[];
+  empty: string;
+}) {
+  return (
+    <section className="inbox-section">
+      <div className="section-heading">
+        <div>
+          <h2>
+            {title} <span>{rows.length}</span>
+          </h2>
+          <p>{note}</p>
+        </div>
+      </div>
+      <div className="work-list">
+        {rows.length === 0 ? (
+          <div className="empty">
+            <UserCheck size={28} />
+            <h3>Nothing waits here</h3>
+            <p>{empty}</p>
+          </div>
+        ) : (
+          rows.map((r) => (
+            <div className="work-row mine-row" key={r.id}>
+              <Mark provider={r.provider} />
+              <a
+                className="item-title"
+                href={r.url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <strong>{r.title}</strong>
+                <span>
+                  {r.key} <span className="meta-dot">·</span>{" "}
+                  {providers[r.provider].name}
+                </span>
+                {r.waits_on.map((w) => (
+                  <span key={`${w.account} ${w.connection_id}`}>
+                    {w.account}:
+                    {w.reasons.map((reason) => (
+                      <em className="reason-tag" key={reason}>
+                        {reasonLabels[reason]}
+                      </em>
+                    ))}
+                  </span>
+                ))}
+              </a>
+              <Status item={r} />
+              <em className={`zone-tag ${r.zone}`}>
+                {r.zone === "external" ? "External" : "Internal"}
+              </em>
+              <a
+                className="open-source"
+                href={r.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label={`Open ${r.title} at source`}
+              >
+                <ExternalLink size={16} />
+              </a>
+            </div>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
 function App() {
   const [data, setData] = useState<Snapshot>({
     items: [],
     connections: [],
     efforts: [],
   });
-  const [page, setPage] = useState<"inbox" | "efforts" | "connections">(
-    "inbox",
-  );
+  const [page, setPage] = useState<
+    "inbox" | "mine" | "efforts" | "connections"
+  >("inbox");
+  const [mineView, setMineView] = useState<MineView>({
+    mine: [],
+    watching: [],
+    watch_errors: [],
+  });
   const [loading, setLoading] = useState(true);
   const [paired, setPaired] = useState(false);
   const [error, setError] = useState("");
@@ -270,8 +398,12 @@ function App() {
     detailItem?.outcome,
   ]);
   async function reload() {
-    const next = await api<Snapshot>("snapshot");
+    const [next, waiting] = await Promise.all([
+      api<Snapshot>("snapshot"),
+      api<MineView>("mine"),
+    ]);
     setData(next);
+    setMineView(waiting);
     setPaired(true);
   }
   useEffect(() => {
@@ -525,6 +657,16 @@ function App() {
             My inbox<span className="nav-count">{active.length}</span>
           </button>
           <button
+            className={page === "mine" ? "nav-item active" : "nav-item"}
+            onClick={() => {
+              setPage("mine");
+              setDetail(null);
+            }}
+          >
+            <UserCheck size={18} />
+            Mine<span className="nav-count">{mineView.mine.length}</span>
+          </button>
+          <button
             className={page === "efforts" ? "nav-item active" : "nav-item"}
             onClick={() => {
               setPage("efforts");
@@ -581,9 +723,11 @@ function App() {
             <strong>
               {page === "inbox"
                 ? "Inbox"
-                : page === "efforts"
-                  ? "Efforts"
-                  : "Connections"}
+                : page === "mine"
+                  ? "Mine"
+                  : page === "efforts"
+                    ? "Efforts"
+                    : "Connections"}
             </strong>
           </span>
           <div className="topbar-right">
@@ -601,16 +745,20 @@ function App() {
               <h1>
                 {page === "inbox"
                   ? "What needs your attention?"
-                  : page === "efforts"
-                    ? "From upstream to shipped."
-                    : "Connect your work."}
+                  : page === "mine"
+                    ? "What waits on you?"
+                    : page === "efforts"
+                      ? "From upstream to shipped."
+                      : "Connect your work."}
               </h1>
               <p>
                 {page === "inbox"
                   ? "One inbox for reviews, next steps, and work waiting on others."
-                  : page === "efforts"
-                    ? "Keep related tickets, changes, and advisories together."
-                    : "Your accounts. Your access. Each service keeps its own identity."}
+                  : page === "mine"
+                    ? "Review requests, assignments, mentions and your changes that need action, from every account. Each shows once, with every reason."
+                    : page === "efforts"
+                      ? "Keep related tickets, changes, and advisories together."
+                      : "Your accounts. Your access. Each service keeps its own identity."}
               </p>
             </div>
             <div className="heading-actions">
@@ -621,6 +769,11 @@ function App() {
                 >
                   <Plus size={16} />
                   Connect source
+                </button>
+              ) : page === "mine" ? (
+                <button className="quiet" onClick={sync} disabled={syncing}>
+                  <RefreshCw size={15} className={syncing ? "spin" : ""} />
+                  {syncing ? "Syncing…" : "Sync sources"}
                 </button>
               ) : (
                 <>
@@ -887,6 +1040,39 @@ function App() {
                   public links open project homes. Start a separate data
                   directory for real work.
                 </p>
+              )}
+            </>
+          )}
+          {page === "mine" && (
+            <>
+              <MineList
+                title="Waiting on you"
+                note="From the account behind each connection. Internal work shows only on this machine."
+                rows={mineView.mine}
+                empty="Nothing waits on your connected accounts. Sync to check again."
+              />
+              {(mineView.watching.length > 0 ||
+                mineView.watch_errors.length > 0) && (
+                <>
+                  {mineView.watch_errors.map((e) => (
+                    <div
+                      className="message error"
+                      role="alert"
+                      key={e.connection_id}
+                    >
+                      <AlertCircle size={17} />
+                      <span>
+                        {e.error}. Watching shows what an earlier sync found.
+                      </span>
+                    </div>
+                  ))}
+                  <MineList
+                    title="Watching"
+                    note="Found by watching other users' activity that your tokens can see. This is their work, not yours."
+                    rows={mineView.watching}
+                    empty="Nothing found for the users you watch."
+                  />
+                </>
               )}
             </>
           )}

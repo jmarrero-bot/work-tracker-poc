@@ -1,6 +1,7 @@
 mod connector;
 mod connectors;
 mod db;
+mod mine;
 mod model;
 mod outcome;
 mod server;
@@ -78,6 +79,13 @@ enum Command {
     Sync,
     /// Show active work. Add --json for agent/script consumption.
     Inbox {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show what waits on the account behind each connection, and why: review
+    /// requests, assignments, mentions and your own changes that need
+    /// action. What watching another user found is listed apart, as theirs.
+    Mine {
         #[arg(long)]
         json: bool,
     },
@@ -402,6 +410,29 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Mine { json } => {
+            let view: mine::Mine = request(
+                &client,
+                &root,
+                args.port,
+                reqwest::Method::GET,
+                "mine",
+                None,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&view)?);
+            } else {
+                print_rows("Waiting on you", &view.mine);
+                if !view.watching.is_empty() || !view.watch_errors.is_empty() {
+                    println!();
+                    print_rows("Watching: their work, not yours", &view.watching);
+                    for e in &view.watch_errors {
+                        println!("  Not updated, showing the last list: {}", e.error);
+                    }
+                }
+            }
+        }
         Command::Status { query, json } => {
             let s: SnapshotClient = request(
                 &client,
@@ -617,6 +648,31 @@ async fn main() -> Result<()> {
         Command::Serve { .. } => unreachable!(),
     }
     Ok(())
+}
+/// Rows of the Mine view under `heading`: why each waits and on whom, its
+/// native status and outcome, its zone and its link.
+fn print_rows(heading: &str, rows: &[mine::Row]) {
+    println!("{heading} ({})", rows.len());
+    for r in rows {
+        // Each account with its own reasons, never another's.
+        let waits_on: Vec<_> = r
+            .waits_on
+            .iter()
+            .map(|w| {
+                let reasons: Vec<_> = w.reasons.iter().map(|r| r.label()).collect();
+                format!("{}: {}", w.account, reasons.join(", "))
+            })
+            .collect();
+        println!("  [{}] {}  {}", r.provider, r.key, r.title);
+        println!(
+            "      {}  ·  {}  ·  {}  ·  {}  ·  {}",
+            waits_on.join("; "),
+            r.status,
+            r.outcome.label(),
+            r.zone.label(),
+            r.url
+        );
+    }
 }
 fn items_of<'a>(items: &'a [Item], e: &EffortView) -> Vec<&'a Item> {
     items

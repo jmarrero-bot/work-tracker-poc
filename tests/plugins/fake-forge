@@ -31,7 +31,7 @@ def helper():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def item(remote_id, outcome, action='next'):
+def item(remote_id, outcome, action='next', reasons=()):
     return {
         'remote_id': remote_id,
         'key': f'FF-{remote_id}',
@@ -42,6 +42,7 @@ def item(remote_id, outcome, action='next'):
         'outcome_reason': f'Fake forge says {outcome}',
         'action': action,
         'updated_at': '2026-10-12T00:00:00Z',
+        'reasons': list(reasons),
     }
 
 
@@ -95,7 +96,8 @@ if method == 'verify':
 if request['account']['id'] != '42':
     error('invalid', 'Unexpected account')
 if method == 'list':
-    answer({'items': [item('1', 'open', 'review'), item('2', 'open')]})
+    answer({'items': [item('1', 'open', 'review', ['review_requested']),
+                      item('2', 'open', reasons=['assigned', 'mentioned', 'assigned'])]})
 if method == 'refresh':
     results = []
     for tracked in request['items']:

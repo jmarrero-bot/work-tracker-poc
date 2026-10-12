@@ -168,6 +168,21 @@ pub enum Reason {
     Todo,
 }
 
+impl Reason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReviewRequested => "review requested",
+            Self::TeamReviewRequested => "team review requested",
+            Self::Assigned => "assigned",
+            Self::Mentioned => "mentioned",
+            Self::ChangesRequested => "needs action: changes requested",
+            Self::ChecksFailing => "needs action: checks failing",
+            Self::Authored => "authored",
+            Self::Todo => "on the to-do list",
+        }
+    }
+}
+
 /// An item as its source reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteItem {
