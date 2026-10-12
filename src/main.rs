@@ -501,6 +501,7 @@ async fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&items)?)
             } else {
+                let now = Timestamp::of(SystemTime::now());
                 for i in items {
                     // Every listed item is open unless it needs attention.
                     let outcome = if i.outcome == Outcome::Open {
@@ -509,13 +510,14 @@ async fn main() -> Result<()> {
                         format!("  {}: {}", i.outcome.label(), i.outcome_reason)
                     };
                     println!(
-                        "{}  [{}] {}  {}{}{}",
+                        "{}  [{}] {}  {}{}{}{}",
                         i.id,
                         i.provider,
                         i.title,
                         i.status,
                         outcome,
-                        if i.demo { " (demo)" } else { "" }
+                        if i.demo { " (demo)" } else { "" },
+                        staleness(i.stale, i.synced_at, now)
                     );
                 }
             }
@@ -533,10 +535,11 @@ async fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&view)?);
             } else {
-                print_rows("Waiting on you", &view.mine);
+                let now = Timestamp::of(SystemTime::now());
+                print_rows("Waiting on you", &view.mine, now);
                 if !view.watching.is_empty() || !view.watch_errors.is_empty() {
                     println!();
-                    print_rows("Watching: their work, not yours", &view.watching);
+                    print_rows("Watching: their work, not yours", &view.watching, now);
                     for e in &view.watch_errors {
                         println!("  Not updated, showing the last list: {}", e.error);
                     }
@@ -796,7 +799,23 @@ fn sync_status(c: &Connection, now: Timestamp) -> String {
             s.failures
         )
     };
-    format!("{state}; {last}")
+    // Never synced says so itself.
+    let stale = if c.schedule.stale && s.last_success.is_some() {
+        "Stale: "
+    } else {
+        ""
+    };
+    format!("{stale}{state}; {last}")
+}
+/// How stale something synced at `synced_at` is, if it is.
+fn staleness(stale: bool, synced_at: Option<Timestamp>, now: Timestamp) -> String {
+    if !stale {
+        return String::new();
+    }
+    match synced_at {
+        Some(t) => format!("  (stale: last synced {})", relative(t, now)),
+        None => "  (stale: not synced)".into(),
+    }
 }
 /// `text` with a capital first letter.
 fn capitalized(text: &str) -> String {
@@ -806,8 +825,8 @@ fn capitalized(text: &str) -> String {
     })
 }
 /// Rows of the Mine view under `heading`: why each waits and on whom, its
-/// native status and outcome, its zone and its link.
-fn print_rows(heading: &str, rows: &[mine::Row]) {
+/// native status and outcome, its zone, its link, and whether it is stale.
+fn print_rows(heading: &str, rows: &[mine::Row], now: Timestamp) {
     println!("{heading} ({})", rows.len());
     for r in rows {
         // Each account with its own reasons, never another's.
@@ -821,12 +840,13 @@ fn print_rows(heading: &str, rows: &[mine::Row]) {
             .collect();
         println!("  [{}] {}  {}", r.provider, r.key, r.title);
         println!(
-            "      {}  ·  {}  ·  {}  ·  {}  ·  {}",
+            "      {}  ·  {}  ·  {}  ·  {}  ·  {}{}",
             waits_on.join("; "),
             r.status,
             r.outcome.label(),
             r.zone.label(),
-            r.url
+            r.url,
+            staleness(r.stale, r.synced_at, now)
         );
     }
 }

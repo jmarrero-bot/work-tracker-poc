@@ -16,7 +16,7 @@ use crate::{
     connector::{self, Connector, Requests, Target},
     connectors,
     db::Db,
-    model::{Connection, ErrorKind, Schedule, SyncState},
+    model::{Connection, ErrorKind, Item, Schedule, Snapshot, SyncState, WatchList},
 };
 use anyhow::{bail, Result};
 use serde::Serialize;
@@ -46,6 +46,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60);
 const MAX_SLEEP: Duration = Duration::from_secs(30);
 /// The shortest it sleeps, so nothing it can't start makes it spin.
 const MIN_SLEEP: Duration = Duration::from_secs(1);
+/// How many of its intervals after its last success a connection's items
+/// are stale: enough that one slow or failed sync doesn't make them so.
+const STALE_INTERVALS: u32 = 3;
 
 /// When connections sync.
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +69,17 @@ impl Policy {
     /// How often `c` syncs.
     pub fn interval(&self, c: &Connection) -> Duration {
         c.sync_interval.map_or(self.interval, Duration::from_secs)
+    }
+    /// How long after its last success the items of `c` are stale.
+    pub fn stale_after(&self, c: &Connection) -> Duration {
+        self.interval(c).saturating_mul(STALE_INTERVALS)
+    }
+    /// Whether the items of `c` are too old to be shown as current at
+    /// `now`, or it never synced.
+    pub fn is_stale(&self, c: &Connection, now: Timestamp) -> bool {
+        c.sync
+            .last_success
+            .is_none_or(|last| now.since(last) > self.stale_after(c))
     }
     /// When the next scheduled sync of `c` is due, after one that finished
     /// at `now` and left `state`: an interval after a success, a backoff
@@ -125,6 +139,22 @@ fn random_sample() -> f64 {
     const BITS: u32 = 53;
     let bits = uuid::Uuid::new_v4().as_u128() & ((1 << BITS) - 1);
     bits as f64 / (1u64 << BITS) as f64
+}
+
+/// Fill in how fresh each of `items` is: as fresh as its connection's last
+/// success, from `connections` as [`Scheduler::annotate`] left them. An item
+/// of a connection that isn't there is stale; a manual one has no sync.
+pub fn freshness(connections: &[Connection], items: &mut [Item]) {
+    for item in items {
+        let Some(id) = item.connection_id.as_deref() else {
+            item.synced_at = None;
+            item.stale = false;
+            continue;
+        };
+        let c = connections.iter().find(|c| c.id == id);
+        item.synced_at = c.and_then(|c| c.sync.last_success);
+        item.stale = c.is_none_or(|c| c.schedule.stale);
+    }
 }
 
 /// Where the scheduler gets a connector for a provider.
@@ -341,14 +371,40 @@ impl Scheduler {
     fn is_running(&self, id: &str) -> bool {
         lock(&self.running).contains_key(id)
     }
-    /// Fill in how each connection is scheduled.
+    /// Fill in how each connection is scheduled, and how fresh its items
+    /// are.
     pub fn annotate(&self, connections: &mut [Connection]) {
+        let now = self.now();
         for c in connections {
             c.schedule = Schedule {
                 interval_secs: self.policy.interval(c).as_secs(),
                 running: self.is_running(&c.id),
                 needs_user: c.sync.error_kind == Some(ErrorKind::Auth),
+                stale: self.policy.is_stale(c, now),
             };
+        }
+    }
+    /// Fill in a snapshot's schedules and how fresh everything in it is, and
+    /// in what watching found. A watch list is as fresh as the sync that
+    /// found it, not its connection's last one: a watch can keep failing,
+    /// and keep its list, while the account's own syncs succeed.
+    pub fn annotate_snapshot(&self, snapshot: &mut Snapshot, watched: &mut [WatchList]) {
+        self.annotate(&mut snapshot.connections);
+        freshness(&snapshot.connections, &mut snapshot.items);
+        let now = self.now();
+        for list in watched {
+            let c = snapshot
+                .connections
+                .iter()
+                .find(|c| c.id == list.connection_id);
+            let stale = c.is_none_or(|c| {
+                list.last_success
+                    .is_none_or(|last| now.since(last) > self.policy.stale_after(c))
+            });
+            for item in &mut list.items {
+                item.synced_at = list.last_success;
+                item.stale = stale;
+            }
         }
     }
     /// When `c` is next due to sync on schedule: none while it runs or needs
@@ -636,7 +692,8 @@ mod tests {
     use crate::{
         clock::ManualClock,
         connector::{
-            Account, BoxFuture, ConnectorError, ConnectorResult, Refreshed, RemoteItem, Tracked,
+            Account, BoxFuture, ConnectorError, ConnectorResult, Reason, Refreshed, RemoteItem,
+            Tracked,
         },
         db,
         model::{Item, Outcome, Zone},
@@ -683,6 +740,31 @@ mod tests {
 
     struct Fake(Arc<World>);
 
+    /// What a host answers to `watch` is queued under its name and this.
+    const WATCH: &str = "#watch";
+
+    /// `count` open items of `host`, their IDs starting with `prefix`.
+    fn remote_items(host: &str, prefix: &str, count: usize) -> Vec<RemoteItem> {
+        (0..count)
+            .map(|n| RemoteItem {
+                remote_id: format!("{prefix}{n}"),
+                key: format!("{host}-{prefix}{n}"),
+                title: format!("Item {prefix}{n} of {host}"),
+                url: format!("https://{host}/{prefix}{n}"),
+                status: "open".into(),
+                outcome: Outcome::Open,
+                outcome_reason: "Open".into(),
+                action: "next".into(),
+                updated_at: "2026-10-12T00:00:00Z".into(),
+                reasons: if prefix.is_empty() {
+                    vec![]
+                } else {
+                    vec![Reason::Assigned]
+                },
+            })
+            .collect()
+    }
+
     fn host(target: &Target) -> String {
         target.base_url.host_str().unwrap_or_default().into()
     }
@@ -721,20 +803,21 @@ mod tests {
                     .get_mut(&host)
                     .and_then(VecDeque::pop_front)
                     .unwrap_or(Ok(2));
-                Ok((0..answer?)
-                    .map(|n| RemoteItem {
-                        remote_id: n.to_string(),
-                        key: format!("{host}-{n}"),
-                        title: format!("Item {n} of {host}"),
-                        url: format!("https://{host}/{n}"),
-                        status: "open".into(),
-                        outcome: Outcome::Open,
-                        outcome_reason: "Open".into(),
-                        action: "next".into(),
-                        updated_at: "2026-10-12T00:00:00Z".into(),
-                        reasons: vec![],
-                    })
-                    .collect())
+                Ok(remote_items(&host, "", answer?))
+            })
+        }
+        fn watch<'a>(
+            &'a self,
+            target: &'a Target,
+            _: &'a str,
+        ) -> BoxFuture<'a, ConnectorResult<Vec<RemoteItem>>> {
+            Box::pin(async move {
+                let host = host(target);
+                let answer = lock(&self.0.answers)
+                    .get_mut(&format!("{host}{WATCH}"))
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(Ok(1));
+                Ok(remote_items(&host, "w", answer?))
             })
         }
         fn refresh<'a>(
@@ -1247,6 +1330,117 @@ mod tests {
                 .await
                 .is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn items_are_as_fresh_as_their_connections_last_success() {
+        let h = Harness::new(&[("a.example", None), ("b.example", Some(10 * MINUTE))]);
+        // With manual items too.
+        lock(&h.db).seed().unwrap();
+        let snapshot = |h: &Harness| {
+            let mut s = lock(&h.db).snapshot().unwrap();
+            let mut watched = lock(&h.db).watched().unwrap();
+            h.scheduler.annotate_snapshot(&mut s, &mut watched);
+            s
+        };
+        // Never synced: stale, though there is nothing to show yet.
+        let s = snapshot(&h);
+        assert!(s.connections.iter().all(|c| c.schedule.stale));
+        h.tick().await;
+        // A failing sync doesn't make what the last one found stale yet.
+        h.world.answer("a.example", Err(transient()));
+        h.set(at(10));
+        h.tick().await;
+        let fresh = |h: &Harness, host: &str| {
+            let s = snapshot(h);
+            let c = s.connections.iter().find(|c| c.label == host).unwrap();
+            let items: Vec<_> = s
+                .items
+                .iter()
+                .filter(|i| i.connection_id.as_ref() == Some(&c.id))
+                .map(|i| (i.synced_at, i.stale))
+                .collect();
+            assert_eq!(items.len(), 2);
+            // Every item as fresh as its connection.
+            assert!(items
+                .iter()
+                .all(|i| *i == (c.sync.last_success, c.schedule.stale)));
+            (c.sync.last_success, c.schedule.stale)
+        };
+        assert_eq!(fresh(&h, "a.example"), (Some(t0()), false));
+        // Three intervals after the last success, it is stale; a connection
+        // with a longer interval isn't yet.
+        h.set(at(15));
+        assert_eq!(fresh(&h, "a.example"), (Some(t0()), false));
+        h.set(at(16));
+        assert_eq!(fresh(&h, "a.example"), (Some(t0()), true));
+        assert_eq!(fresh(&h, "b.example"), (Some(at(10)), false));
+        // A success makes it current again.
+        h.tick().await;
+        assert_eq!(fresh(&h, "a.example"), (Some(at(16)), false));
+        // Manual items have no sync to be fresh from.
+        let s = snapshot(&h);
+        let manual: Vec<_> = s
+            .items
+            .iter()
+            .filter(|i| i.connection_id.is_none())
+            .collect();
+        assert_eq!(manual.len(), 7);
+        assert!(manual.iter().all(|i| i.synced_at.is_none() && !i.stale));
+        // An item whose connection isn't known is never current.
+        let mut orphan = s.items[0].clone();
+        orphan.connection_id = Some("gone".into());
+        freshness(&s.connections, std::slice::from_mut(&mut orphan));
+        assert!(orphan.stale && orphan.synced_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failing_watch_goes_stale_while_the_account_syncs() {
+        let h = Harness::new(&[("a.example", None)]);
+        lock(&h.db)
+            .set_watch_user(h.id("a.example"), Some("someone"))
+            .unwrap();
+        h.tick().await;
+        // From now on the watch fails, and keeps what it found at t0,
+        // while the account's own syncs go on succeeding.
+        let watched = |h: &Harness| {
+            let mut s = lock(&h.db).snapshot().unwrap();
+            let mut watched = lock(&h.db).watched().unwrap();
+            h.scheduler.annotate_snapshot(&mut s, &mut watched);
+            let [list] = watched.try_into().unwrap();
+            let c = s.connections[0].clone();
+            let mine = crate::mine::mine(&s, std::slice::from_ref(&list));
+            let rows: Vec<_> = mine
+                .watching
+                .iter()
+                .map(|r| (r.synced_at, r.stale))
+                .collect();
+            assert_eq!(rows, [(list.items[0].synced_at, list.items[0].stale)]);
+            assert!(list.items.iter().all(|i| i.synced_at == list.last_success));
+            (
+                c.sync.last_success,
+                c.schedule.stale,
+                list.last_success,
+                list.items[0].stale,
+            )
+        };
+        assert_eq!(watched(&h), (Some(t0()), false, Some(t0()), false));
+        for minutes in [5, 10, 15, 20] {
+            h.world
+                .answer(&format!("a.example{WATCH}"), Err(transient()));
+            h.set(at(minutes));
+            let [report] = h.tick().await.try_into().unwrap();
+            assert!(report.error.is_none() && report.watched.unwrap().error.is_some());
+            let (account, account_stale, list, list_stale) = watched(&h);
+            assert_eq!((account, account_stale), (Some(at(minutes)), false));
+            assert_eq!(list, Some(t0()), "the list is as old as when it was found");
+            // Stale past three intervals, though the account is current.
+            assert_eq!(list_stale, minutes > 15, "{minutes}");
+        }
+        // A watch that works again is current again.
+        h.set(at(25));
+        h.tick().await;
+        assert_eq!(watched(&h), (Some(at(25)), false, Some(at(25)), false));
     }
 
     #[tokio::test]

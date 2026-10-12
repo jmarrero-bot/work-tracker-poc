@@ -3,7 +3,7 @@
 //! apart from it, what watching another user found, which is never the
 //! account's.
 
-use crate::model::{Item, Outcome, Reason, Snapshot, WatchList, Zone};
+use crate::model::{Item, Outcome, Reason, Snapshot, Timestamp, WatchList, Zone};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -36,6 +36,10 @@ pub struct Row {
     /// Each account it waits on, with that account's reasons: a reason
     /// is never shown as another account's.
     pub waits_on: Vec<WaitsOn>,
+    /// The oldest last success of the connections that found it.
+    pub synced_at: Option<Timestamp>,
+    /// Whether any of them is stale, so it can't be shown as current.
+    pub stale: bool,
 }
 
 /// Why a connection's watch list couldn't be updated by its last sync.
@@ -82,10 +86,15 @@ fn rows<'a>(found: impl IntoIterator<Item = (&'a Item, &'a str)>) -> Vec<Row> {
             zone: item.zone,
             updated_at: item.updated_at.clone(),
             waits_on: vec![],
+            synced_at: item.synced_at,
+            stale: false,
         });
         if item.zone == Zone::Internal {
             row.zone = Zone::Internal;
         }
+        // As fresh as the stalest connection that found it.
+        row.synced_at = row.synced_at.zip(item.synced_at).map(|(a, b)| a.min(b));
+        row.stale |= item.stale;
         let mut reasons = item.reasons.clone();
         reasons.sort();
         reasons.dedup();
@@ -179,6 +188,8 @@ mod tests {
             demo: false,
             zone: Zone::External,
             reasons,
+            synced_at: None,
+            stale: false,
         }
     }
     fn snapshot(items: Vec<Item>) -> Snapshot {
@@ -250,6 +261,36 @@ mod tests {
             .collect();
         assert_eq!(connections, ["a", "b"]);
         assert!(view.watching.is_empty() && view.watch_errors.is_empty());
+    }
+
+    #[test]
+    fn a_row_is_as_fresh_as_the_stalest_connection_that_found_it() {
+        let t = |unix| Some(Timestamp::from_unix(unix));
+        let fresh = |connection: &str, n, synced_at, stale| Item {
+            synced_at,
+            stale,
+            ..item(connection, n, vec![Assigned], Outcome::Open)
+        };
+        let s = snapshot(vec![
+            fresh("a", 1, t(200), false),
+            fresh("b", 1, t(100), true),
+            fresh("a", 2, t(200), false),
+            fresh("b", 3, None, true),
+        ]);
+        let rows: Vec<_> = mine(&s, &[])
+            .mine
+            .iter()
+            .map(|r| (r.key.clone(), r.synced_at, r.stale))
+            .collect();
+        assert_eq!(
+            rows,
+            // The most recently changed first.
+            [
+                ("o/r#3".to_string(), None, true),
+                ("o/r#2".into(), t(200), false),
+                ("o/r#1".into(), t(100), true),
+            ]
+        );
     }
 
     #[test]

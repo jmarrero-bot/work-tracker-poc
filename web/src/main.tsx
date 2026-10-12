@@ -72,6 +72,10 @@ type Item = {
   demo: boolean;
   zone: Zone;
   reasons: Reason[];
+  // When its connection last synced successfully; null for manual items.
+  synced_at: string | null;
+  // Too long ago for it to be current.
+  stale: boolean;
 };
 // One thing that waits in the Mine view, once, with every reason.
 type MineRow = {
@@ -88,6 +92,10 @@ type MineRow = {
   // Each account it waits on, with that account's own reasons: the
   // connection's account, or the user it watches.
   waits_on: { account: string; connection_id: string; reasons: Reason[] }[];
+  // The oldest last success of the connections that found it, and whether
+  // any of them is stale.
+  synced_at: string | null;
+  stale: boolean;
 };
 // A watch list its last sync couldn't update.
 type WatchError = { connection_id: string; login: string; error: string };
@@ -121,6 +129,8 @@ type Schedule = {
   // Its credential was rejected: scheduled syncs stopped until it is
   // verified again.
   needs_user: boolean;
+  // It never synced, or not for a few intervals: its items aren't current.
+  stale: boolean;
 };
 type ErrorKind = "auth" | "transient" | "inaccessible" | "invalid";
 // What a connection's syncs did. Times are UTC, in RFC 3339.
@@ -231,7 +241,7 @@ function every(seconds: number) {
 function syncStatus(c: Connection): { text: string; attention: boolean } {
   const s = c.sync;
   const last = s.last_success
-    ? `Last synced ${relative(s.last_success)}.`
+    ? `${c.schedule.stale ? "Stale: last" : "Last"} synced ${relative(s.last_success)}.`
     : "Never synced.";
   // Past due: the schedule starts it within moments.
   const next = !s.next_due
@@ -248,7 +258,7 @@ function syncStatus(c: Connection): { text: string; attention: boolean } {
   if (!s.error)
     return {
       text: `${last} Next sync ${next}, every ${every(c.schedule.interval_secs)}.`,
-      attention: false,
+      attention: c.schedule.stale && s.last_success !== null,
     };
   const held = s.held_until && new Date(s.held_until).getTime() > Date.now();
   return {
@@ -257,6 +267,77 @@ function syncStatus(c: Connection): { text: string; attention: boolean } {
       : `${s.error}. ${s.failures} failed ${s.failures === 1 ? "sync" : "syncs"} in a row, backing off; next try ${next}. ${last}`,
     attention: true,
   };
+}
+// How many of its intervals after its last success a connection's items
+// are stale, as the service decides.
+const STALE_INTERVALS = 3;
+// Whether data last synced at `at` is past the stale threshold of
+// connection `c` at `now`.
+function pastThreshold(c: Connection, at: string | null, now: number) {
+  return (
+    !at ||
+    now - new Date(at).getTime() >
+      STALE_INTERVALS * c.schedule.interval_secs * 1000
+  );
+}
+// The snapshot as of `now`. The service marks staleness when the page
+// fetches; this keeps the marks true while the page shows what it fetched:
+// everything synced is stale once the service can't be reached, and a
+// connection's items once its last success is past the threshold.
+function age(d: Snapshot, offline: boolean, now: number): Snapshot {
+  const stale = new Map(
+    d.connections.map((c) => [
+      c.id,
+      offline || c.schedule.stale || pastThreshold(c, c.sync.last_success, now),
+    ]),
+  );
+  return {
+    ...d,
+    connections: d.connections.map((c) => ({
+      ...c,
+      schedule: { ...c.schedule, stale: stale.get(c.id) ?? true },
+    })),
+    items: d.items.map((i) =>
+      i.connection_id
+        ? { ...i, stale: i.stale || (stale.get(i.connection_id) ?? true) }
+        : i,
+    ),
+  };
+}
+// The Mine view as of `now`, the same way, by the connections that found
+// each row, as `age` left them.
+function ageMine(
+  m: MineView,
+  connections: Connection[],
+  offline: boolean,
+  now: number,
+): MineView {
+  const byId = new Map(connections.map((c) => [c.id, c]));
+  const row = (r: MineRow) => ({
+    ...r,
+    stale:
+      r.stale ||
+      offline ||
+      r.waits_on.some((w) => {
+        const c = byId.get(w.connection_id);
+        return !c || c.schedule.stale || pastThreshold(c, r.synced_at, now);
+      }),
+  });
+  return { ...m, mine: m.mine.map(row), watching: m.watching.map(row) };
+}
+// Marks what is stale, so it is never taken as current.
+function Stale({ item }: { item: { stale: boolean; synced_at: string | null } }) {
+  if (!item.stale) return null;
+  return (
+    <>
+      <span className="meta-dot">·</span>
+      <em className="stale-tag">
+        {item.synced_at
+          ? `Stale: last synced ${relative(item.synced_at)}`
+          : "Stale: not synced"}
+      </em>
+    </>
+  );
 }
 function progressText(p: Progress) {
   const parts = [
@@ -359,6 +440,7 @@ function MineList({
                 <span>
                   {r.key} <span className="meta-dot">·</span>{" "}
                   {providers[r.provider].name}
+                  <Stale item={r} />
                 </span>
                 {r.waits_on.map((w) => (
                   <span key={`${w.account} ${w.connection_id}`}>
@@ -392,7 +474,8 @@ function MineList({
   );
 }
 function App() {
-  const [data, setData] = useState<Snapshot>({
+  // What the service last sent; `data` and `mineView` are it as of now.
+  const [fetched, setData] = useState<Snapshot>({
     items: [],
     connections: [],
     efforts: [],
@@ -400,11 +483,24 @@ function App() {
   const [page, setPage] = useState<
     "inbox" | "mine" | "efforts" | "connections"
   >("inbox");
-  const [mineView, setMineView] = useState<MineView>({
+  const [fetchedMine, setMineView] = useState<MineView>({
     mine: [],
     watching: [],
     watch_errors: [],
   });
+  // When the page last fetched from the service, and since when it can't.
+  const [fetchedAt, setFetchedAt] = useState<number | null>(null);
+  const [offlineSince, setOfflineSince] = useState<number | null>(null);
+  // Moves on with the clock, so freshness is worked out again.
+  const [now, setNow] = useState(() => Date.now());
+  const data = useMemo(
+    () => age(fetched, offlineSince !== null, now),
+    [fetched, offlineSince, now],
+  );
+  const mineView = useMemo(
+    () => ageMine(fetchedMine, data.connections, offlineSince !== null, now),
+    [fetchedMine, data, offlineSince, now],
+  );
   const [loading, setLoading] = useState(true);
   const [paired, setPaired] = useState(false);
   const [error, setError] = useState("");
@@ -483,6 +579,9 @@ function App() {
     setData(next);
     setMineView(waiting);
     setPaired(true);
+    setFetchedAt(Date.now());
+    setNow(Date.now());
+    setOfflineSince(null);
   }
   useEffect(() => {
     (async () => {
@@ -506,12 +605,24 @@ function App() {
         setLoading(false);
       }
     })();
-    const timer = window.setInterval(() => {
-      reload().catch(() => {
-        /* Keep the last view on transient failures. */
-      });
-    }, 30000);
-    return () => window.clearInterval(timer);
+    // Keep the last view when the service can't be reached, but marked
+    // stale, never as current.
+    const poll = () => {
+      setNow(Date.now());
+      reload().catch(() =>
+        setOfflineSince((since) => since ?? Date.now()),
+      );
+    };
+    const timer = window.setInterval(poll, 30000);
+    // A page that was hidden or asleep looks again as soon as it is seen.
+    const visible = () => {
+      if (document.visibilityState === "visible") poll();
+    };
+    document.addEventListener("visibilitychange", visible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", visible);
+    };
   }, []);
   const filtered = useMemo(
     () =>
@@ -880,6 +991,20 @@ function App() {
               )}
             </div>
           </div>
+          {offlineSince !== null && (
+            <div className="message error" role="alert">
+              <AlertCircle size={17} />
+              <span>
+                Can't reach the Workboard service since{" "}
+                {new Date(offlineSince).toLocaleTimeString()}. This is what it
+                had{" "}
+                {fetchedAt
+                  ? `at ${new Date(fetchedAt).toLocaleTimeString()}`
+                  : "before"}
+                , all marked stale.
+              </span>
+            </div>
+          )}
           {error && !modal && (
             <div className="message error" role="alert">
               <AlertCircle size={17} />
@@ -1105,6 +1230,7 @@ function App() {
                                 <span className="meta-dot">·</span>Manual
                               </>
                             )}
+                            <Stale item={i} />
                           </span>
                         </button>
                         <Status item={i} />
