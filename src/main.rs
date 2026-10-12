@@ -45,6 +45,11 @@ enum Command {
         /// is never started as the other.
         #[arg(long, conflicts_with = "demo")]
         hub: bool,
+        /// Another name a hub is reached by, such as its tailnet name
+        /// behind `tailscale serve`, which serves it over HTTPS. The
+        /// service still listens on loopback only. Repeat for each name.
+        #[arg(long = "allowed-host", value_name = "NAME", requires = "hub")]
+        allowed_hosts: Vec<String>,
         /// How often each connection syncs unless it has its own interval,
         /// such as 30m or 1h.
         #[arg(long, value_name = "INTERVAL", default_value = "5m", value_parser = interval)]
@@ -232,6 +237,13 @@ enum Command {
     },
     /// Remove a connection, its locally cached items and its stored credential.
     Disconnect { connection: String },
+    /// Print a hub's companion token, with which a companion reads the
+    /// hub's external export and nothing else. Run it on the hub.
+    CompanionToken {
+        /// Replace it; the old one stops working at once.
+        #[arg(long)]
+        rotate: bool,
+    },
 }
 /// A sync interval given on the command line.
 fn interval(text: &str) -> Result<Duration, String> {
@@ -304,6 +316,7 @@ async fn main() -> Result<()> {
     if let Command::Serve {
         demo,
         hub,
+        allowed_hosts,
         sync_interval,
     } = args.command
     {
@@ -312,6 +325,7 @@ async fn main() -> Result<()> {
             demo,
             interval: sync_interval,
             hub,
+            hosts: allowed_hosts,
         };
         return server::serve(root, options).await;
     }
@@ -770,6 +784,24 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("Disconnected")
+        }
+        Command::CompanionToken { rotate } => {
+            let method = if rotate {
+                reqwest::Method::POST
+            } else {
+                reqwest::Method::GET
+            };
+            let v: serde_json::Value = request(
+                &client,
+                &root,
+                args.port,
+                method,
+                "companion-token",
+                rotate.then(|| serde_json::json!({})),
+            )
+            .await?;
+            let token = v["token"].as_str().context("The hub sent no token")?;
+            println!("{token}");
         }
         Command::Serve { .. } => unreachable!(),
     }

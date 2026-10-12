@@ -7,11 +7,11 @@ use crate::{
     schedule::{self, Builtin, Policy, Scheduler, Trigger},
     zone,
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{DefaultBodyLimit, OriginalUri, Path, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -22,7 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::Duration,
 };
 use uuid::Uuid;
@@ -33,8 +33,7 @@ struct Assets;
 #[derive(Clone)]
 struct App {
     db: Arc<Mutex<Db>>,
-    token: Arc<String>,
-    origin: String,
+    access: Arc<Access>,
     scheduler: Arc<Scheduler>,
     mode: Mode,
 }
@@ -63,66 +62,207 @@ fn matches_token(a: &str, b: &str) -> bool {
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
-async fn protect(State(app): State<App>, req: Request, next: Next) -> Response {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok());
-    if host != app.origin.strip_prefix("http://") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error":"Unexpected host"})),
-        )
-            .into_response();
-    }
-    let bearer = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let cookie = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split(';')
-                .find_map(|s| s.trim().strip_prefix("workboard_session="))
-        });
-    let bearer_ok = bearer.is_some_and(|v| matches_token(v, &app.token));
-    let cookie_ok = cookie.is_some_and(|v| matches_token(v, &app.token));
-    if !bearer_ok && !cookie_ok {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"Open the pairing URL printed by `workboard serve`"})),
-        )
-            .into_response();
-    }
-    if req.method() != axum::http::Method::GET && !bearer_ok {
-        let origin = req
-            .headers()
-            .get(header::ORIGIN)
-            .and_then(|v| v.to_str().ok());
-        if origin != Some(app.origin.as_str()) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error":"Cross-origin changes are not allowed"})),
-            )
-                .into_response();
-        }
-    }
-    next.run(req).await
+/// The only path a hub's companion token may read.
+const EXPORT_PATH: &str = "/api/export/external";
+/// The browser session's cookie.
+const SESSION_COOKIE: &str = "workboard_session";
+/// Where a hub keeps its companion token, in the data directory.
+const COMPANION_TOKEN: &str = "companion.token";
+
+/// Who may use the service, from where. This is the interim
+/// authentication: a bearer token, and a browser cookie paired with it,
+/// until GitHub App login (#12) replaces it.
+struct Access {
+    /// `127.0.0.1:PORT`, where the service listens.
+    local: String,
+    /// Other names a hub is reached by, such as its tailnet name, always
+    /// through an HTTPS front such as `tailscale serve`.
+    hosts: Vec<String>,
+    /// The application credential: full access. Rotated on each start.
+    token: String,
+    /// A hub's companion token, which reads the external export and
+    /// nothing else. Kept across restarts.
+    companion: Option<RwLock<String>>,
 }
-async fn session(State(app): State<App>) -> Response {
+
+/// Why a request was turned away.
+#[derive(Debug, PartialEq, Eq)]
+enum Denied {
+    Host,
+    Unauthorized,
+    /// The companion token, used for anything but the export.
+    Scope,
+    CrossOrigin,
+}
+
+impl Denied {
+    fn response(self) -> Response {
+        let (status, message) = match self {
+            Self::Host => (StatusCode::FORBIDDEN, "Unexpected host"),
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "Open the pairing URL printed by `workboard serve`",
+            ),
+            Self::Scope => (
+                StatusCode::FORBIDDEN,
+                "This token only reads the hub's external export",
+            ),
+            Self::CrossOrigin => (
+                StatusCode::FORBIDDEN,
+                "Cross-origin changes are not allowed",
+            ),
+        };
+        (status, Json(json!({ "error": message }))).into_response()
+    }
+}
+
+impl Access {
+    /// The origin a browser that reached the service as `host` sends: the
+    /// service's own on loopback, or HTTPS under one of the hub's names.
+    fn origin(&self, host: &str) -> Option<String> {
+        if host == self.local {
+            return Some(format!("http://{host}"));
+        }
+        let host = host.to_ascii_lowercase();
+        self.hosts
+            .contains(&host)
+            .then(|| format!("https://{host}"))
+    }
+    /// Whether a session cookie set for `host` is marked Secure: under one
+    /// of the hub's names, which are only reached over HTTPS.
+    fn secure(&self, host: &str) -> bool {
+        self.origin(host)
+            .is_some_and(|origin| origin.starts_with("https://"))
+    }
+    /// Whether a request may go on.
+    fn check(&self, method: &Method, path: &str, headers: &HeaderMap) -> Result<(), Denied> {
+        let text = |name| {
+            headers
+                .get(name)
+                .and_then(|v: &HeaderValue| v.to_str().ok())
+        };
+        let origin = text(header::HOST)
+            .and_then(|host| self.origin(host))
+            .ok_or(Denied::Host)?;
+        let bearer = text(header::AUTHORIZATION).and_then(|v| v.strip_prefix("Bearer "));
+        let cookie = text(header::COOKIE).and_then(|v| {
+            v.split(';').find_map(|s| {
+                s.trim()
+                    .strip_prefix(SESSION_COOKIE)
+                    .and_then(|s| s.strip_prefix('='))
+            })
+        });
+        let bearer_ok = bearer.is_some_and(|v| matches_token(v, &self.token));
+        let cookie_ok = cookie.is_some_and(|v| matches_token(v, &self.token));
+        if !bearer_ok && !cookie_ok {
+            let companion = self.companion.as_ref().is_some_and(|token| {
+                let token = token.read().unwrap_or_else(PoisonError::into_inner);
+                bearer.is_some_and(|v| matches_token(v, &token))
+            });
+            return match companion {
+                true if method == Method::GET && path == EXPORT_PATH => Ok(()),
+                true => Err(Denied::Scope),
+                false => Err(Denied::Unauthorized),
+            };
+        }
+        // A browser's change must come from the page the service served
+        // under the same name.
+        if method != Method::GET && !bearer_ok && text(header::ORIGIN) != Some(origin.as_str()) {
+            return Err(Denied::CrossOrigin);
+        }
+        Ok(())
+    }
+}
+
+async fn protect(State(app): State<App>, req: Request, next: Next) -> Response {
+    // Routes nested under /api see their path without it.
+    let path = req
+        .extensions()
+        .get::<OriginalUri>()
+        .map_or_else(|| req.uri().path().to_string(), |u| u.path().to_string());
+    match app.access.check(req.method(), &path, req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(denied) => denied.response(),
+    }
+}
+async fn session(State(app): State<App>, headers: HeaderMap) -> Response {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    let secure = if app.access.secure(host) {
+        "; Secure"
+    } else {
+        ""
+    };
     let mut res = Json(json!({"ok":true})).into_response();
     res.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "workboard_session={}; Path=/api; HttpOnly; SameSite=Strict",
-            app.token
+            "{SESSION_COOKIE}={}; Path=/api; HttpOnly; SameSite=Strict{secure}",
+            app.access.token
         ))
         .unwrap(),
     );
     res
+}
+/// A hub's companion token, which a companion uses to read the external
+/// export.
+async fn companion_token(State(app): State<App>) -> ApiResult<Value> {
+    let token = app.access.companion.as_ref().ok_or_else(only_hubs)?;
+    let token = token.read().unwrap_or_else(PoisonError::into_inner).clone();
+    Ok(Json(json!({ "token": token })))
+}
+/// Replace a hub's companion token: the old one stops working at once.
+async fn rotate_companion_token(State(app): State<App>) -> ApiResult<Value> {
+    let current = app.access.companion.as_ref().ok_or_else(only_hubs)?;
+    let token = new_token();
+    replace_secret(&app.db.lock().unwrap().root.join(COMPANION_TOKEN), &token)?;
+    *current.write().unwrap_or_else(PoisonError::into_inner) = token.clone();
+    Ok(Json(json!({ "token": token })))
+}
+fn only_hubs() -> anyhow::Error {
+    anyhow::anyhow!("Only a hub has a companion token")
+}
+/// A new random credential.
+fn new_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+/// Write `value` to the private file at `path`, replacing it all at once.
+fn replace_secret(path: &std::path::Path, value: &str) -> Result<()> {
+    let staged = path.with_extension("new");
+    db::remove_if_there(&staged)?;
+    db::write_secret(&staged, value)?;
+    std::fs::rename(&staged, path)?;
+    Ok(())
+}
+/// A hub's companion token, made on its first start and kept.
+fn companion_token_of(root: &std::path::Path) -> Result<String> {
+    let path = root.join(COMPANION_TOKEN);
+    match std::fs::read_to_string(&path) {
+        Ok(token) if !token.trim().is_empty() => Ok(token.trim().to_string()),
+        Ok(_) => bail!("{} is empty; remove it to make a new one", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let token = new_token();
+            db::write_secret(&path, &token)?;
+            Ok(token)
+        }
+        Err(e) => Err(e).with_context(|| format!("Cannot read {}", path.display())),
+    }
+}
+/// Whether `host` can name a hub: a DNS name, with a port if it isn't
+/// HTTPS's.
+pub fn valid_host(host: &str) -> bool {
+    let (name, port) = host.split_once(':').unwrap_or((host, "443"));
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        && port.parse::<u16>().is_ok_and(|p| p != 0)
 }
 /// Everything stored, with how fresh it is, and what watching found.
 fn fresh_snapshot(app: &App) -> Result<(Snapshot, Vec<WatchList>)> {
@@ -509,6 +649,8 @@ pub struct Options {
     pub interval: Duration,
     /// Serve a hub: external work only.
     pub hub: bool,
+    /// Other names a hub is reached by, through an HTTPS front.
+    pub hosts: Vec<String>,
 }
 pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     #[cfg(not(unix))]
@@ -518,10 +660,20 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         demo,
         interval,
         hub,
+        hosts,
     } = options;
     let mode = if hub { Mode::Hub } else { Mode::Local };
     if hub && demo {
         bail!("A hub keeps external work only, and the demo's work is internal; start the demo without --hub")
+    }
+    // Only a hub is served under another name: a local service may hold
+    // internal work, which never leaves its machine.
+    if !hub && !hosts.is_empty() {
+        bail!("Only a hub is reached by another name; a local service may hold internal work and stays on loopback")
+    }
+    let hosts: Vec<String> = hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
+    if let Some(host) = hosts.iter().find(|h| !valid_host(h)) {
+        bail!("Enter a host name such as hub.example.ts.net, with a port only if it isn't 443: {host}")
     }
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let mut db = Db::open_as(&root, mode)?;
@@ -529,13 +681,17 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     if demo && db.items()?.is_empty() && db.efforts()?.is_empty() {
         db.seed()?
     }
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let token = new_token();
     let path = root.join("service.token");
     if path.exists() {
         std::fs::remove_file(&path)?
     }
     db::write_secret(&path, &token)?;
-    let origin = format!("http://127.0.0.1:{port}");
+    let local = format!("127.0.0.1:{port}");
+    let companion = match mode {
+        Mode::Hub => Some(RwLock::new(companion_token_of(&root)?)),
+        Mode::Local => None,
+    };
     let db = Arc::new(Mutex::new(db));
     let sources = Builtin {
         plugins: root.join(connectors::PLUGINS_DIR),
@@ -550,8 +706,12 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     tokio::spawn(scheduler.clone().serve());
     let app = App {
         db,
-        token: Arc::new(token),
-        origin: origin.clone(),
+        access: Arc::new(Access {
+            local: local.clone(),
+            hosts,
+            token,
+            companion,
+        }),
         scheduler,
         mode,
     };
@@ -560,6 +720,10 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         .route("/mine", get(mine))
         .route("/export/external", get(export_external))
         .route("/session", post(session))
+        .route(
+            "/companion-token",
+            get(companion_token).post(rotate_companion_token),
+        )
         .route("/connections", post(connect))
         .route(
             "/connections/{id}",
@@ -584,7 +748,15 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         Mode::Local => "Workboard is running locally",
         Mode::Hub => "Workboard is running as a hub, for external work only",
     };
-    println!("{running}. Open this private pairing URL:\n{origin}/#token={}\nKeep this URL private. CLI commands use the same data directory.",app.token);
+    let token = &app.access.token;
+    let mut urls = vec![format!("http://{local}/#token={token}")];
+    urls.extend(
+        app.access
+            .hosts
+            .iter()
+            .map(|host| format!("https://{host}/#token={token}")),
+    );
+    println!("{running}. Open this private pairing URL:\n{}\nKeep this URL private. CLI commands use the same data directory.", urls.join("\n"));
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -600,5 +772,126 @@ mod tests {
         assert!(matches_token("abc", "abc"));
         assert!(!matches_token("abc", "abd"));
         assert!(!matches_token("ab", "abc"));
+    }
+
+    const LOCAL: &str = "127.0.0.1:8421";
+    const TAILNET: &str = "hub.example.ts.net";
+    const TOKEN: &str = "test-only-token";
+    const COMPANION: &str = "test-only-companion";
+
+    fn access(hub: bool) -> Access {
+        Access {
+            local: LOCAL.into(),
+            hosts: if hub { vec![TAILNET.into()] } else { vec![] },
+            token: TOKEN.into(),
+            companion: hub.then(|| RwLock::new(COMPANION.into())),
+        }
+    }
+
+    /// What a request carries to authenticate.
+    #[derive(Clone, Copy)]
+    enum Credential {
+        Nothing,
+        Bearer(&'static str),
+        Cookie(&'static str),
+        /// A cookie whose name only starts like the session's.
+        Lookalike,
+    }
+
+    /// The headers of a request that came by `host`, with `credential`
+    /// and `origin`.
+    fn headers(host: &str, credential: Credential, origin: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let mut set = |name, value: String| {
+            h.insert(name, HeaderValue::from_str(&value).unwrap());
+        };
+        set(header::HOST, host.into());
+        match credential {
+            Credential::Nothing => (),
+            Credential::Bearer(token) => set(header::AUTHORIZATION, format!("Bearer {token}")),
+            Credential::Cookie(token) => {
+                set(header::COOKIE, format!("a=b; {SESSION_COOKIE}={token}"))
+            }
+            Credential::Lookalike => set(header::COOKIE, format!("{SESSION_COOKIE}x={TOKEN}")),
+        }
+        if let Some(origin) = origin {
+            set(header::ORIGIN, origin.into());
+        }
+        h
+    }
+
+    #[test]
+    fn requests_need_a_known_host_a_credential_and_a_matching_origin() {
+        use Credential::*;
+        use Denied::*;
+        const SNAPSHOT: &str = "/api/snapshot";
+        const EFFORTS: &str = "/api/efforts";
+        const HUB_ORIGIN: &str = "https://hub.example.ts.net";
+        const LOCAL_ORIGIN: &str = "http://127.0.0.1:8421";
+        let (get, post) = (Method::GET, Method::POST);
+        // (hub, method, path, host, credential, origin, expected)
+        #[rustfmt::skip]
+        let cases = [
+            (false, &get, SNAPSHOT, LOCAL, Bearer(TOKEN), None, Ok(())),
+            (false, &get, SNAPSHOT, LOCAL, Nothing, None, Err(Unauthorized)),
+            (false, &get, SNAPSHOT, LOCAL, Bearer("wrong"), None, Err(Unauthorized)),
+            (false, &get, SNAPSHOT, LOCAL, Lookalike, None, Err(Unauthorized)),
+            (false, &get, SNAPSHOT, "attacker.example", Bearer(TOKEN), None, Err(Host)),
+            // A local service is never reached by another name.
+            (false, &get, SNAPSHOT, TAILNET, Bearer(TOKEN), None, Err(Host)),
+            (true, &get, SNAPSHOT, TAILNET, Bearer(TOKEN), None, Ok(())),
+            (true, &get, SNAPSHOT, "HUB.example.ts.net", Cookie(TOKEN), None, Ok(())),
+            (true, &get, SNAPSHOT, "other.example.ts.net", Cookie(TOKEN), None, Err(Host)),
+            // A browser's change needs the origin of the name it came by.
+            (true, &post, EFFORTS, TAILNET, Cookie(TOKEN), Some(HUB_ORIGIN), Ok(())),
+            (true, &post, EFFORTS, TAILNET, Cookie(TOKEN), Some(LOCAL_ORIGIN), Err(CrossOrigin)),
+            (true, &post, EFFORTS, TAILNET, Cookie(TOKEN), Some("http://hub.example.ts.net"), Err(CrossOrigin)),
+            (true, &post, EFFORTS, TAILNET, Cookie(TOKEN), None, Err(CrossOrigin)),
+            (true, &post, EFFORTS, LOCAL, Cookie(TOKEN), Some(LOCAL_ORIGIN), Ok(())),
+            (true, &post, EFFORTS, LOCAL, Cookie(TOKEN), Some(HUB_ORIGIN), Err(CrossOrigin)),
+            (true, &post, EFFORTS, LOCAL, Bearer(TOKEN), None, Ok(())),
+            // The companion token reads the export, and nothing else.
+            (true, &get, EXPORT_PATH, TAILNET, Bearer(COMPANION), None, Ok(())),
+            (true, &get, EXPORT_PATH, LOCAL, Bearer(COMPANION), None, Ok(())),
+            (true, &get, SNAPSHOT, TAILNET, Bearer(COMPANION), None, Err(Scope)),
+            (true, &get, "/api/companion-token", TAILNET, Bearer(COMPANION), None, Err(Scope)),
+            (true, &post, EXPORT_PATH, TAILNET, Bearer(COMPANION), Some(HUB_ORIGIN), Err(Scope)),
+            (true, &get, EXPORT_PATH, TAILNET, Cookie(COMPANION), None, Err(Unauthorized)),
+            (false, &get, EXPORT_PATH, LOCAL, Bearer(COMPANION), None, Err(Unauthorized)),
+        ];
+        for (n, (hub, method, path, host, credential, origin, expected)) in
+            cases.into_iter().enumerate()
+        {
+            let got = access(hub).check(method, path, &headers(host, credential, origin));
+            assert_eq!(got, expected, "case {n}: {method} {path} via {host}");
+        }
+    }
+
+    #[test]
+    fn session_cookies_are_secure_under_the_hubs_names() {
+        let hub = access(true);
+        assert!(hub.secure(TAILNET));
+        assert!(!hub.secure(LOCAL));
+        assert!(!hub.secure("attacker.example"));
+        assert!(!access(false).secure(LOCAL));
+    }
+
+    #[test]
+    fn hub_names() {
+        for (host, valid) in [
+            ("hub.example.ts.net", true),
+            ("hub", true),
+            ("hub.example.ts.net:8443", true),
+            ("", false),
+            ("hub.example.ts.net:0", false),
+            ("hub.example.ts.net:x", false),
+            ("https://hub.example.ts.net", false),
+            ("hub..example", false),
+            ("-hub.example", false),
+            ("hub_1.example", false),
+            ("hub.example/", false),
+        ] {
+            assert_eq!(valid_host(host), valid, "{host}");
+        }
     }
 }
