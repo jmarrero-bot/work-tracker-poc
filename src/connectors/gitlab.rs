@@ -1,6 +1,7 @@
 //! GitLab, internal or public: a personal access token in the
-//! `PRIVATE-TOKEN` header, and the open merge requests the account authored,
-//! is assigned or is asked to review.
+//! `PRIVATE-TOKEN` header, the open merge requests the account authored, is
+//! assigned or is asked to review, and the merge requests and issues on its
+//! to-do list.
 
 use super::{account, inaccessible, source_url, string, Auth, Fetched, Http};
 use crate::{
@@ -14,6 +15,13 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 const SOURCE: &str = "GitLab";
+/// Rows per page, GitLab's largest.
+const PER_PAGE: usize = 100;
+/// Pages read of one list before a sync gives up rather than save part of it.
+const MAX_PAGES: usize = 100;
+/// Marks an issue's remote ID, `PROJECT:issue:IID`, apart from a merge
+/// request's `PROJECT:IID`.
+const ISSUE: &str = "issue";
 
 pub struct GitLab {
     http: Http,
@@ -30,63 +38,92 @@ impl GitLab {
         let id = v["id"].as_u64().map(|n| n.to_string());
         account(&v, id)
     }
-    async fn merge_requests(
+    /// Every row of a paginated GitLab list, or an error: never part of it.
+    async fn all_pages(
+        &self,
+        target: &Target,
+        path: &str,
+        query: &[(&str, String)],
+        what: &str,
+    ) -> ConnectorResult<Vec<Value>> {
+        let mut all = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let mut query = query.to_vec();
+            query.push(("per_page", PER_PAGE.to_string()));
+            query.push(("page", page.to_string()));
+            let v = self.http.get(target, path, &query).await?;
+            let rows = v
+                .as_array()
+                .ok_or_else(|| ConnectorError::invalid(format!("Unexpected GitLab {what} list")))?;
+            all.extend(rows.iter().cloned());
+            if rows.len() < PER_PAGE {
+                return Ok(all);
+            }
+        }
+        Err(ConnectorError::invalid(format!(
+            "Too many {what}s for one sync; no partial results were saved"
+        )))
+    }
+    /// The open merge requests the account wrote, is assigned or is asked to
+    /// review, and the targets of its pending to-do items.
+    async fn listing(
         &self,
         target: &Target,
         account: &Account,
     ) -> ConnectorResult<Vec<RemoteItem>> {
         let mut all = Listing::default();
-        for (kind, extra, reason) in [
-            ("next", ("scope", "created_by_me".into()), None),
+        let opened = ("state", "opened".to_string());
+        for (kind, query, reason) in [
             (
                 "next",
-                ("scope", "assigned_to_me".into()),
+                vec![opened.clone(), ("scope", "created_by_me".into())],
+                None,
+            ),
+            (
+                "next",
+                vec![opened.clone(), ("scope", "assigned_to_me".into())],
                 Some(Reason::Assigned),
             ),
             (
                 "review",
-                ("reviewer_id", account.id.clone()),
+                vec![
+                    opened,
+                    ("scope", "all".into()),
+                    ("reviewer_id", account.id.clone()),
+                ],
                 Some(Reason::ReviewRequested),
             ),
         ] {
-            let mut complete = false;
-            for page in 1..=100 {
-                let query = vec![
-                    ("state", "opened".into()),
-                    ("scope", "all".into()),
-                    extra.clone(),
-                    ("per_page", "100".into()),
-                    ("page", page.to_string()),
-                ];
-                // Do not send duplicate scope parameters.
-                let query: Vec<_> = query
-                    .into_iter()
-                    .filter(|(k, v)| !(*k == "scope" && v == "all" && extra.0 == "scope"))
-                    .collect();
-                let v = self
-                    .http
-                    .get(target, "api/v4/merge_requests", &query)
-                    .await?;
-                let rows = v.as_array().ok_or_else(|| {
-                    ConnectorError::invalid("Unexpected GitLab merge request list")
-                })?;
-                for row in rows {
-                    let mut item = gitlab_item(row, kind).map_err(ConnectorError::invalid)?;
-                    item.reasons.extend(reason);
-                    // A review request takes precedence when the MR appears in
-                    // several lists, and its reasons add up.
-                    all.add(item);
-                }
-                if rows.len() < 100 {
-                    complete = true;
-                    break;
-                }
+            let rows = self
+                .all_pages(target, "api/v4/merge_requests", &query, "merge request")
+                .await?;
+            for row in rows {
+                let mut item = gitlab_item(&row, kind).map_err(ConnectorError::invalid)?;
+                item.reasons.extend(reason);
+                // A review request takes precedence when the MR appears in
+                // several lists, and its reasons add up.
+                all.add(item);
             }
-            if !complete {
-                return Err(ConnectorError::invalid(
-                    "Too many merge requests for one sync; no partial results were saved",
-                ));
-            }
+        }
+        let todos = self
+            .all_pages(
+                target,
+                "api/v4/todos",
+                &[("state", "pending".into())],
+                "to-do item",
+            )
+            .await?;
+        for todo in todos {
+            let (reason, kind) = todo_reason(todo["action_name"].as_str().unwrap_or_default());
+            let item = match todo["target_type"].as_str() {
+                Some("MergeRequest") => gitlab_item(&todo["target"], kind),
+                Some("Issue") => gitlab_issue_item(&todo["target"], kind),
+                // Commits, epics, designs and alerts aren't items yet.
+                _ => continue,
+            };
+            let mut item = item.map_err(ConnectorError::invalid)?;
+            item.reasons.push(reason);
+            all.add(item);
         }
         Ok(all.into_items())
     }
@@ -97,27 +134,58 @@ impl GitLab {
     ) -> ConnectorResult<Vec<Refreshed>> {
         let mut answers = Vec::new();
         for item in tracked {
-            let (project, iid) = item
-                .remote_id
-                .split_once(':')
-                .ok_or_else(|| ConnectorError::invalid("Invalid stored merge request identity"))?;
-            let fetched = self
-                .http
-                .fetch(
-                    target,
-                    &format!("api/v4/projects/{project}/merge_requests/{iid}"),
-                    &[],
-                )
-                .await?;
+            let (path, issue) = api_path(&item.remote_id)
+                .ok_or_else(|| ConnectorError::invalid("Invalid stored GitLab item identity"))?;
+            let fetched = self.http.fetch(target, &path, &[]).await?;
             answers.push(match fetched {
-                Fetched::Found(row) => Refreshed::found(
-                    &item.remote_id,
-                    gitlab_item(&row, "follow-up").map_err(ConnectorError::invalid)?,
-                ),
+                Fetched::Found(row) => {
+                    let found = if issue {
+                        gitlab_issue_item(&row, "follow-up")
+                    } else {
+                        gitlab_item(&row, "follow-up")
+                    };
+                    Refreshed::found(&item.remote_id, found.map_err(ConnectorError::invalid)?)
+                }
                 Fetched::Inaccessible(status) => inaccessible(SOURCE, &item.remote_id, status),
             });
         }
         Ok(answers)
+    }
+}
+
+/// Why a pending to-do waits on the account, and its attention category.
+fn todo_reason(action_name: &str) -> (Reason, &'static str) {
+    match action_name {
+        "assigned" => (Reason::Assigned, "next"),
+        "mentioned" | "directly_addressed" => (Reason::Mentioned, "next"),
+        "review_requested" | "approval_required" => (Reason::ReviewRequested, "review"),
+        "build_failed" => (Reason::ChecksFailing, "next"),
+        _ => (Reason::Todo, "next"),
+    }
+}
+
+/// The API path of a stored item, `PROJECT:IID` for a merge request or
+/// `PROJECT:issue:IID` for an issue, and whether it is an issue.
+fn api_path(remote_id: &str) -> Option<(String, bool)> {
+    let number = |s: &str| s.parse::<u64>().ok();
+    match remote_id.split(':').collect::<Vec<_>>()[..] {
+        [project, iid] => Some((
+            format!(
+                "api/v4/projects/{}/merge_requests/{}",
+                number(project)?,
+                number(iid)?
+            ),
+            false,
+        )),
+        [project, ISSUE, iid] => Some((
+            format!(
+                "api/v4/projects/{}/issues/{}",
+                number(project)?,
+                number(iid)?
+            ),
+            true,
+        )),
+        _ => None,
     }
 }
 
@@ -133,7 +201,7 @@ impl Connector for GitLab {
         target: &'a Target,
         account: &'a Account,
     ) -> BoxFuture<'a, ConnectorResult<Vec<RemoteItem>>> {
-        Box::pin(self.merge_requests(target, account))
+        Box::pin(self.listing(target, account))
     }
     fn refresh<'a>(
         &'a self,
@@ -167,6 +235,28 @@ pub fn gitlab_item(v: &Value, action: &str) -> Result<RemoteItem> {
         } else {
             state
         },
+        outcome,
+        outcome_reason,
+        action: action.into(),
+        updated_at: string(v, "updated_at")?,
+        reasons: vec![],
+    })
+}
+
+pub fn gitlab_issue_item(v: &Value, action: &str) -> Result<RemoteItem> {
+    let project = v["project_id"].as_u64().context("Missing project ID")?;
+    let iid = v["iid"].as_u64().context("Missing issue number")?;
+    let state = string(v, "state")?;
+    let (outcome, outcome_reason) = outcome::gitlab_issue(&state);
+    Ok(RemoteItem {
+        remote_id: format!("{project}:{ISSUE}:{iid}"),
+        key: v["references"]["full"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or(format!("#{iid}")),
+        title: string(v, "title")?,
+        url: source_url(&string(v, "web_url")?)?,
+        status: state,
         outcome,
         outcome_reason,
         action: action.into(),
@@ -236,6 +326,13 @@ mod tests {
     fn mr(iid: u64, state: &str) -> Value {
         serde_json::json!({"project_id":7,"iid":iid,"title":format!("fix {iid}"),"state":state,"web_url":format!("https://example.com/p/-/merge_requests/{iid}"),"updated_at":"2026-10-06T20:00:00Z"})
     }
+    fn issue(iid: u64, state: &str) -> Value {
+        serde_json::json!({"project_id":7,"iid":iid,"title":format!("bug {iid}"),"state":state,"web_url":format!("https://example.com/p/-/issues/{iid}"),"updated_at":"2026-10-06T20:00:00Z","references":{"full":format!("p#{iid}")}})
+    }
+    /// A pending to-do item, as `/todos` lists it.
+    fn todo(action: &str, target_type: &str, target: Value) -> Value {
+        serde_json::json!({"id":1,"action_name":action,"target_type":target_type,"target":target,"state":"pending"})
+    }
     #[tokio::test]
     async fn paginates_deduplicates_and_refreshes_merged_items() {
         use axum::{extract::Query, routing::get, Json, Router};
@@ -260,6 +357,27 @@ mod tests {
             )
             .route("/api/v4/merge_requests", get(list))
             .route(
+                "/api/v4/todos",
+                get(
+                    |Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                        assert_eq!(q["state"], "pending");
+                        Json(serde_json::json!([
+                            todo("mentioned", "MergeRequest", mr(1, "opened")),
+                            todo("build_failed", "MergeRequest", mr(2, "opened")),
+                            todo("review_requested", "MergeRequest", mr(102, "opened")),
+                            todo("assigned", "Issue", issue(5, "opened")),
+                            todo("marked", "Issue", issue(5, "opened")),
+                            // Not an item yet.
+                            todo("mentioned", "Commit", serde_json::json!({"id":"abc"})),
+                        ]))
+                    },
+                ),
+            )
+            .route(
+                "/api/v4/projects/7/issues/6",
+                get(|| async { Json(issue(6, "closed")) }),
+            )
+            .route(
                 "/api/v4/projects/7/merge_requests/999",
                 get(|| async { Json(mr(999, "merged")) }),
             )
@@ -273,27 +391,49 @@ mod tests {
             );
         // 996 has no route: GitLab answers 404 for a deleted merge request.
         let (p, task) = fixture(router, "test-only-token").await;
-        let old: Vec<_> = [999, 998, 997, 996]
+        let mut old: Vec<_> = [999, 998, 997, 996]
             .into_iter()
             .map(|iid| gitlab_item(&c(), &mr(iid, "opened"), "next").unwrap())
             .collect();
+        old.push(
+            connector::to_item(
+                &c(),
+                "gitlab",
+                gitlab_issue_item(&issue(6, "opened"), "next").unwrap(),
+            )
+            .unwrap(),
+        );
         let items = p.sync(&c(), &old).await.unwrap();
-        assert_eq!(items.len(), 105);
-        // Listed three times: once, with both reasons and the review first.
+        // 101 authored, one more to review, an issue to do, and five tracked.
+        assert_eq!(items.len(), 108);
         let listed = |remote_id: &str| {
             let i = items.iter().find(|i| i.remote_id == remote_id).unwrap();
-            (i.action.clone(), i.reasons.clone())
+            (i.key.as_str(), i.action.as_str(), i.reasons.clone())
         };
-        assert_eq!(
-            listed("7:1"),
+        use Reason::*;
+        for (remote_id, key, action, reasons) in [
+            // Listed four times: once, with every reason and the review first.
             (
-                "review".into(),
-                vec![Reason::ReviewRequested, Reason::Assigned]
-            )
-        );
-        // Only authored: in the inbox, but not waiting on the account.
-        assert_eq!(listed("7:2"), ("next".into(), vec![]));
+                "7:1",
+                "!1",
+                "review",
+                vec![ReviewRequested, Assigned, Mentioned],
+            ),
+            ("7:2", "!2", "next", vec![ChecksFailing]),
+            // Only authored: in the inbox, but not waiting on the account.
+            ("7:3", "!3", "next", vec![]),
+            ("7:102", "!102", "review", vec![ReviewRequested]),
+            ("7:issue:5", "p#5", "next", vec![Assigned, Todo]),
+        ] {
+            assert_eq!(listed(remote_id), (key, action, reasons), "{remote_id}");
+        }
         for (remote_id, status, outcome, reason) in [
+            (
+                "7:issue:6",
+                "closed",
+                Outcome::ClosedWithoutDelivery,
+                "closed",
+            ),
             ("7:999", "merged", Outcome::Delivered, "merged"),
             ("7:998", "closed", Outcome::ClosedWithoutDelivery, "closed"),
             // The last known status stays; the outcome is unknown, never done.

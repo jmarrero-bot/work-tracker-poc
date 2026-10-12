@@ -120,6 +120,22 @@ pub fn gitlab(state: &str) -> Derived {
     }
 }
 
+/// GitLab issue states. GitLab doesn't record whether a closed issue was done
+/// or dropped, so a closed one is never taken as delivered.
+pub fn gitlab_issue(state: &str) -> Derived {
+    match state {
+        "opened" => (Outcome::Open, "GitLab issue is open".into()),
+        "closed" => (
+            Outcome::ClosedWithoutDelivery,
+            "GitLab issue was closed, and GitLab does not record whether it was done; decide whether it was abandoned or needs rework".into(),
+        ),
+        other => (
+            Outcome::Unknown,
+            format!("GitLab reported an unrecognized issue state '{other}'"),
+        ),
+    }
+}
+
 /// Jira resolutions that mean the work was delivered, compared
 /// case-insensitively. Any other resolution (Won't Do, Duplicate, Not a Bug,
 /// Obsolete, ...) is closed without delivery.
@@ -237,6 +253,18 @@ mod tests {
             let (outcome, reason) = gitlab(state);
             assert_eq!(outcome, expected, "{state}");
             assert!(!reason.is_empty());
+        }
+    }
+
+    #[test]
+    fn gitlab_issue_states() {
+        for (state, expected) in [
+            ("opened", Open),
+            // Closed is not delivered: GitLab doesn't say how.
+            ("closed", ClosedWithoutDelivery),
+            ("locked", Unknown),
+        ] {
+            assert_eq!(gitlab_issue(state).0, expected, "{state}");
         }
     }
 
