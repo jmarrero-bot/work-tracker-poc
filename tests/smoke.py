@@ -147,6 +147,16 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert b'test-only-token' not in body
         synced = [i for i in json.loads(body)['items'] if i['connection_id']]
         assert len(synced) == 4 and {i['zone'] for i in synced} == {'internal','external'}, synced
+        # Freshness: each connection's sync state and schedule, and each
+        # item as fresh as its connection's last success.
+        snapshot = json.loads(body)
+        for c in snapshot['connections']:
+            assert c['sync']['last_success'] and c['sync']['next_due'] and c['sync']['error'] is None, c
+            assert c['schedule']['interval_secs'] == 300 and not c['schedule']['needs_user'] and not c['schedule']['stale'], c
+        last_success = {c['id']: c['sync']['last_success'] for c in snapshot['connections']}
+        assert all(i['synced_at'] == last_success[i['connection_id']] and not i['stale'] for i in synced), synced
+        assert all(i['synced_at'] is None and not i['stale'] for i in snapshot['items'] if not i['connection_id'])
+        assert 'Next sync in ' in subprocess.check_output(command + ['connections'], text=True)
         internal_item = next(i['id'] for i in synced if i['zone'] == 'internal')
         external_items = sorted(i['id'] for i in synced if i['zone'] == 'external')
         mixed = {'title':'Mixed zones','note':'internal-only note','item_ids':[internal_item, external_items[0]]}
@@ -186,6 +196,64 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         subprocess.check_call(command + ['share-title', mixed_id], stdout=subprocess.DEVNULL)
         [effort_out] = json.loads(subprocess.check_output(command + ['export','--external']))['efforts']
         assert effort_out['title'] == 'Mixed zones', effort_out
+        # Scheduled sync: connections that verify but then fail sync on
+        # their own, with nobody asking, and say how.
+        connect('https://list-flaky.example/', '--external', '--sync-interval', '10m')
+        connect('https://list-denied.example/')
+        def failing():
+            connections = json.loads(call('/api/snapshot', token=token)[2])['connections']
+            return {c['base_url']: c for c in connections if c['base_url'].startswith('https://list-')}
+        for _ in range(200):
+            if all(c['sync']['last_attempt'] for c in failing().values()): break
+            time.sleep(.05)
+        else: raise RuntimeError('No scheduled sync ran: ' + json.dumps(failing()))
+        flaky, denied = failing()['https://list-flaky.example/'], failing()['https://list-denied.example/']
+        # A transient failure backs off, and its data isn't current.
+        assert flaky['sync']['error_kind'] == 'transient' and flaky['sync']['failures'] >= 1, flaky
+        assert flaky['sync']['next_due'] and flaky['sync']['last_success'] is None, flaky
+        assert flaky['schedule']['interval_secs'] == 600 and flaky['schedule']['stale'], flaky
+        # A rejected credential stops scheduled syncs until it is verified.
+        assert denied['sync']['error_kind'] == 'auth' and denied['sync']['next_due'] is None, denied
+        assert denied['schedule']['needs_user'], denied
+        text = subprocess.check_output(command + ['connections'], text=True)
+        assert 'backing off' in text and 'Needs you' in text and f"workboard verify {denied['id']}" in text, text
+        # Explicit syncs still run, of one connection, and fail.
+        result = subprocess.run(command + ['sync', flaky['id']], capture_output=True, text=True)
+        assert result.returncode != 0, result
+        [report] = json.loads(result.stdout)['results']
+        assert report['trigger'] == 'explicit' and report['error_kind'] == 'transient', report
+        subprocess.check_call(command + ['schedule', flaky['id'], '15m'], stdout=subprocess.DEVNULL)
+        assert failing()['https://list-flaky.example/']['schedule']['interval_secs'] == 900
+        # A change is checked whole before any of it is saved.
+        patch = {'sync_interval': 1200, 'watch_user': 'someone'}
+        assert call(f"/api/connections/{flaky['id']}", 'PATCH', patch, token=token)[0] == 400
+        assert failing()['https://list-flaky.example/']['schedule']['interval_secs'] == 900
+        assert subprocess.run(command + ['schedule', flaky['id'], '10s'], capture_output=True).returncode != 0
+        # The export carries each connection's freshness and error kind,
+        # never the message.
+        exported = subprocess.check_output(command + ['export','--external'], text=True)
+        assert 'Try later' not in exported, exported
+        out = {c['base_url']: c for c in json.loads(exported)['connections']}
+        assert out['https://forge.example/']['stale'] is False and out['https://forge.example/']['last_success'], out
+        assert out['https://list-flaky.example/']['stale'] is True and out['https://list-flaky.example/']['error_kind'] == 'transient', out
+        assert out['https://list-flaky.example/']['last_success'] is None, out
+        assert 'https://list-denied.example/' not in out, out
+        # Verifying the credential again succeeds, and brings the schedule back.
+        verified = subprocess.check_output(command + ['verify', denied['id']], text=True)
+        assert 'syncs again soon' in verified, verified
+        status, _, body = call(f"/api/connections/{denied['id']}/verify", 'POST', {}, token=token)
+        assert status == 200, body
+        back = json.loads(body)
+        assert not back['schedule']['needs_user'] and back['sync']['error'] is None, back
+        assert back['sync']['next_due'] and back['sync']['failures'] == 0, back
+        # Its schedule is back: it syncs again unasked, and stops again,
+        # since the listing still refuses it.
+        for _ in range(200):
+            if failing()['https://list-denied.example/']['sync']['error_kind'] == 'auth': break
+            time.sleep(.05)
+        else: raise RuntimeError('No scheduled sync after verify: ' + json.dumps(failing()))
+        assert failing()['https://list-denied.example/']['schedule']['needs_user']
+        states = {c['id']: c['sync'] for c in json.loads(call('/api/snapshot', token=token)[2])['connections']}
         if os.name == 'posix':
             assert (root.stat().st_mode & 0o777) == 0o700
             assert ((root / 'service.token').stat().st_mode & 0o777) == 0o600
@@ -203,7 +271,11 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert call('/api/snapshot',token=token)[0] == 401
         snapshot = json.loads(call('/api/snapshot',token=fresh)[2])
         assert all(i['effort_id']==effort['id'] for i in snapshot['items'] if i['id'] in ['demo-4','demo-5'])
-        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin, the external export, the Mine view, permissions and restart persistence')
+        # Sync state is kept: the last successes are those from before.
+        for c in snapshot['connections']:
+            if c['id'] in last_success:
+                assert c['sync']['last_success'] == states[c['id']]['last_success'], (c, states)
+        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin, the external export, the Mine view, scheduled sync and freshness, permissions and restart persistence')
     finally:
         if process.poll() is None:
             process.terminate()
