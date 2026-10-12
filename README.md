@@ -234,6 +234,6 @@ The GNOME smoke test needs Xvfb, ImageMagick, xdotool, PyGObject and python-xlib
 
 See `docs/architecture.md` for the next implementation boundaries.
 
-## Container recipe
+## Container image
 
-`Containerfile` is supplied as a starting recipe and has not been built in this environment. Because the server binds loopback only, a container on Linux needs host networking to reach it from the same host browser. Mount a private, writable `/data` directory and run as its owner. The native executable is the recommended first run on Linux or macOS.
+`Containerfile` builds the hub's release image: the web UI and a release build of the service, on a distroless base, as an unprivileged user, with its data directory as a volume. CI builds it and runs `tests/image_smoke.py` against it on every pull request, and publishes it to `ghcr.io/jmarrero-bot/work-tracker-poc` on `v*` tags. [docs/hub.md](docs/hub.md#run-the-hub-from-its-image) says how to run it, and [docs/release.md](docs/release.md) how to release it and move atomic-setup's pin.

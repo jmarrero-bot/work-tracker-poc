@@ -20,7 +20,7 @@ workboard --data-dir ~/.local/share/workboard-hub serve --hub --allowed-host bot
 The hub listens on `127.0.0.1:8421` only, like any Workboard service. [`tailscale serve`](https://tailscale.com/kb/1312/serve) is the intended front: it serves the hub over HTTPS on the tailnet, with a certificate for the machine's tailnet name, and proxies to the loopback port.
 
 ```sh
-tailscale serve --bg 8421
+tailscale serve --bg --https=443 http://127.0.0.1:8421
 ```
 
 Give that name to `--allowed-host`, once per name the hub is reached by. The hub accepts a request only if its Host is its loopback address or one of those names, and `tailscale serve` passes on the name the browser used. A browser's changes must carry the HTTPS origin of the name the request came by, so cross-site requests are refused behind the proxy as on loopback. Use `tailscale serve`, never Funnel, which would put the hub on the internet: Funnel marks each request it brings in with a `Tailscale-Funnel-Request` header, which `tailscale serve` strips from requests that arrive with one, and the hub refuses every request that has it, the page included. Only a hub takes `--allowed-host`: a local service may hold internal work, and stays reachable on loopback alone.
@@ -43,7 +43,38 @@ $WB companion-token
 
 Upgrade the companions before the hub. A companion checks the hub's export whole, and refuses all of it if it has a source or a reason it doesn't know, such as the bot connector's `bot` items and their `bot_waiting` reason, which an older companion doesn't.
 
-Publishing the hub's image and its quadlet in atomic-setup is a later slice ([#11](https://github.com/jmarrero-bot/work-tracker-poc/issues/11)).
+## Run the hub from its image
+
+CI publishes the hub's image, `ghcr.io/jmarrero-bot/work-tracker-poc`, for each `v*` tag ([release.md](release.md)). On jmarrero's bot machine it runs from the quadlet in jmarrero/atomic-setup, `bot/workboard-hub/`, which pins the image by digest and holds only the wiring: the volume, the secrets and the port. The hub's code and its image stay here, and moving the pin is an atomic-setup pull request that jmarrero merges.
+
+The image runs `workboard serve --hub` as an unprivileged user, from a distroless base with no shell. Its data directory is the volume at `/var/lib/workboard`, which the CLI finds without `--data-dir` (the image sets `XDG_DATA_HOME`). Its health check is an authenticated `workboard connections`, which reads the service's token from that directory.
+
+The hub still listens on `127.0.0.1:8421` only, inside the container. Publish that port to the host's loopback, at the same number, since the hub takes its loopback address only as `127.0.0.1:8421`, and have rootless podman's pasta forward it to the container's loopback with `--host-lo-to-ns-lo` (`pasta --help` lists it if pasta has it). By default pasta, like Docker, forwards a published port to the container's own address, where nothing listens. `tailscale serve` on the host then proxies to the published port as above. Under Docker, use `--network host` instead.
+
+```sh
+podman run -d --name workboard-hub --volume workboard-hub:/var/lib/workboard \
+  --network pasta:--host-lo-to-ns-lo --publish 127.0.0.1:8421:8421 --cap-drop all --security-opt no-new-privileges --read-only \
+  --secret jmarrero-bot-gh-token,type=env,target=GH_TOKEN \
+  ghcr.io/jmarrero-bot/work-tracker-poc@sha256:DIGEST \
+  serve --hub --allowed-host bot.tail1234.ts.net
+```
+
+The pairing URL is in the container's log (`podman logs workboard-hub`). The CLI runs in the container, where a secret given as an environment variable is what `--token-env` reads:
+
+```sh
+podman exec workboard-hub workboard connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user jmarrero
+podman exec workboard-hub workboard companion-token
+```
+
+A connection keeps its own copy of the token in the data directory. After replacing the secret, restart the container and give the connection the new token with `podman exec workboard-hub workboard verify ID --token-env GH_TOKEN`.
+
+Check through `tailscale serve` that the hub takes its tailnet name:
+
+```sh
+curl -sS https://bot.tail1234.ts.net/api/snapshot
+```
+
+`` {"error":"Open the pairing URL printed by `workboard serve`"} `` means the name got through and the hub wants a login; `{"error":"Unexpected host"}` means it isn't one of the `--allowed-host` names. Once GitHub App login ([#12](https://github.com/jmarrero-bot/work-tracker-poc/issues/12)) lands, its options go on the same `serve` line.
 
 ## Set up the companion
 
