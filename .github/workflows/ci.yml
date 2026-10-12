@@ -102,12 +102,36 @@ jobs:
       - name: cargo build
         run: cargo build --locked -p workboard-gnome
 
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      # The runner's preinstalled SDKs, mounted to be removed: the
+      # runtime, the SDK and the build don't fit next to them.
+      options: >-
+        --privileged -v /usr/share/dotnet:/unused/dotnet -v /usr/local/lib/android:/unused/android
+        -v /opt/hostedtoolcache:/unused/toolcache -v /opt/ghc:/unused/ghc
+    steps:
+      - name: Free disk space
+        run: |
+          rm -rf /unused/*/*
+          df -h /__w
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
+        with:
+          manifest-path: gnome/io.github.jmarrero_bot.Workboard.yml
+          bundle: workboard-gnome.flatpak
+          # A restored cache would take the space of a build again.
+          cache: false
+
   # The one job that decides whether a change may merge. It runs always(),
   # even when a job it needs failed or the run was cancelled, and fails
   # unless every job it needs succeeded. List every job above in needs.
   ci:
     if: always()
-    needs: [fmt, build, gnome]
+    needs: [fmt, build, gnome, flatpak]
     runs-on: ubuntu-latest
     steps:
       - name: Check the jobs it needs

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.jmarrero_bot.Workboard</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Workboard</name>
+  <summary>What waits on you, from every account</summary>
+  <description>
+    <p>
+      A companion to the local Workboard service: the review requests,
+      assignments and mentions that wait on you across Jira, GitLab, GitHub,
+      Fedora Forge and the bot, your next actions, efforts with their
+      progress, and how fresh each connection is. New items are announced
+      as notifications, also while the window is closed.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.jmarrero_bot.Workboard.desktop</launchable>
+  <url type="homepage">https://github.com/jmarrero-bot/work-tracker-poc</url>
+  <developer id="io.github.jmarrero_bot">
+    <name>jmarrero-bot</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <releases>
+    <release version="0.1.0" date="2026-10-12"/>
+  </releases>
+</component>

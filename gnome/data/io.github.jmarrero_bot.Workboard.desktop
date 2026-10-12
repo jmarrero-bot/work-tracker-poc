@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Workboard
+Comment=What waits on you, from every account
+Exec=workboard-gnome
+Icon=io.github.jmarrero_bot.Workboard
+Terminal=false
+Type=Application
+Categories=Office;ProjectManagement;
+Keywords=work;inbox;review;jira;gitlab;github;
+StartupNotify=true
+DBusActivatable=false
+X-GNOME-UsesNotifications=true
