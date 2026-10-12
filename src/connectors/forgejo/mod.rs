@@ -32,6 +32,9 @@ const PER_PAGE: usize = 50;
 /// Most results one listing reads; past it, the sync fails rather than
 /// save part of them.
 const MAX_RESULTS: u64 = 1000;
+/// Most pages one listing reads: enough for [`MAX_RESULTS`], and one more
+/// for a listing that grew while it was read.
+const MAX_PAGES: u64 = MAX_RESULTS.div_ceil(PER_PAGE as u64) + 1;
 /// Where Forgejo searches the issues and pull requests the account can see.
 const SEARCH: &str = "repos/issues/search";
 
@@ -111,7 +114,7 @@ impl Forgejo {
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
         let mut first_total = None;
-        for page in 1..=MAX_RESULTS {
+        for page in 1..=MAX_PAGES {
             let mut query = query.to_vec();
             query.extend([("limit", PER_PAGE.to_string()), ("page", page.to_string())]);
             let (v, total) = match self.client.get(target, path, &query).await? {
@@ -137,6 +140,7 @@ impl Forgejo {
             let page_rows = v
                 .as_array()
                 .ok_or_else(|| ConnectorError::invalid("Unexpected Forgejo listing"))?;
+            let before = rows.len();
             for row in page_rows {
                 let id = row["id"]
                     .as_u64()
@@ -154,6 +158,14 @@ impl Forgejo {
                 return Err(ConnectorError::new(
                     ErrorKind::Transient,
                     "Forgejo's listing returned fewer results than it counted; no partial results were saved",
+                ));
+            }
+            // Nor does a page of results already read, as a server that
+            // ignores `page` sends: it would never reach the count.
+            if rows.len() == before {
+                return Err(ConnectorError::new(
+                    ErrorKind::Transient,
+                    "Forgejo's listing repeated a page; no partial results were saved",
                 ));
             }
         }
@@ -650,6 +662,24 @@ mod tests {
         }));
         let error = sync(router, &[]).await.0.unwrap_err();
         assert_eq!(error.kind, ErrorKind::Transient, "{error}");
+        assert!(error.message.contains("repeated a page"), "{error}");
+        // A server that ignores `page` is asked twice, not until the count.
+        let router = routes(get(|| async { page(vec![issue(1, "open")], 2) }));
+        let (items, requests) = sync(router, &[]).await;
+        let error = items.unwrap_err();
+        assert!(error.message.contains("repeated a page"), "{error}");
+        assert_eq!(requests.sent["GET"], 1 + 2, "the account and two pages");
+        // One that sends a new result a page never ends either: it is read
+        // for as many pages as the most results take, and one more.
+        let router = routes(get(|q: Query<HashMap<String, String>>| async move {
+            let n: u64 = q["page"].parse().unwrap();
+            page(vec![issue(n, "open")], 1000)
+        }));
+        let (items, requests) = sync(router, &[]).await;
+        let error = items.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Invalid, "{error}");
+        assert!(error.message.contains("kept paging"), "{error}");
+        assert_eq!(requests.sent["GET"], 1 + MAX_PAGES);
         // Another account's token is refused before anything is listed.
         let router = Router::new().route(
             "/api/v1/user",
