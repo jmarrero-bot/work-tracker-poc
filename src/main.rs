@@ -52,6 +52,10 @@ enum Command {
         /// service still listens on loopback only. Repeat for each name.
         #[arg(long = "allowed-host", value_name = "NAME", requires = "hub")]
         allowed_hosts: Vec<String>,
+        /// Let browsers pair with the hub through the pairing URL it prints,
+        /// until its GitHub App is set up.
+        #[arg(long, requires = "hub")]
+        pairing: bool,
         /// How often each connection syncs unless it has its own interval,
         /// such as 30m or 1h.
         #[arg(long, value_name = "INTERVAL", default_value = "5m", value_parser = interval)]
@@ -416,6 +420,7 @@ async fn main() -> Result<()> {
         demo,
         hub,
         allowed_hosts,
+        pairing,
         sync_interval,
     } = args.command
     {
@@ -425,6 +430,7 @@ async fn main() -> Result<()> {
             interval: sync_interval,
             hub,
             hosts: allowed_hosts,
+            pairing,
         };
         return server::serve(root, options).await;
     }

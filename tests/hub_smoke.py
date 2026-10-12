@@ -158,8 +158,10 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         other = [binary, '--data-dir', str(Path(folder) / 'other'), '--port', str(free_port()), 'serve']
         refused(other + ['--hub', '--demo'], 'cannot be used with')
         refused(other + ['--allowed-host', TAILNET], '--hub')
+        refused(other + ['--pairing'], '--hub')
 
-        hub = Service(hub_root, '--hub', '--allowed-host', TAILNET)
+        # Without its GitHub App, a hub pairs browsers only with --pairing.
+        hub = Service(hub_root, '--hub', '--allowed-host', TAILNET, '--pairing')
         services.append(hub)
         hub_answers = []
 
@@ -319,13 +321,14 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         refused([binary, '--data-dir', str(companion_root), '--port', str(free_port()), 'serve', '--hub'], "isn't a hub's")
         hub = Service(hub_root, '--hub')
         services.append(hub)
+        assert hub.call('/api/session', 'POST')[0] == 403, 'no pairing without --pairing'
         assert hub.cli('companion-token').stdout.strip() == companion_token, 'kept across restarts'
         rotated = hub.cli('companion-token', '--rotate').stdout.strip()
         assert rotated != companion_token
         assert hub.call('/api/export/external', token=companion_token)[0] == 401
         assert hub.call('/api/export/external', token=rotated)[0] == 200
         proxy.shutdown()
-        print('PASS: hub mode refusals, tailnet name and origins, the companion token, a companion pulling read-only GETs, the merged board and Mine view, duplicates, read-only hub work, no internal work at the hub, staleness with the hub down, and mode persistence')
+        print('PASS: hub mode refusals, tailnet name and origins, the companion token, a companion pulling read-only GETs, the merged board and Mine view, duplicates, read-only hub work, no internal work at the hub, staleness with the hub down, mode persistence, and pairing only with --pairing')
     finally:
         for service in services:
             service.stop()
