@@ -23,7 +23,7 @@ The hub listens on `127.0.0.1:8421` only, like any Workboard service. [`tailscal
 tailscale serve --bg 8421
 ```
 
-Give that name to `--allowed-host`, once per name the hub is reached by. The hub accepts a request only if its Host is its loopback address or one of those names, and `tailscale serve` passes on the name the browser used. A browser's changes must carry the HTTPS origin of the name the request came by, so cross-site requests are refused behind the proxy as on loopback. Use `tailscale serve`, never Funnel, which would put the hub on the internet. Only a hub takes `--allowed-host`: a local service may hold internal work, and stays reachable on loopback alone.
+Give that name to `--allowed-host`, once per name the hub is reached by. The hub accepts a request only if its Host is its loopback address or one of those names, and `tailscale serve` passes on the name the browser used. A browser's changes must carry the HTTPS origin of the name the request came by, so cross-site requests are refused behind the proxy as on loopback. Use `tailscale serve`, never Funnel, which would put the hub on the internet: Funnel marks each request it brings in with a `Tailscale-Funnel-Request` header, which `tailscale serve` strips from requests that arrive with one, and the hub refuses every request that has it, the page included. Only a hub takes `--allowed-host`: a local service may hold internal work, and stays reachable on loopback alone.
 
 Then connect its sources, always as external, with the same CLI on the same data directory:
 

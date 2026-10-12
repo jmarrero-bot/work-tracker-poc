@@ -42,8 +42,8 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def call(port, path, method='GET', body=None, token=None, cookie=None, origin=None, host=None):
-    headers = {}
+def call(port, path, method='GET', body=None, token=None, cookie=None, origin=None, host=None, extra=None):
+    headers = dict(extra or {})
     if token is not None: headers['Authorization'] = 'Bearer ' + token
     if cookie is not None: headers['Cookie'] = cookie
     if origin is not None: headers['Origin'] = origin
@@ -194,6 +194,12 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         assert hub_call('/api/efforts', 'POST', {'title': 'Via the tailnet'}, origin=f'https://{TAILNET}', **via)[0] == 200
         assert hub_call('/api/efforts', 'POST', {'title': 'Cross'}, origin=f'http://127.0.0.1:{hub.port}', **via)[0] == 403
         assert hub_call('/api/efforts', 'POST', {'title': 'Cross'}, origin=f'http://{TAILNET}', **via)[0] == 403
+        # Never through Tailscale Funnel, which marks what it brings from
+        # the internet: not the API, not the page.
+        funnel = {'Tailscale-Funnel-Request': '?1'}
+        assert hub_call('/api/snapshot', host=TAILNET, extra=funnel)[0] == 403
+        assert hub_call('/', token=None, host=TAILNET, extra=funnel)[0] == 403
+        assert hub_call('/', token=None, host=TAILNET)[0] == 200
 
         # The companion token reads the export, and nothing else.
         companion_token = hub.cli('companion-token').stdout.strip()
