@@ -4,8 +4,8 @@
 use super::{account, inaccessible, source_url, string, Auth, Fetched, Http};
 use crate::{
     connector::{
-        Account, BoxFuture, Connector, ConnectorError, ConnectorResult, Refreshed, RemoteItem,
-        Target, Tracked,
+        Account, BoxFuture, Connector, ConnectorError, ConnectorResult, Reason, Refreshed,
+        RemoteItem, Target, Tracked,
     },
     outcome,
 };
@@ -60,8 +60,9 @@ impl Jira {
                 .as_array()
                 .ok_or_else(|| ConnectorError::invalid("Unexpected Jira search response"))?;
             for row in rows {
-                let item =
+                let mut item =
                     jira_item(&target.base_url, row, "next").map_err(ConnectorError::invalid)?;
+                item.reasons = vec![Reason::Assigned];
                 all.insert(item.remote_id.clone(), item);
             }
             start += rows.len();
@@ -161,6 +162,7 @@ pub fn jira_item(base: &Url, v: &Value, action: &str) -> Result<RemoteItem> {
         outcome_reason,
         action: action.into(),
         updated_at: string(&v["fields"], "updated")?,
+        reasons: vec![],
     })
 }
 
@@ -203,5 +205,44 @@ mod tests {
             assert_eq!(i.url, "https://example.com/browse/RHEL-1");
             assert_eq!(i.action, if outcome == Open { "next" } else { "" });
         }
+    }
+    fn issue(n: u64) -> Value {
+        serde_json::json!({"id":n.to_string(),"key":format!("RHEL-{n}"),"fields":{"summary":"fix","updated":"now","resolution":null,"status":{"name":"In Progress","statusCategory":{"key":"indeterminate"}}}})
+    }
+    #[tokio::test]
+    async fn assigned_issues_wait_on_the_account() {
+        use axum::{extract::Query, routing::get, Json, Router};
+        // Two pages, the second overlapping the first, as a search can when
+        // an issue changes between requests.
+        async fn search(Query(q): Query<std::collections::HashMap<String, String>>) -> Json<Value> {
+            assert!(q["jql"].starts_with("assignee = currentUser()"), "{q:?}");
+            let issues: Vec<_> = match q["startAt"].as_str() {
+                "0" => vec![issue(1), issue(2)],
+                _ => vec![issue(2)],
+            };
+            Json(serde_json::json!({"issues": issues, "total": 3}))
+        }
+        let router = Router::new()
+            .route(
+                "/rest/api/2/myself",
+                get(|| async { Json(serde_json::json!({"key":"1","name":"me"})) }),
+            )
+            .route("/rest/api/2/search", get(search));
+        let (target, task) = crate::connectors::fixture(router, "test-only-token").await;
+        let items = connector::sync(&Jira::new().unwrap(), &target, &c(), &[])
+            .await
+            .unwrap();
+        let listed: Vec<_> = items
+            .iter()
+            .map(|i| (i.key.as_str(), i.action.as_str(), i.reasons.clone()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("RHEL-1", "next", vec![Reason::Assigned]),
+                ("RHEL-2", "next", vec![Reason::Assigned]),
+            ]
+        );
+        task.abort();
     }
 }

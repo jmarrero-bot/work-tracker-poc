@@ -5,14 +5,13 @@
 use super::{account, inaccessible, source_url, string, Auth, Fetched, Http};
 use crate::{
     connector::{
-        Account, BoxFuture, Connector, ConnectorError, ConnectorResult, Refreshed, RemoteItem,
-        Target, Tracked,
+        Account, BoxFuture, Connector, ConnectorError, ConnectorResult, Listing, Reason, Refreshed,
+        RemoteItem, Target, Tracked,
     },
     outcome,
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 const SOURCE: &str = "GitLab";
 
@@ -36,11 +35,19 @@ impl GitLab {
         target: &Target,
         account: &Account,
     ) -> ConnectorResult<Vec<RemoteItem>> {
-        let mut all = BTreeMap::<String, RemoteItem>::new();
-        for (kind, extra) in [
-            ("next", ("scope", "created_by_me".into())),
-            ("next", ("scope", "assigned_to_me".into())),
-            ("review", ("reviewer_id", account.id.clone())),
+        let mut all = Listing::default();
+        for (kind, extra, reason) in [
+            ("next", ("scope", "created_by_me".into()), None),
+            (
+                "next",
+                ("scope", "assigned_to_me".into()),
+                Some(Reason::Assigned),
+            ),
+            (
+                "review",
+                ("reviewer_id", account.id.clone()),
+                Some(Reason::ReviewRequested),
+            ),
         ] {
             let mut complete = false;
             for page in 1..=100 {
@@ -64,11 +71,11 @@ impl GitLab {
                     ConnectorError::invalid("Unexpected GitLab merge request list")
                 })?;
                 for row in rows {
-                    let item = gitlab_item(row, kind).map_err(ConnectorError::invalid)?;
-                    // A review assignment takes precedence when the MR appears in multiple lists.
-                    if kind == "review" || !all.contains_key(&item.remote_id) {
-                        all.insert(item.remote_id.clone(), item);
-                    }
+                    let mut item = gitlab_item(row, kind).map_err(ConnectorError::invalid)?;
+                    item.reasons.extend(reason);
+                    // A review request takes precedence when the MR appears in
+                    // several lists, and its reasons add up.
+                    all.add(item);
                 }
                 if rows.len() < 100 {
                     complete = true;
@@ -81,7 +88,7 @@ impl GitLab {
                 ));
             }
         }
-        Ok(all.into_values().collect())
+        Ok(all.into_items())
     }
     async fn tracked(
         &self,
@@ -164,6 +171,7 @@ pub fn gitlab_item(v: &Value, action: &str) -> Result<RemoteItem> {
         outcome_reason,
         action: action.into(),
         updated_at: string(v, "updated_at")?,
+        reasons: vec![],
     })
 }
 
@@ -171,12 +179,11 @@ pub fn gitlab_item(v: &Value, action: &str) -> Result<RemoteItem> {
 mod tests {
     use super::*;
     use crate::{
-        connector::{self, Credential},
+        connector,
         connectors::test_connection as c,
         model::{Connection, Item, Outcome},
     };
     use reqwest::StatusCode;
-    use url::Url;
     /// Build items the way a sync does, through the connector interface.
     fn gitlab_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
         Ok(connector::to_item(
@@ -220,20 +227,11 @@ mod tests {
             self.connector.verify(&self.target).await
         }
     }
-    /// Serve a GitLab API fixture over plain HTTP, which production
-    /// constructors refuse.
+    /// The GitLab connector pointed at a fixture serving `router`.
     async fn fixture(router: axum::Router, token: &str) -> (Fixture, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}/", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let p = Fixture {
-            connector: GitLab::new().unwrap(),
-            target: Target {
-                base_url: Url::parse(&base).unwrap(),
-                credential: Credential::new(token).unwrap(),
-            },
-        };
-        (p, task)
+        let (target, task) = crate::connectors::fixture(router, token).await;
+        let connector = GitLab::new().unwrap();
+        (Fixture { connector, target }, task)
     }
     fn mr(iid: u64, state: &str) -> Value {
         serde_json::json!({"project_id":7,"iid":iid,"title":format!("fix {iid}"),"state":state,"web_url":format!("https://example.com/p/-/merge_requests/{iid}"),"updated_at":"2026-10-06T20:00:00Z"})
@@ -246,7 +244,7 @@ mod tests {
                 return Json(serde_json::json!([mr(1, "opened")]));
             }
             if q.get("scope").map(String::as_str) == Some("assigned_to_me") {
-                return Json(serde_json::json!([]));
+                return Json(serde_json::json!([mr(1, "opened")]));
             }
             let rows = if q.get("page").map(String::as_str) == Some("1") {
                 (1..=100).map(|i| mr(i, "opened")).collect::<Vec<_>>()
@@ -281,10 +279,20 @@ mod tests {
             .collect();
         let items = p.sync(&c(), &old).await.unwrap();
         assert_eq!(items.len(), 105);
+        // Listed three times: once, with both reasons and the review first.
+        let listed = |remote_id: &str| {
+            let i = items.iter().find(|i| i.remote_id == remote_id).unwrap();
+            (i.action.clone(), i.reasons.clone())
+        };
         assert_eq!(
-            items.iter().find(|i| i.remote_id == "7:1").unwrap().action,
-            "review"
+            listed("7:1"),
+            (
+                "review".into(),
+                vec![Reason::ReviewRequested, Reason::Assigned]
+            )
         );
+        // Only authored: in the inbox, but not waiting on the account.
+        assert_eq!(listed("7:2"), ("next".into(), vec![]));
         for (remote_id, status, outcome, reason) in [
             ("7:999", "merged", Outcome::Delivered, "merged"),
             ("7:998", "closed", Outcome::ClosedWithoutDelivery, "closed"),

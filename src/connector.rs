@@ -27,8 +27,9 @@ const MAX_CREDENTIAL: usize = 16384;
 const MAX_FIELD: usize = 8192;
 /// Longest remote identity accepted from a connector, in bytes.
 const MAX_REMOTE_ID: usize = 256;
-/// Attention categories a connector may give an item.
-const ACTIONS: &[&str] = &["next", "review", "waiting", "follow-up", ""];
+/// Attention categories a connector may give an item, from the most
+/// pressing.
+const ACTIONS: &[&str] = &["review", "next", "waiting", "follow-up", ""];
 /// The attention category of tracked items fetched again by `refresh`.
 const FOLLOW_UP: &str = "follow-up";
 /// What replaces a credential that a message echoes.
@@ -144,6 +145,29 @@ pub struct Account {
     pub name: String,
 }
 
+/// Why an item waits on an account. The Mine view lists open items that
+/// have one, with all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    /// The account's review is requested.
+    ReviewRequested,
+    /// The review of a team the account is in is requested.
+    TeamReviewRequested,
+    /// It is assigned to the account.
+    Assigned,
+    /// The account was mentioned.
+    Mentioned,
+    /// The account's own change has changes requested.
+    ChangesRequested,
+    /// The account's own change has failing checks.
+    ChecksFailing,
+    /// The account wrote it.
+    Authored,
+    /// It is on the account's to-do list for another reason.
+    Todo,
+}
+
 /// An item as its source reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteItem {
@@ -166,6 +190,37 @@ pub struct RemoteItem {
     pub action: String,
     /// When the source last changed the item.
     pub updated_at: String,
+    /// Why it waits on the account, if it does. Optional in the protocol.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<Reason>,
+}
+
+/// Items that several listings of one connector report, each once: their
+/// reasons combined, and the most pressing attention category.
+#[derive(Default)]
+pub struct Listing(BTreeMap<String, RemoteItem>);
+
+impl Listing {
+    pub fn add(&mut self, mut item: RemoteItem) {
+        let rank = |action: &str| {
+            ACTIONS
+                .iter()
+                .position(|a| *a == action)
+                .unwrap_or(usize::MAX)
+        };
+        if let Some(old) = self.0.remove(&item.remote_id) {
+            item.reasons.extend(old.reasons);
+            if rank(&old.action) < rank(&item.action) {
+                item.action = old.action;
+            }
+        }
+        item.reasons.sort();
+        item.reasons.dedup();
+        self.0.insert(item.remote_id.clone(), item);
+    }
+    pub fn into_items(self) -> Vec<RemoteItem> {
+        self.0.into_values().collect()
+    }
 }
 
 /// A tracked item to fetch again: it was open or unknown, and `list` no
@@ -275,6 +330,9 @@ pub fn to_item(c: &Connection, kind: &str, remote: RemoteItem) -> ConnectorResul
         ));
     }
     let url = source_url(&remote.url).map_err(ConnectorError::invalid)?;
+    let mut reasons = remote.reasons;
+    reasons.sort();
+    reasons.dedup();
     let mut item = Item {
         id: format!("{}:{kind}:{}", c.id, remote.remote_id),
         connection_id: Some(c.id.clone()),
@@ -292,6 +350,7 @@ pub fn to_item(c: &Connection, kind: &str, remote: RemoteItem) -> ConnectorResul
         abandoned_at: None,
         demo: false,
         zone: c.zone,
+        reasons,
     };
     item.set_outcome((remote.outcome, remote.outcome_reason));
     Ok(item)
@@ -418,7 +477,10 @@ async fn sync_checked(
                         "The connector answered a tracked item with a different item",
                     ));
                 }
+                // The listing no longer has it, so it no longer waits on
+                // the account.
                 remote.action = FOLLOW_UP.into();
+                remote.reasons.clear();
                 checked(remote)?
             }
             (None, Some(e)) if e.kind == ErrorKind::Inaccessible => {
@@ -528,6 +590,7 @@ mod tests {
             outcome_reason: format!("Fake says {outcome:?}"),
             action: action.into(),
             updated_at: "2026-10-12T00:00:00Z".into(),
+            reasons: vec![],
         }
     }
     /// An item a previous sync stored.
@@ -551,14 +614,18 @@ mod tests {
             stored("done", Delivered),
             elsewhere,
         ];
+        let assigned = |mut item: RemoteItem| {
+            item.reasons = vec![Reason::Assigned, Reason::Assigned];
+            item
+        };
         let fake = Fake::new(
             vec![
-                remote("listed", Open, "review"),
+                assigned(remote("listed", Open, "review")),
                 remote("new", Delivered, "next"),
             ],
             vec![
                 Refreshed::inaccessible("gone", "Fake returned HTTP 404 for this item"),
-                Refreshed::found("merged", remote("merged", Delivered, "next")),
+                Refreshed::found("merged", assigned(remote("merged", Delivered, "next"))),
             ],
         );
         let items = run(&fake, &old).await.unwrap();
@@ -582,6 +649,10 @@ mod tests {
                 ("c1:fake:new", Delivered, ""),
             ]
         );
+        // A listed item keeps its reasons, once each; a refreshed one isn't
+        // listed, so nothing waits on the account any more.
+        let reasons: Vec<_> = items.iter().map(|i| i.reasons.clone()).collect();
+        assert_eq!(reasons, [vec![], vec![Reason::Assigned], vec![], vec![]]);
         let gone = &items[0];
         assert_eq!(gone.status, "Unknown", "the last known status stays");
         assert_eq!(
@@ -793,15 +864,54 @@ mod tests {
     }
 
     #[test]
+    fn listings_combine_reasons_and_keep_the_most_pressing_action() {
+        use Reason::*;
+        let item = |id: &str, action: &str, reasons: Vec<Reason>| RemoteItem {
+            reasons,
+            ..remote(id, Outcome::Open, action)
+        };
+        let mut listing = Listing::default();
+        for added in [
+            item("a", "waiting", vec![]),
+            item("a", "review", vec![ReviewRequested]),
+            item("a", "next", vec![Assigned, ReviewRequested]),
+            item("b", "next", vec![Mentioned]),
+        ] {
+            listing.add(added);
+        }
+        let items: Vec<_> = listing
+            .into_items()
+            .into_iter()
+            .map(|i| (i.remote_id, i.action, i.reasons))
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("a".into(), "review".into(), vec![ReviewRequested, Assigned]),
+                ("b".into(), "next".into(), vec![Mentioned]),
+            ]
+        );
+    }
+
+    #[test]
     fn protocol_json_shapes() {
         let answer = Refreshed::inaccessible("7:4", "Gone");
         assert_eq!(
             serde_json::to_value(&answer).unwrap(),
             serde_json::json!({"remote_id":"7:4","error":{"kind":"inaccessible","message":"Gone"}})
         );
-        let item = remote("7:4", Outcome::ClosedWithoutDelivery, "");
+        let mut item = remote("7:4", Outcome::ClosedWithoutDelivery, "");
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["outcome"], "closed_without_delivery");
+        // Reasons are optional, so older plugins and hosts still agree.
+        assert!(json.get("reasons").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<RemoteItem>(json).unwrap(), item);
+        item.reasons = vec![Reason::TeamReviewRequested, Reason::ChecksFailing];
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            json["reasons"],
+            serde_json::json!(["team_review_requested", "checks_failing"])
+        );
         assert_eq!(serde_json::from_value::<RemoteItem>(json).unwrap(), item);
         let credential = Credential::new(" test-only-token\n").unwrap();
         assert_eq!(credential.expose(), "test-only-token");

@@ -1,5 +1,5 @@
 pub use crate::{
-    connector::ErrorKind,
+    connector::{ErrorKind, Reason},
     outcome::{Outcome, Progress},
     zone::Zone,
 };
@@ -51,6 +51,9 @@ pub struct Item {
     /// connection and are internal.
     #[serde(default)]
     pub zone: Zone,
+    /// Why it waits on its connection's account, as of the last sync.
+    #[serde(default)]
+    pub reasons: Vec<Reason>,
 }
 
 impl Item {

@@ -317,6 +317,7 @@ mod tests {
             abandoned_at: Some(format!("{INTERNAL} abandoned {n}")),
             demo: false,
             zone,
+            reasons: vec![],
         }
     }
     /// An effort whose title is tagged internal unless it's shared.
