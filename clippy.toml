@@ -1,8 +1,9 @@
 # Workboard only reads from the sources it connects to, so a reqwest call
 # that can send any other method is refused here. Each use is an explicit
 # exception with a reason: the CLI's calls to its own local service, and the
-# one send of each read-only client (GitHub's and Forgejo's), which checks
-# every request first.
+# one send of each read-only client, which checks every request first:
+# GitHub's and Forgejo's, and the companion's client of its hub, which only
+# GETs the hub's export.
 #
 # A reqwest request goes out through `Client::execute`, the tower `Service`
 # that `Client` and `&Client` implement, or `RequestBuilder::send`. The first

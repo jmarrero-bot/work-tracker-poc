@@ -51,7 +51,7 @@ The GitHub connector holds a token that may be able to write: for testing it is 
 - `POST` to the GraphQL endpoint passes only with a JSON body of a `query` document and optional `variables`, when the document parses and every operation in it is a query. A mutation or subscription anywhere in it, even next to queries, an `operationName`, or anything else in the body refuses it. The document sent is printed from what was parsed, so GitHub reads what was checked;
 - everything else is refused before it is sent, and counted.
 
-Its HTTP client is private to that module, and clippy (`clippy.toml`, run with warnings denied) refuses the calls that could send another method anywhere in the crate unless marked as an exception. There are three exceptions: the one send of each read-only client, GitHub's and Fedora Forge's (below), after its check, and the CLI's calls to its own local service. reqwest sends a request through one of three paths, and each is covered:
+Its HTTP client is private to that module, and clippy (`clippy.toml`, run with warnings denied) refuses the calls that could send another method anywhere in the crate unless marked as an exception. There are four exceptions: the one send of each read-only client, GitHub's, Fedora Forge's (below) and the companion's client of its hub (see Hub mode), after its check, and the CLI's calls to its own local service. reqwest sends a request through one of three paths, and each is covered:
 
 - `Client::execute`, on a client or a reference to one: refused, since it sends a `Request` of any method;
 - tower's `Service::call`, which `Client` and `&Client` implement, also when reached generically through `axum::ServiceExt`: refused, for the same reason;
