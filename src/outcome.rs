@@ -186,6 +186,44 @@ pub fn github_issue(state: &str, reason: Option<&str>) -> Derived {
     }
 }
 
+/// Forgejo pull requests, such as Fedora Forge's: merged is delivered,
+/// closed without merging isn't, and a draft (a work-in-progress title) is
+/// open like any other.
+pub fn forgejo_pull_request(state: &str, merged: bool, draft: bool) -> Derived {
+    match (state, merged) {
+        (_, true) => (Outcome::Delivered, "Forgejo pull request was merged".into()),
+        ("open", _) if draft => (
+            Outcome::Open,
+            "Forgejo pull request is a draft (work in progress)".into(),
+        ),
+        ("open", _) => (Outcome::Open, "Forgejo pull request is open".into()),
+        ("closed", _) => (
+            Outcome::ClosedWithoutDelivery,
+            "Forgejo pull request was closed without merging; decide whether it was abandoned or needs rework".into(),
+        ),
+        (other, _) => (
+            Outcome::Unknown,
+            format!("Forgejo reported an unrecognized pull request state '{other}'"),
+        ),
+    }
+}
+
+/// Forgejo issues. Forgejo doesn't record whether a closed issue was done
+/// or dropped, so, as for GitLab, a closed one is never taken as delivered.
+pub fn forgejo_issue(state: &str) -> Derived {
+    match state {
+        "open" => (Outcome::Open, "Forgejo issue is open".into()),
+        "closed" => (
+            Outcome::ClosedWithoutDelivery,
+            "Forgejo issue was closed, and Forgejo does not record whether it was done; decide whether it was abandoned or needs rework".into(),
+        ),
+        other => (
+            Outcome::Unknown,
+            format!("Forgejo reported an unrecognized issue state '{other}'"),
+        ),
+    }
+}
+
 /// Jira resolutions that mean the work was delivered, compared
 /// case-insensitively. Any other resolution (Won't Do, Duplicate, Not a Bug,
 /// Obsolete, ...) is closed without delivery.
@@ -352,6 +390,34 @@ mod tests {
                 expected,
                 "{state} {reason:?}"
             );
+        }
+    }
+
+    #[test]
+    fn forgejo_pull_requests() {
+        for (state, merged, draft, expected) in [
+            ("open", false, false, Open),
+            ("open", false, true, Open),
+            ("closed", true, false, Delivered),
+            ("closed", false, false, ClosedWithoutDelivery),
+            ("closed", false, true, ClosedWithoutDelivery),
+            ("locked", false, false, Unknown),
+        ] {
+            let (outcome, reason) = forgejo_pull_request(state, merged, draft);
+            assert_eq!(outcome, expected, "{state} merged={merged} draft={draft}");
+            assert!(reason.contains("pull request"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn forgejo_issues() {
+        for (state, expected) in [
+            ("open", Open),
+            // Closed is not delivered: Forgejo doesn't say how.
+            ("closed", ClosedWithoutDelivery),
+            ("locked", Unknown),
+        ] {
+            assert_eq!(forgejo_issue(state).0, expected, "{state}");
         }
     }
 
