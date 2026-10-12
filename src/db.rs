@@ -28,6 +28,15 @@ pub fn write_secret(path: &Path, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove the file at `path`, if there is one.
+pub fn remove_if_there(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("Cannot remove {}", path.display())),
+    }
+}
+
 /// The schema version this build writes, kept in SQLite's `user_version`.
 /// Version 0 is the prototype's schema, whose items only had a `terminal` flag.
 const SCHEMA_VERSION: i32 = 5;
@@ -400,11 +409,7 @@ impl Db {
     pub fn stage_secret(&self, id: &str, value: &str) -> Result<PathBuf> {
         Uuid::parse_str(id)?;
         let staged = self.root.join("secrets").join(format!("{id}.new"));
-        match fs::remove_file(&staged) {
-            Ok(()) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(e) => return Err(e.into()),
-        }
+        remove_if_there(&staged)?;
         write_secret(&staged, value)?;
         Ok(staged)
     }
@@ -686,11 +691,12 @@ impl Db {
         tx.execute("DELETE FROM sync_state WHERE connection_id=?1", [id])?;
         tx.execute("DELETE FROM connections WHERE id=?1", [id])?;
         tx.commit()?;
-        match fs::remove_file(self.root.join("secrets").join(id)) {
-            Ok(()) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(e) => return Err(e.into()),
-        };
+        // The credential, and a new one a verify staged but never put in
+        // place.
+        let secrets = self.root.join("secrets");
+        for path in [secrets.join(id), secrets.join(format!("{id}.new"))] {
+            remove_if_there(&path)?;
+        }
         Ok(())
     }
     pub fn seed(&mut self) -> Result<()> {
@@ -1313,12 +1319,18 @@ mod tests {
         assert_eq!(body.get("sync"), None, "{body}");
         assert_eq!(body.get("schedule"), None, "{body}");
         let mut db = db;
+        // A credential, and a new one a failed verify left staged.
+        let secrets = root.join("secrets");
+        write_secret(&secrets.join(&c.id), "test-only-token").unwrap();
+        db.stage_secret(&c.id, "new-token").unwrap();
         db.delete_connection(&c.id).unwrap();
         let rows: i64 = db
             .sql
             .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0);
+        let left: Vec<_> = fs::read_dir(&secrets).unwrap().collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]

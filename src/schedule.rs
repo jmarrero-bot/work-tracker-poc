@@ -642,9 +642,18 @@ impl Scheduler {
         let staged = token
             .map(|_| db.stage_secret(id, target.credential.expose()))
             .transpose()?;
-        db.save_sync_state(id, &state)?;
-        if let Some(staged) = staged {
-            db.install_secret(id, &staged)?;
+        let installed = db.save_sync_state(id, &state).and_then(|()| {
+            staged
+                .as_deref()
+                .map_or(Ok(()), |staged| db.install_secret(id, staged))
+        });
+        if let Err(e) = installed {
+            // Never leave the new credential behind, where a disconnect
+            // wouldn't find it.
+            if let Some(staged) = &staged {
+                let _ = std::fs::remove_file(staged);
+            }
+            return Err(e);
         }
         let mut c = db.connection(id)?;
         drop(db);
@@ -1180,6 +1189,46 @@ mod tests {
         // Verifying the stored credential works the same.
         let c = h.scheduler.verify(h.id("a.example"), None).await.unwrap();
         assert_eq!(c.sync.next_due, Some(Timestamp::of(h.clock.now())));
+    }
+
+    #[tokio::test]
+    async fn a_failed_verify_leaves_no_staged_credential() {
+        let h = Harness::new(&[("a.example", None)]);
+        let id = h.id("a.example");
+        let secrets = h.temp.path().join("secrets");
+        let staged = secrets.join(format!("{id}.new"));
+        // Where verify fails: saving the state, or putting the new
+        // credential in place.
+        let fail_state = |db: &Db| {
+            db.sql()
+                .execute_batch("CREATE TRIGGER fail BEFORE INSERT ON sync_state BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+                .unwrap()
+        };
+        let fail_install = |_: &Db| {
+            let secret = secrets.join(id);
+            std::fs::remove_file(&secret).unwrap();
+            std::fs::create_dir(&secret).unwrap();
+            std::fs::write(secret.join("in-the-way"), "").unwrap();
+        };
+        let breaks: [&dyn Fn(&Db); 2] = [&fail_state, &fail_install];
+        for (n, fail) in breaks.into_iter().enumerate() {
+            fail(&lock(&h.db));
+            assert!(
+                h.scheduler.verify(id, Some("new-token")).await.is_err(),
+                "case {n}"
+            );
+            assert!(!staged.exists(), "case {n}");
+            // Repaired for the next case.
+            lock(&h.db)
+                .sql()
+                .execute_batch("DROP TRIGGER IF EXISTS fail")
+                .unwrap();
+            let secret = secrets.join(id);
+            if secret.is_dir() {
+                std::fs::remove_dir_all(&secret).unwrap();
+                db::write_secret(&secret, TOKEN).unwrap();
+            }
+        }
     }
 
     #[tokio::test]
