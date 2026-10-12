@@ -1,0 +1,23 @@
+[package]
+name = "workboard"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A personal work inbox across Jira, GitLab and downstream release work"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
