@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""A connector plugin with illustrative work, for the GNOME app's smoke test
+and screenshots. It answers the plugin protocol in docs/plugins.md from
+canned data, per instance host. Its links point to example domains, or to
+project home pages, never to real changes."""
+import json
+import sys
+import urllib.parse
+
+TOKEN = 'demo-only-token'
+
+
+def answer(body):
+    json.dump({'protocol': 1, **body}, sys.stdout)
+    sys.exit(0)
+
+
+def error(kind, message):
+    answer({'error': {'kind': kind, 'message': message}})
+
+
+def item(remote_id, key, title, status, url, reasons, action='next', outcome='open', reason=None):
+    return {
+        'remote_id': remote_id,
+        'key': key,
+        'title': title,
+        'url': url,
+        'status': status,
+        'outcome': outcome,
+        'outcome_reason': reason or f'The source says {status}',
+        'action': action,
+        'updated_at': f'2026-10-{12 - int(remote_id) % 5:02d}T0{int(remote_id) % 9}:00:00Z',
+        'reasons': reasons,
+    }
+
+
+# What each instance lists, by host.
+WORK = {
+    # Internal: advisories, on this machine only.
+    'errata.example.invalid': [
+        item('1', 'RHBA-2026:4821', 'bootc bug fix and enhancement update', 'QE',
+             'https://errata.example.invalid/advisory/4821', ['assigned']),
+        item('2', 'RHSA-2026:0042', 'ostree security update', 'NEW_FILES',
+             'https://errata.example.invalid/advisory/42', ['review_requested'], action='review'),
+        item('3', 'RHBA-2026:3907', 'rpm-ostree update for RHEL 10.1', 'PUSH_READY',
+             'https://errata.example.invalid/advisory/3907', ['mentioned'], action='waiting'),
+    ],
+    # External, synced by the hub.
+    'forge.example.org': [
+        item('4', 'bootc-dev/bootc#1873', 'Add a composefs fsck to bootc container lint', 'Open',
+             'https://forge.example.org/bootc-dev/bootc/pulls/1873', ['review_requested'], action='review'),
+        item('5', 'containers/composefs-rs#211', 'Verify fs-verity digests on import', 'Open',
+             'https://forge.example.org/containers/composefs-rs/pulls/211', ['team_review_requested'], action='review'),
+        item('6', 'ostreedev/ostree#3388', 'Fix the deploy lock on read-only sysroots', 'Changes requested',
+             'https://forge.example.org/ostreedev/ostree/pulls/3388', ['changes_requested']),
+        item('7', 'bootc-dev/bootc#1790', 'Document soft reboots', 'Closed',
+             'https://forge.example.org/bootc-dev/bootc/pulls/1790', [], action='', outcome='closed_without_delivery',
+             reason='Closed without merging; decide whether it was abandoned or needs rework'),
+    ],
+    # Added during the test: new work to announce.
+    # Added after the app's window is closed.
+    'later.errata.example.invalid': [
+        item('9', 'RHSA-2026:5177', 'podman security update', 'NEW_FILES',
+             'https://later.errata.example.invalid/advisory/5177', ['review_requested'], action='review'),
+    ],
+    'new.errata.example.invalid': [
+        item('8', 'RHSA-2026:5120', 'skopeo security update', 'NEW_FILES',
+             'https://new.errata.example.invalid/advisory/5120', ['assigned']),
+    ],
+}
+
+request = json.load(sys.stdin)
+if request.get('protocol') != 1:
+    error('invalid', 'Unknown protocol version')
+host = urllib.parse.urlsplit(request['instance']['base_url']).hostname
+if request['credential'] != TOKEN:
+    error('auth', 'Credential rejected')
+method = request['method']
+if method == 'verify':
+    answer({'account': {'id': '42', 'name': 'jmarrero'}})
+# Verifies, then fails every sync, as a credential that expired does.
+if host == 'staging.errata.example.invalid':
+    error('auth', 'The staging token expired')
+if method == 'list':
+    answer({'items': WORK.get(host, [])})
+if method == 'refresh':
+    answer({'results': [{'remote_id': t['remote_id'], 'error': {'kind': 'inaccessible', 'message': 'Gone'}}
+                        for t in request['items']]})
+error('invalid', f'Unknown method {method}')
