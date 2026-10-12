@@ -73,6 +73,11 @@ elif host == 'denied.example':
     error('auth', 'No access')
 elif host == 'flaky.example':
     error('transient', 'Try later')
+# Verify the account, but then fail every sync.
+elif host == 'list-flaky.example' and request['method'] != 'verify':
+    error('transient', 'Try later')
+elif host == 'list-denied.example' and request['method'] != 'verify':
+    error('auth', 'No access to the list')
 elif host == 'gone.example':
     error('inaccessible', 'Gone')
 elif host == 'echo.example':
