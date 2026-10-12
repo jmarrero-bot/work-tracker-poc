@@ -1,3 +1,4 @@
+mod connector;
 mod connectors;
 mod db;
 mod model;

@@ -1,5 +1,12 @@
-use crate::{model::*, outcome};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::{
+    connector::{
+        Account, BoxFuture, Connector, ConnectorError, ConnectorResult, ErrorKind, Refreshed,
+        RemoteItem, Target, Tracked,
+    },
+    model::*,
+    outcome,
+};
+use anyhow::{bail, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
@@ -51,61 +58,77 @@ enum Fetched {
     Inaccessible(StatusCode),
 }
 
-fn http_error(status: StatusCode) -> anyhow::Error {
-    let reason = match status {
-        StatusCode::UNAUTHORIZED => "Credential rejected",
-        StatusCode::FORBIDDEN => "Access denied; check token scope and account permissions",
-        StatusCode::TOO_MANY_REQUESTS => "Rate limited; try again later",
-        s if s.is_redirection() => {
-            "Instance redirected the API request; verify its base URL and API authentication"
-        }
-        _ => "Instance API request failed",
+fn http_error(status: StatusCode) -> ConnectorError {
+    let (kind, reason) = match status {
+        StatusCode::UNAUTHORIZED => (ErrorKind::Auth, "Credential rejected"),
+        StatusCode::FORBIDDEN => (
+            ErrorKind::Auth,
+            "Access denied; check token scope and account permissions",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (ErrorKind::Transient, "Rate limited; try again later"),
+        s if s.is_redirection() => (
+            ErrorKind::Invalid,
+            "Instance redirected the API request; verify its base URL and API authentication",
+        ),
+        s if s.is_server_error() => (ErrorKind::Transient, "Instance API request failed"),
+        _ => (ErrorKind::Invalid, "Instance API request failed"),
     };
-    anyhow!("{reason} (HTTP {})", status.as_u16())
+    ConnectorError::new(kind, format!("{reason} (HTTP {})", status.as_u16()))
 }
 
+/// The built-in Jira Data Center and GitLab connectors.
 pub struct Provider {
     client: Client,
-    base: Url,
-    token: String,
     provider: String,
 }
 impl Provider {
-    pub fn new(provider: &str, base: &str, token: &str) -> Result<Self> {
+    pub fn new(provider: &str) -> Result<Self> {
         if !supported(provider) {
             bail!("Live connection currently supports Jira Data Center and GitLab")
         }
-        if token.trim().is_empty() || token.len() > 16384 || token.chars().any(|c| c.is_control()) {
-            bail!("Invalid token")
-        }
         Ok(Self {
             client: client()?,
-            base: Url::parse(&base_url(base)?)?,
-            token: token.into(),
             provider: provider.into(),
         })
     }
-    async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
-        match self.fetch(path, query).await? {
+    async fn get(
+        &self,
+        target: &Target,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> ConnectorResult<Value> {
+        match self.fetch(target, path, query).await? {
             Fetched::Found(v) => Ok(v),
             Fetched::Inaccessible(status) => Err(http_error(status)),
         }
     }
     /// Like `get`, but a 403 or 404 is an answer about that one resource
     /// rather than an error.
-    async fn fetch(&self, path: &str, query: &[(&str, String)]) -> Result<Fetched> {
-        let url = self.base.join(path)?;
-        if url.origin() != self.base.origin() {
-            bail!("API request changed origin")
+    async fn fetch(
+        &self,
+        target: &Target,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> ConnectorResult<Fetched> {
+        let url = target
+            .base_url
+            .join(path)
+            .map_err(ConnectorError::invalid)?;
+        if url.origin() != target.base_url.origin() {
+            return Err(ConnectorError::invalid("API request changed origin"));
         }
         let req = self.client.get(url).query(query);
+        let token = target.credential.expose();
         let req = if is_gitlab(&self.provider) {
-            req.header("PRIVATE-TOKEN", &self.token)
+            req.header("PRIVATE-TOKEN", token)
         } else {
-            req.bearer_auth(&self.token)
+            req.bearer_auth(token)
         };
         let response = req.send().await.map_err(|_| {
-            anyhow!("Cannot reach the instance; check network, VPN and certificate trust")
+            ConnectorError::new(
+                ErrorKind::Transient,
+                "Cannot reach the instance; check network, VPN and certificate trust",
+            )
         })?;
         let status = response.status();
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN) {
@@ -115,11 +138,9 @@ impl Provider {
             return Err(http_error(status));
         }
         // Do not surface remote error bodies, request headers or credentials.
-        response
-            .json()
-            .await
-            .map(Fetched::Found)
-            .map_err(|_| anyhow!("Instance did not return the expected JSON response"))
+        response.json().await.map(Fetched::Found).map_err(|_| {
+            ConnectorError::invalid("Instance did not return the expected JSON response")
+        })
     }
     fn source_name(&self) -> &'static str {
         if is_gitlab(&self.provider) {
@@ -128,9 +149,10 @@ impl Provider {
             "Jira"
         }
     }
-    pub async fn identity(&self) -> Result<(String, String)> {
+    async fn identity(&self, target: &Target) -> ConnectorResult<Account> {
         let v = self
             .get(
+                target,
                 if is_gitlab(&self.provider) {
                     "api/v4/user"
                 } else {
@@ -147,27 +169,26 @@ impl Provider {
                 .or(v["accountId"].as_str())
                 .map(str::to_string)
         }
-        .context("Instance response has no stable account ID")?;
+        .ok_or_else(|| ConnectorError::invalid("Instance response has no stable account ID"))?;
         let name = v["username"]
             .as_str()
             .or(v["displayName"].as_str())
             .or(v["name"].as_str())
             .unwrap_or(&id)
             .to_string();
-        Ok((id, name))
+        Ok(Account { id, name })
     }
-    pub async fn sync(&self, c: &Connection, old: &[Item]) -> Result<Vec<Item>> {
-        // Verify that rotating a credential has not changed the linked account.
-        let (id, _) = self.identity().await?;
-        if id != c.account_id {
-            bail!("Credential belongs to another account; create a separate connection")
-        }
-        let mut all = BTreeMap::<String, Item>::new();
+    async fn list_items(
+        &self,
+        target: &Target,
+        account: &Account,
+    ) -> ConnectorResult<Vec<RemoteItem>> {
+        let mut all = BTreeMap::<String, RemoteItem>::new();
         if is_gitlab(&self.provider) {
             for (kind, extra) in [
                 ("next", ("scope", "created_by_me".into())),
                 ("next", ("scope", "assigned_to_me".into())),
-                ("review", ("reviewer_id", id.clone())),
+                ("review", ("reviewer_id", account.id.clone())),
             ] {
                 let mut complete = false;
                 for page in 1..=100 {
@@ -183,15 +204,15 @@ impl Provider {
                         .into_iter()
                         .filter(|(k, v)| !(*k == "scope" && v == "all" && extra.0 == "scope"))
                         .collect();
-                    let v = self.get("api/v4/merge_requests", &query).await?;
-                    let rows = v
-                        .as_array()
-                        .context("Unexpected GitLab merge request list")?;
+                    let v = self.get(target, "api/v4/merge_requests", &query).await?;
+                    let rows = v.as_array().ok_or_else(|| {
+                        ConnectorError::invalid("Unexpected GitLab merge request list")
+                    })?;
                     for row in rows {
-                        let item = gitlab_item(c, row, kind)?;
+                        let item = gitlab_item(row, kind).map_err(ConnectorError::invalid)?;
                         // A review assignment takes precedence when the MR appears in multiple lists.
-                        if kind == "review" || !all.contains_key(&item.id) {
-                            all.insert(item.id.clone(), item);
+                        if kind == "review" || !all.contains_key(&item.remote_id) {
+                            all.insert(item.remote_id.clone(), item);
                         }
                     }
                     if rows.len() < 100 {
@@ -200,57 +221,74 @@ impl Provider {
                     }
                 }
                 if !complete {
-                    bail!("Too many merge requests for one sync; no partial results were saved")
+                    return Err(ConnectorError::invalid(
+                        "Too many merge requests for one sync; no partial results were saved",
+                    ));
                 }
             }
         } else {
             let mut start = 0usize;
             let mut complete = false;
             for _ in 0..100 {
-                let v=self.get("rest/api/2/search",&[("jql","assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC".into()),("fields",JIRA_FIELDS.into()),("maxResults","100".into()),("startAt",start.to_string())]).await?;
+                let v = self
+                    .get(
+                        target,
+                        "rest/api/2/search",
+                        &[
+                            (
+                                "jql",
+                                "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC".into(),
+                            ),
+                            ("fields", JIRA_FIELDS.into()),
+                            ("maxResults", "100".into()),
+                            ("startAt", start.to_string()),
+                        ],
+                    )
+                    .await?;
                 let rows = v["issues"]
                     .as_array()
-                    .context("Unexpected Jira search response")?;
+                    .ok_or_else(|| ConnectorError::invalid("Unexpected Jira search response"))?;
                 for row in rows {
-                    let item = jira_item(c, row, "next")?;
-                    all.insert(item.id.clone(), item);
+                    let item = jira_item(&target.base_url, row, "next")
+                        .map_err(ConnectorError::invalid)?;
+                    all.insert(item.remote_id.clone(), item);
                 }
                 start += rows.len();
                 let total = v["total"]
                     .as_u64()
-                    .context("Jira search response has no total")?
+                    .ok_or_else(|| ConnectorError::invalid("Jira search response has no total"))?
                     as usize;
                 if start >= total {
                     complete = true;
                     break;
                 }
                 if rows.is_empty() {
-                    bail!("Jira pagination stopped before all items were read")
+                    return Err(ConnectorError::invalid(
+                        "Jira pagination stopped before all items were read",
+                    ));
                 }
             }
             if !complete {
-                bail!("Too many Jira issues for one sync; no partial results were saved")
+                return Err(ConnectorError::invalid(
+                    "Too many Jira issues for one sync; no partial results were saved",
+                ));
             }
         }
-        // Refresh previously tracked items that left the open inbox, so a merge or
-        // completed ticket can advance its effort. An item the source no longer
-        // shows becomes unknown, never done; any other failed refresh aborts
-        // this sync.
-        let missing: Vec<_> = old
-            .iter()
-            .filter(|i| {
-                i.connection_id.as_deref() == Some(&c.id)
-                    && matches!(i.outcome, Outcome::Open | Outcome::Unknown)
-                    && !all.contains_key(&i.id)
-            })
-            .collect();
-        for item in missing {
+        Ok(all.into_values().collect())
+    }
+    async fn refresh_items(
+        &self,
+        target: &Target,
+        tracked: &[Tracked],
+    ) -> ConnectorResult<Vec<Refreshed>> {
+        let mut answers = Vec::new();
+        for item in tracked {
             let fetched = if is_gitlab(&self.provider) {
-                let (project, iid) = item
-                    .remote_id
-                    .split_once(':')
-                    .context("Invalid stored merge request identity")?;
+                let (project, iid) = item.remote_id.split_once(':').ok_or_else(|| {
+                    ConnectorError::invalid("Invalid stored merge request identity")
+                })?;
                 self.fetch(
+                    target,
                     &format!("api/v4/projects/{project}/merge_requests/{iid}"),
                     &[],
                 )
@@ -261,28 +299,63 @@ impl Provider {
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || ch == '-');
                 if !key {
-                    bail!("Invalid stored Jira key")
+                    return Err(ConnectorError::invalid("Invalid stored Jira key"));
                 }
                 self.fetch(
+                    target,
                     &format!("rest/api/2/issue/{}", item.key),
                     &[("fields", JIRA_FIELDS.into())],
                 )
                 .await?
             };
-            let next = match fetched {
-                Fetched::Found(row) if is_gitlab(&self.provider) => {
-                    gitlab_item(c, &row, "follow-up")?
-                }
-                Fetched::Found(row) => jira_item(c, &row, "follow-up")?,
-                Fetched::Inaccessible(status) => {
-                    let mut gone = item.clone();
-                    gone.set_outcome(outcome::inaccessible(self.source_name(), status.as_u16()));
-                    gone
-                }
-            };
-            all.insert(next.id.clone(), next);
+            answers.push(match fetched {
+                Fetched::Found(row) if is_gitlab(&self.provider) => Refreshed::found(
+                    &item.remote_id,
+                    gitlab_item(&row, "follow-up").map_err(ConnectorError::invalid)?,
+                ),
+                Fetched::Found(row) => Refreshed::found(
+                    &item.remote_id,
+                    jira_item(&target.base_url, &row, "follow-up")
+                        .map_err(ConnectorError::invalid)?,
+                ),
+                Fetched::Inaccessible(status) => Refreshed::inaccessible(
+                    &item.remote_id,
+                    format!(
+                        "{} returned HTTP {} for this item (missing or no permission)",
+                        self.source_name(),
+                        status.as_u16()
+                    ),
+                ),
+            });
         }
-        Ok(all.into_values().collect())
+        Ok(answers)
+    }
+}
+impl Connector for Provider {
+    fn kind(&self) -> &str {
+        if is_gitlab(&self.provider) {
+            "gitlab"
+        } else {
+            "jira"
+        }
+    }
+    fn verify<'a>(&'a self, target: &'a Target) -> BoxFuture<'a, ConnectorResult<Account>> {
+        Box::pin(self.identity(target))
+    }
+    fn list<'a>(
+        &'a self,
+        target: &'a Target,
+        account: &'a Account,
+    ) -> BoxFuture<'a, ConnectorResult<Vec<RemoteItem>>> {
+        Box::pin(self.list_items(target, account))
+    }
+    fn refresh<'a>(
+        &'a self,
+        target: &'a Target,
+        _account: &'a Account,
+        tracked: &'a [Tracked],
+    ) -> BoxFuture<'a, ConnectorResult<Vec<Refreshed>>> {
+        Box::pin(self.refresh_items(target, tracked))
     }
 }
 fn string(v: &Value, key: &str) -> Result<String> {
@@ -291,51 +364,38 @@ fn string(v: &Value, key: &str) -> Result<String> {
         .map(str::to_string)
         .with_context(|| format!("Missing field: {key}"))
 }
-pub fn jira_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
+pub fn jira_item(base: &Url, v: &Value, action: &str) -> Result<RemoteItem> {
     let remote_id = string(v, "id")?;
     let key = string(v, "key")?;
     let status = string(&v["fields"]["status"], "name")?;
-    let derived = outcome::jira(
+    let (outcome, outcome_reason) = outcome::jira(
         &status,
         v["fields"]["status"]["statusCategory"]["key"].as_str(),
         v["fields"]["resolution"]["name"].as_str(),
     );
-    let url = Url::parse(&c.base_url)?
-        .join(&format!("browse/{key}"))?
-        .to_string();
-    let mut item = Item {
-        id: format!("{}:jira:{remote_id}", c.id),
-        connection_id: Some(c.id.clone()),
-        provider: c.provider.clone(),
+    let url = base.join(&format!("browse/{key}"))?.to_string();
+    Ok(RemoteItem {
         remote_id,
         key,
         title: string(&v["fields"], "summary")?,
         url: source_url(&url)?,
         status,
-        outcome: Outcome::Open,
-        outcome_reason: String::new(),
+        outcome,
+        outcome_reason,
         action: action.into(),
         updated_at: string(&v["fields"], "updated")?,
-        effort_id: None,
-        abandoned_at: None,
-        demo: false,
-    };
-    item.set_outcome(derived);
-    Ok(item)
+    })
 }
-pub fn gitlab_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
+pub fn gitlab_item(v: &Value, action: &str) -> Result<RemoteItem> {
     let project = v["project_id"].as_u64().context("Missing project ID")?;
     let iid = v["iid"].as_u64().context("Missing MR number")?;
     let state = string(v, "state")?;
-    let derived = outcome::gitlab(&state);
+    let (outcome, outcome_reason) = outcome::gitlab(&state);
     let draft = v["draft"]
         .as_bool()
         .or(v["work_in_progress"].as_bool())
         .unwrap_or(false);
-    let mut item = Item {
-        id: format!("{}:gitlab:{project}:{iid}", c.id),
-        connection_id: Some(c.id.clone()),
-        provider: c.provider.clone(),
+    Ok(RemoteItem {
         remote_id: format!("{project}:{iid}"),
         key: v["references"]["full"]
             .as_str()
@@ -348,21 +408,33 @@ pub fn gitlab_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
         } else {
             state
         },
-        outcome: Outcome::Open,
-        outcome_reason: String::new(),
+        outcome,
+        outcome_reason,
         action: action.into(),
         updated_at: string(v, "updated_at")?,
-        effort_id: None,
-        abandoned_at: None,
-        demo: false,
-    };
-    item.set_outcome(derived);
-    Ok(item)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::{self, Credential};
+    /// Build items the way a sync does, through the connector interface.
+    fn gitlab_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
+        Ok(connector::to_item(
+            c,
+            "gitlab",
+            super::gitlab_item(v, action)?,
+        )?)
+    }
+    fn jira_item(c: &Connection, v: &Value, action: &str) -> Result<Item> {
+        let base = Url::parse(&c.base_url)?;
+        Ok(connector::to_item(
+            c,
+            "jira",
+            super::jira_item(&base, v, action)?,
+        )?)
+    }
     fn c() -> Connection {
         Connection {
             id: "a".into(),
@@ -430,17 +502,31 @@ mod tests {
             assert_eq!(i.action, if outcome == Open { "next" } else { "" });
         }
     }
+    /// The GitLab connector pointed at a fixture.
+    struct Fixture {
+        connector: Provider,
+        target: Target,
+    }
+    impl Fixture {
+        async fn sync(&self, c: &Connection, old: &[Item]) -> ConnectorResult<Vec<Item>> {
+            connector::sync(&self.connector, &self.target, c, old).await
+        }
+        async fn identity(&self) -> ConnectorResult<Account> {
+            self.connector.verify(&self.target).await
+        }
+    }
     /// Serve a GitLab API fixture over plain HTTP, which production
     /// constructors refuse.
-    async fn fixture(router: axum::Router, token: &str) -> (Provider, tokio::task::JoinHandle<()>) {
+    async fn fixture(router: axum::Router, token: &str) -> (Fixture, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let p = Provider {
-            client: client().unwrap(),
-            base: Url::parse(&base).unwrap(),
-            token: token.into(),
-            provider: "gitlab-internal".into(),
+        let p = Fixture {
+            connector: Provider::new("gitlab-internal").unwrap(),
+            target: Target {
+                base_url: Url::parse(&base).unwrap(),
+                credential: Credential::new(token).unwrap(),
+            },
         };
         (p, task)
     }

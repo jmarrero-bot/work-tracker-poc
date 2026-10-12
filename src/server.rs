@@ -1,4 +1,5 @@
 use crate::{
+    connector::{self, ConnectorError, Target},
     connectors,
     db::{self, Db},
     model::*,
@@ -126,8 +127,10 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         bail_api("Enter a connection name of 1–100 characters")?
     }
     let base = connectors::base_url(&input.base_url)?;
-    let provider = connectors::Provider::new(&input.provider, &base, input.token.trim())?;
-    let (id, name) = provider.identity().await?;
+    let source = connectors::Provider::new(&input.provider)?;
+    let target = Target::new(&base, &input.token)?;
+    let account = connector::verify(&source, &target).await?;
+    let (id, name) = (account.id, account.name);
     let db = app.db.lock().unwrap();
     if db
         .connections()?
@@ -147,7 +150,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         error: None,
     };
     let path = db.root.join("secrets").join(&c.id);
-    db::write_secret(&path, input.token.trim())?;
+    db::write_secret(&path, target.credential.expose())?;
     if let Err(e) = db.save_connection(&c) {
         let _ = std::fs::remove_file(path);
         return Err(e.into());
@@ -173,8 +176,9 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
         };
         let result = async {
             let token = token?;
-            let p = connectors::Provider::new(&c.provider, &c.base_url, &token)?;
-            p.sync(&c, &old).await
+            let source = connectors::Provider::new(&c.provider)?;
+            let target = Target::new(&c.base_url, &token)?;
+            Ok::<_, anyhow::Error>(connector::sync(&source, &target, &c, &old).await?)
         }
         .await;
         let mut db = app.db.lock().unwrap();
@@ -190,8 +194,12 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
                 results.push(json!({"connection":c.id,"label":c.label,"items":items.len()}));
             }
             Err(e) => {
+                // Whether to fix a credential or retry later.
+                let kind = e.downcast_ref::<ConnectorError>().map(|e| e.kind);
                 c.error = Some(e.to_string());
-                results.push(json!({"connection":c.id,"label":c.label,"error":c.error}));
+                results.push(
+                    json!({"connection":c.id,"label":c.label,"error":c.error,"error_kind":kind}),
+                );
             }
         };
         db.save_connection(&c)?;
