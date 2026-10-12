@@ -284,11 +284,25 @@ struct Board {
     /// The hub this companion pulls from, if one is set.
     hub: Option<hub::Status>,
 }
+/// What the page and the CLI show: everything stored here, and on a
+/// companion the hub's work too, read-only, as of the last pull. Only for
+/// showing: the export is built from this machine's own work alone.
+fn board(app: &App) -> Result<(Snapshot, Vec<WatchList>, Option<hub::Status>)> {
+    let (mut snapshot, watched) = fresh_snapshot(app)?;
+    let hub = app.scheduler.hub_view()?.map(|(status, export)| {
+        if let Some(export) = export {
+            hub::merge(&mut snapshot, &export, &status);
+        }
+        status
+    });
+    Ok((snapshot, watched, hub))
+}
 async fn snapshot(State(app): State<App>) -> ApiResult<Board> {
+    let (snapshot, _, hub) = board(&app)?;
     Ok(Json(Board {
-        snapshot: fresh_snapshot(&app)?.0,
+        snapshot,
         mode: app.mode,
-        hub: app.scheduler.hub_status()?,
+        hub,
     }))
 }
 /// The hub this companion pulls from, if one is set, and how its pulls go.
@@ -317,12 +331,20 @@ async fn unset_hub(State(app): State<App>) -> ApiResult<Value> {
 /// other users found. A local view: internal work shows here, and never
 /// leaves through it.
 async fn mine(State(app): State<App>) -> ApiResult<crate::mine::Mine> {
-    let (snapshot, watched) = fresh_snapshot(&app)?;
+    let (snapshot, watched, _) = board(&app)?;
     Ok(Json(crate::mine::mine(&snapshot, &watched)))
 }
-/// What may leave this machine, for the hub: the external zone only.
+/// What may leave this machine, for the hub: the external zone of this
+/// machine's own work only, never the work a companion pulled from a hub.
 async fn export_external(State(app): State<App>) -> ApiResult<zone::ExternalSnapshot> {
     Ok(Json(zone::external_only(&fresh_snapshot(&app)?.0)))
+}
+/// Fail if `id` names the hub's work, which is read-only on its companion.
+fn local(id: &str) -> Result<()> {
+    if hub::is_from_hub(id) {
+        bail!("That comes from the hub and is read-only here; change it on the hub")
+    }
+    Ok(())
 }
 async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> ApiResult<Connection> {
     if input.label.trim().is_empty() || input.label.len() > 100 {
@@ -368,6 +390,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         sync_interval: input.sync_interval,
         sync: SyncState::default(),
         schedule: Schedule::default(),
+        from_hub: false,
     };
     let path = db.root.join("secrets").join(&c.id);
     db::write_secret(&path, target.credential.expose())?;
@@ -421,6 +444,7 @@ async fn patch_connection(
     Path(id): Path<String>,
     Json(input): Json<ConnectionPatch>,
 ) -> ApiResult<Connection> {
+    local(&id)?;
     // Every field is checked before any is written.
     let c = app.db.lock().unwrap().connection(&id)?;
     let interval = input.sync_interval.map(|i| i.map(Duration::from_secs));
@@ -465,11 +489,13 @@ async fn verify(
     Path(id): Path<String>,
     Json(input): Json<VerifyInput>,
 ) -> ApiResult<Connection> {
+    local(&id)?;
     Ok(Json(
         app.scheduler.verify(&id, input.token.as_deref()).await?,
     ))
 }
 async fn disconnect(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Value> {
+    local(&id)?;
     // Not while it syncs, which would save what it found afterwards.
     let _held = app.scheduler.hold(&id).await;
     app.db.lock().unwrap().delete_connection(&id)?;
@@ -495,6 +521,9 @@ async fn sync(State(app): State<App>, Json(input): Json<SyncInput>) -> ApiResult
     Ok(Json(json!({ "results": results })))
 }
 async fn effort(State(app): State<App>, Json(input): Json<EffortInput>) -> ApiResult<Effort> {
+    for id in &input.item_ids {
+        local(id)?;
+    }
     Ok(Json(app.db.lock().unwrap().create_effort(input)?))
 }
 #[derive(Deserialize)]
@@ -507,6 +536,7 @@ async fn share_effort(
     Path(id): Path<String>,
     Json(input): Json<ShareInput>,
 ) -> ApiResult<Effort> {
+    local(&id)?;
     Ok(Json(
         app.db.lock().unwrap().share_title(&id, input.share_title)?,
     ))
@@ -517,6 +547,10 @@ struct LinkInput {
     effort: Option<String>,
 }
 async fn link(State(app): State<App>, Json(input): Json<LinkInput>) -> ApiResult<Value> {
+    local(&input.item)?;
+    if let Some(effort) = &input.effort {
+        local(effort)?;
+    }
     app.db
         .lock()
         .unwrap()
@@ -563,6 +597,7 @@ async fn manual(State(app): State<App>, Json(input): Json<ManualInput>) -> ApiRe
         reasons: vec![],
         synced_at: None,
         stale: false,
+        from_hub: false,
     };
     // Manual outcomes are explicit; the status text never implies one.
     item.set_outcome((input.outcome, input.outcome.manual_reason().into()));
@@ -581,6 +616,7 @@ async fn update_manual(
     Path(id): Path<String>,
     Json(input): Json<StatusInput>,
 ) -> ApiResult<Item> {
+    local(&id)?;
     if input.status.trim().is_empty()
         || input.status.len() > 100
         || !matches!(
@@ -622,6 +658,7 @@ async fn abandon(
     Path(id): Path<String>,
     Json(input): Json<AbandonInput>,
 ) -> ApiResult<Item> {
+    local(&id)?;
     Ok(Json(app.db.lock().unwrap().set_abandoned(
         &id,
         input.abandoned,

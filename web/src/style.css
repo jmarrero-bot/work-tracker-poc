@@ -894,6 +894,10 @@ h1 {
   color: #d6c08f;
   background: #3a3322;
 }
+.zone-tag.hub {
+  color: #c9b8e8;
+  background: #322a44;
+}
 .zone-choice {
   display: flex;
   gap: 10px;

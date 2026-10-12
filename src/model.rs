@@ -35,6 +35,9 @@ pub struct Connection {
     /// stored.
     #[serde(default)]
     pub schedule: Schedule,
+    /// It is the hub's, shown read-only on its companion. Never stored.
+    #[serde(default)]
+    pub from_hub: bool,
 }
 
 /// How a connection's syncs are scheduled now, and how fresh its items are.
@@ -154,6 +157,9 @@ pub struct Item {
     /// shown.
     #[serde(default)]
     pub stale: bool,
+    /// It came from the hub, and is read-only here. Never stored.
+    #[serde(default)]
+    pub from_hub: bool,
 }
 
 impl Item {
@@ -185,6 +191,9 @@ pub struct EffortView {
     #[serde(flatten)]
     pub effort: Effort,
     pub progress: Progress,
+    /// It came from the hub, and is read-only here.
+    #[serde(default)]
+    pub from_hub: bool,
 }
 
 #[derive(Debug, Serialize)]

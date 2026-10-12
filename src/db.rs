@@ -409,6 +409,7 @@ fn connection_body(c: &Connection) -> Result<String> {
     if let Some(body) = v.as_object_mut() {
         body.remove("sync");
         body.remove("schedule");
+        body.remove("from_hub");
     }
     Ok(serde_json::to_string(&v)?)
 }
@@ -592,6 +593,7 @@ impl Db {
                         .map(|i| i.outcome),
                 ),
                 effort,
+                from_hub: false,
             })
             .collect();
         Ok(Snapshot {
@@ -614,6 +616,8 @@ impl Db {
             let (body, state) = row?;
             let mut c: Connection = serde_json::from_str(&body)?;
             c.sync = state;
+            // Only ever the companion's own.
+            c.from_hub = false;
             Ok(c)
         })
         .collect()
@@ -682,6 +686,8 @@ impl Db {
             let (body, effort, abandoned) = v?;
             let mut i: Item = serde_json::from_str(&body)?;
             i.effort_id = effort;
+            // Only ever this machine's own.
+            i.from_hub = false;
             i.zone = i
                 .connection_id
                 .as_ref()
@@ -819,6 +825,7 @@ impl Db {
             let mut items: Vec<Item> = serde_json::from_str(&body)?;
             for i in &mut items {
                 i.zone = zone;
+                i.from_hub = false;
             }
             lists.push(WatchList {
                 connection_id,
@@ -1142,6 +1149,7 @@ impl Db {
                 reasons: vec![],
                 synced_at: None,
                 stale: false,
+                from_hub: false,
             })?;
         }
         self.create_effort(EffortInput {title:"Ship the bootc storage fix".into(),note:"Example effort linking upstream work, a RHEL backport and an advisory. All items are illustrative.".into(),item_ids:[0,1,2,3,6].map(|n|format!("demo-{n}")).to_vec(),share_title:false})?;
@@ -1924,6 +1932,7 @@ mod tests {
             reasons: vec![],
             synced_at: None,
             stale: false,
+            from_hub: false,
         };
         let theirs = item(&external, Zone::External, 1);
         db.save_sync(&external.id, std::slice::from_ref(&theirs), None, &ok)
