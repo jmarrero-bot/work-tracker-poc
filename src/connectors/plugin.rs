@@ -441,16 +441,35 @@ mod tests {
         let items = connector::sync(&plugin, &target, &c, &old).await.unwrap();
         let found: Vec<_> = items
             .iter()
-            .map(|i| (i.id.as_str(), i.outcome, i.action.as_str()))
+            .map(|i| {
+                (
+                    i.id.as_str(),
+                    i.outcome,
+                    i.action.as_str(),
+                    i.reasons.clone(),
+                )
+            })
             .collect();
+        use crate::connector::Reason::*;
         assert_eq!(
             found,
             [
-                ("c1:fake-forge:1", Outcome::Open, "review"),
-                ("c1:fake-forge:2", Outcome::Open, "next"),
-                ("c1:fake-forge:3", Outcome::Delivered, ""),
-                ("c1:fake-forge:echo-5", Outcome::Unknown, ""),
-                ("c1:fake-forge:gone-4", Outcome::Unknown, ""),
+                (
+                    "c1:fake-forge:1",
+                    Outcome::Open,
+                    "review",
+                    vec![ReviewRequested]
+                ),
+                // Once each, whatever the plugin repeats.
+                (
+                    "c1:fake-forge:2",
+                    Outcome::Open,
+                    "next",
+                    vec![Assigned, Mentioned]
+                ),
+                ("c1:fake-forge:3", Outcome::Delivered, "", vec![]),
+                ("c1:fake-forge:echo-5", Outcome::Unknown, "", vec![]),
+                ("c1:fake-forge:gone-4", Outcome::Unknown, "", vec![]),
             ]
         );
         assert!(items[4].outcome_reason.contains("HTTP 404"));

@@ -4,7 +4,7 @@
 
 use crate::{
     connector::ErrorKind,
-    model::{Item, Outcome, Progress, Snapshot},
+    model::{Item, Outcome, Progress, Reason, Snapshot},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -75,6 +75,8 @@ pub struct ExternalItem {
     /// Only an exported effort.
     pub effort_id: Option<String>,
     pub zone: Zone,
+    /// Why it waits on its connection's account, for the hub's Mine view.
+    pub reasons: Vec<Reason>,
 }
 
 /// An effort as the external zone sees it. Its title and note are free text
@@ -205,6 +207,7 @@ pub fn external_only(snapshot: &Snapshot) -> ExternalSnapshot {
                 .clone()
                 .filter(|e| exported.contains(e.as_str())),
             zone: Zone::External,
+            reasons: i.reasons.clone(),
         })
         .collect();
     ExternalSnapshot {
@@ -502,6 +505,7 @@ mod tests {
                     "outcome",
                     "outcome_reason",
                     "provider",
+                    "reasons",
                     "status",
                     "title",
                     "updated_at",

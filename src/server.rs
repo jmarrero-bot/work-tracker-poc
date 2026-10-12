@@ -124,6 +124,13 @@ async fn session(State(app): State<App>) -> Response {
 async fn snapshot(State(app): State<App>) -> ApiResult<Snapshot> {
     Ok(Json(app.db.lock().unwrap().snapshot()?))
 }
+/// What waits on each connection's account, and apart from it what watching
+/// other users found. A local view: internal work shows here, and never
+/// leaves through it.
+async fn mine(State(app): State<App>) -> ApiResult<crate::mine::Mine> {
+    let db = app.db.lock().unwrap();
+    Ok(Json(crate::mine::mine(&db.snapshot()?, &db.watched()?)))
+}
 /// What may leave this machine, for the hub: the external zone only.
 async fn export_external(State(app): State<App>) -> ApiResult<zone::ExternalSnapshot> {
     let snapshot = app.db.lock().unwrap().snapshot()?;
@@ -478,6 +485,7 @@ pub async fn serve(root: PathBuf, port: u16, demo: bool) -> Result<()> {
     };
     let api = Router::new()
         .route("/snapshot", get(snapshot))
+        .route("/mine", get(mine))
         .route("/export/external", get(export_external))
         .route("/session", post(session))
         .route("/connections", post(connect))

@@ -160,6 +160,25 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         exported = json.loads(exported)
         assert [c['base_url'] for c in exported['connections']] == ['https://forge.example/'], exported
         assert sorted(i['id'] for i in exported['items']) == external_items, exported
+        assert sorted(tuple(i['reasons']) for i in exported['items']) == [('assigned', 'mentioned'), ('review_requested',)], exported
+        # The Mine view: both connections report both changes, so each shows
+        # once, with all its reasons, and internal because one of them is.
+        assert call('/api/mine')[0] == 401
+        mine = json.loads(subprocess.check_output(command + ['mine', '--json']))
+        assert mine['watching'] == [] and mine['watch_errors'] == [], mine
+        rows = {r['key']: r for r in mine['mine']}
+        assert sorted(rows) == ['FF-1', 'FF-2'], mine
+        # Each connection's account with its own reasons.
+        assert [w['reasons'] for w in rows['FF-2']['waits_on']] == [['assigned', 'mentioned']] * 2, rows
+        assert [w['reasons'] for w in rows['FF-1']['waits_on']] == [['review_requested']] * 2, rows
+        assert rows['FF-1']['status'] == 'open', rows
+        assert all(len({w['connection_id'] for w in r['waits_on']}) == 2 and r['zone'] == 'internal' for r in rows.values()), rows
+        text = subprocess.check_output(command + ['mine'], text=True)
+        assert 'Waiting on you (2)' in text and 'fixture: assigned, mentioned' in text and 'Watching' not in text, text
+        # Only a GitHub connection can watch another user.
+        forge = next(c['id'] for c in exported['connections'])
+        watch = subprocess.run(command + ['watch', forge, 'someone'], capture_output=True, text=True)
+        assert watch.returncode != 0 and 'Only a GitHub connection' in watch.stderr, watch
         [effort_out] = exported['efforts']
         assert effort_out['title'] == 'Effort ' + mixed_id.replace('-', '')[:8], effort_out
         assert effort_out['progress']['total'] == 1, effort_out
@@ -184,7 +203,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert call('/api/snapshot',token=token)[0] == 401
         snapshot = json.loads(call('/api/snapshot',token=fresh)[2])
         assert all(i['effort_id']==effort['id'] for i in snapshot['items'] if i['id'] in ['demo-4','demo-5'])
-        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin, the external export, permissions and restart persistence')
+        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin, the external export, the Mine view, permissions and restart persistence')
     finally:
         if process.poll() is None:
             process.terminate()
