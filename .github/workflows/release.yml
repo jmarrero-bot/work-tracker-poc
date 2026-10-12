@@ -92,8 +92,8 @@ jobs:
         run: |
           echo "Image=${IMAGE}@${DIGEST}"
           printf '%s\n' "## ${TAG}" '' 'For the quadlet in atomic-setup:' '' '```' "Image=${IMAGE}@${DIGEST}" '```' >> "${GITHUB_STEP_SUMMARY}"
-      # A new package is private until its owner makes it public, which only
-      # the web UI does; atomic-setup pulls it without credentials.
+      # atomic-setup pulls the image without credentials, so the package
+      # must stay public; only the web UI changes that (docs/release.md).
       - name: Check that anyone can pull it
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
