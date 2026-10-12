@@ -1103,6 +1103,15 @@ h1 {
   border-radius: 6px;
   padding: 8px 15px;
 }
+.link-button {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
 .spin {
   animation: spin 1s linear infinite;
 }

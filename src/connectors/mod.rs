@@ -134,6 +134,13 @@ fn plugin(_: &str, _: &Path) -> Result<Box<dyn Connector>> {
     bail!("Connector plugins need Linux or macOS")
 }
 
+/// The GitHub account a token belongs to, read with `GET /user` through the
+/// read-only client: its numeric ID, and its login as of now.
+pub async fn github_account(target: &Target) -> ConnectorResult<Account> {
+    let github = github::GitHub::new(Arc::default()).map_err(ConnectorError::invalid)?;
+    crate::connector::verify(&github, target).await
+}
+
 /// What a request found.
 enum Fetched {
     Found(Value),

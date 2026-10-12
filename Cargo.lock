@@ -2310,9 +2310,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "clap",
  "graphql-parser",
  "reqwest",
+ "ring",
  "rusqlite",
  "rust-embed",
  "rustix",
@@ -2320,6 +2322,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
  "url",
  "uuid",
 ]

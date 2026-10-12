@@ -4,8 +4,10 @@ mod connector;
 mod connectors;
 mod db;
 mod hub;
+mod login;
 mod mine;
 mod model;
+mod oauth;
 mod outcome;
 mod schedule;
 mod server;
@@ -53,9 +55,22 @@ enum Command {
         #[arg(long = "allowed-host", value_name = "NAME", requires = "hub")]
         allowed_hosts: Vec<String>,
         /// Let browsers pair with the hub through the pairing URL it prints,
-        /// until its GitHub App is set up.
-        #[arg(long, requires = "hub")]
+        /// until its GitHub App is set up. Off once the App is configured.
+        #[arg(long, requires = "hub", conflicts_with = "github_app_client_id")]
         pairing: bool,
+        /// The client ID of the GitHub App people sign in to the hub with
+        /// (see docs/github-app.md). Its client secret is set with
+        /// `workboard github-app set-secret`.
+        #[arg(long, value_name = "ID", requires_all = ["hub", "github_app_callback", "github_user"])]
+        github_app_client_id: Option<String>,
+        /// The App's callback URL: https://NAME/auth/github/callback, NAME
+        /// being one of the --allowed-host names.
+        #[arg(long, value_name = "URL", requires = "github_app_client_id")]
+        github_app_callback: Option<String>,
+        /// A GitHub user allowed to sign in, by numeric user ID, never by
+        /// login. Repeat for each.
+        #[arg(long, value_name = "ID", requires = "github_app_client_id")]
+        github_user: Vec<u64>,
         /// How often each connection syncs unless it has its own interval,
         /// such as 30m or 1h.
         #[arg(long, value_name = "INTERVAL", default_value = "5m", value_parser = interval)]
@@ -286,6 +301,24 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
+    /// Set up the GitHub App a hub signs people in with.
+    GithubApp {
+        #[command(subcommand)]
+        command: GithubAppCommand,
+    },
+}
+#[derive(Subcommand)]
+enum GithubAppCommand {
+    /// Keep the App's client secret in the data directory, in a file only
+    /// you can read. The hub reads it when it starts.
+    SetSecret {
+        /// Read the secret from this environment variable.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token_env: Option<String>,
+        /// Read the secret from standard input.
+        #[arg(long)]
+        token_stdin: bool,
+    },
 }
 /// Where a bot's work is, for `connect bot`. All are needed; none is
 /// assumed.
@@ -421,9 +454,17 @@ async fn main() -> Result<()> {
         hub,
         allowed_hosts,
         pairing,
+        github_app_client_id,
+        github_app_callback,
+        github_user,
         sync_interval,
     } = args.command
     {
+        let github_app = github_app_client_id.map(|client_id| server::GitHubApp {
+            client_id,
+            callback: github_app_callback.unwrap_or_default(),
+            users: github_user,
+        });
         let options = server::Options {
             port: args.port,
             demo,
@@ -431,8 +472,26 @@ async fn main() -> Result<()> {
             hub,
             hosts: allowed_hosts,
             pairing,
+            github_app,
         };
         return server::serve(root, options).await;
+    }
+    if let Command::GithubApp {
+        command:
+            GithubAppCommand::SetSecret {
+                token_env,
+                token_stdin,
+            },
+    } = args.command
+    {
+        let secret = read_token(token_env, token_stdin)?.ok_or_else(|| {
+            anyhow!(
+                "Use --token-stdin or --token-env NAME. Secrets are never command-line arguments."
+            )
+        })?;
+        login::save_secret(&root, &secret)?;
+        println!("Kept the GitHub App's client secret; the hub reads it when it starts next");
+        return Ok(());
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(900))
@@ -1022,7 +1081,7 @@ async fn main() -> Result<()> {
             let token = v["token"].as_str().context("The hub sent no token")?;
             println!("{token}");
         }
-        Command::Serve { .. } => unreachable!(),
+        Command::Serve { .. } | Command::GithubApp { .. } => unreachable!(),
     }
     Ok(())
 }

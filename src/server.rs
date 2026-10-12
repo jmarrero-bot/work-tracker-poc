@@ -5,14 +5,16 @@ use crate::{
     connectors,
     db::{self, Db, Mode},
     hub,
+    login::{self, AppConfig, Callback, LoginError, Logins},
     model::*,
+    oauth::Site,
     schedule::{self, Builtin, Policy, Scheduler, Trigger},
     zone,
 };
 use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, OriginalUri, Path, Request, State},
+    extract::{DefaultBodyLimit, OriginalUri, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -55,7 +57,9 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
-fn matches_token(a: &str, b: &str) -> bool {
+/// Whether two secrets are equal, in time that doesn't depend on where
+/// they differ.
+pub(crate) fn matches_token(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -72,9 +76,9 @@ const SESSION_COOKIE: &str = "workboard_session";
 const COMPANION_TOKEN: &str = "companion.token";
 
 /// Who may use the service, from where: the CLI with the application
-/// token, a browser paired with it where pairing is on, and companions with
-/// a credential that reads the export. Pairing is the interim browser
-/// authentication, until GitHub App login (#12) replaces it.
+/// token, a browser signed in with the hub's GitHub App or, without one, a
+/// browser paired with the application token, and companions with a
+/// credential that reads the export.
 struct Access {
     /// `127.0.0.1:PORT`, where the service listens.
     local: String,
@@ -87,8 +91,12 @@ struct Access {
     /// nothing else. Kept across restarts.
     companion: Option<RwLock<String>>,
     /// Whether a browser may pair with the application token: always on a
-    /// local service, and on a hub only with `--pairing`.
+    /// local service, and on a hub only with `--pairing`, which can't be
+    /// combined with a GitHub App.
     pairing: bool,
+    /// A hub's GitHub App sign-ins, if it has one. Then the application
+    /// token is the CLI's alone, on loopback.
+    logins: Option<Arc<Logins>>,
 }
 
 /// Why a request was turned away.
@@ -107,7 +115,7 @@ impl Denied {
             Self::Host => (StatusCode::FORBIDDEN, "Unexpected host"),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
-                "Open the pairing URL printed by `workboard serve`",
+                "Sign in first: with GitHub on a hub that has its App, otherwise with the pairing URL `workboard serve` printed",
             ),
             Self::Scope => (
                 StatusCode::FORBIDDEN,
@@ -145,10 +153,20 @@ impl Access {
         let host = text(headers, header::HOST).ok_or(Denied::Host)?;
         let origin = self.origin(host).ok_or(Denied::Host)?;
         let bearer = text(headers, header::AUTHORIZATION).and_then(|v| v.strip_prefix("Bearer "));
-        let app_token = |v: &str| matches_token(v, &self.token);
+        // With a GitHub App, the application token is the CLI's, on
+        // loopback and not through a proxy; without one, also a paired
+        // browser's on the hub's names.
+        let direct = host == self.local && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h));
+        let app_token =
+            |v: &str| matches_token(v, &self.token) && (direct || self.logins.is_none());
         let bearer_ok = bearer.is_some_and(app_token);
         let paired = self.pairing && cookie(headers, SESSION_COOKIE).is_some_and(app_token);
-        if !bearer_ok && !paired {
+        let signed_in = self.logins.as_ref().is_some_and(|logins| {
+            let renew = !headers.contains_key(BACKGROUND_HEADER);
+            cookie(headers, login::SESSION_COOKIE)
+                .is_some_and(|v| logins.session(v, renew).is_some())
+        });
+        if !bearer_ok && !paired && !signed_in {
             let companion = self.companion.as_ref().is_some_and(|token| {
                 let token = token.read().unwrap_or_else(PoisonError::into_inner);
                 bearer.is_some_and(|v| matches_token(v, &token))
@@ -171,6 +189,18 @@ impl Access {
     }
 }
 
+/// Headers a proxy in front of the service adds, such as `tailscale serve`.
+/// A client can send any Host header through one, so the loopback name
+/// alone doesn't show a request came from this machine.
+const PROXY_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "tailscale-user-login",
+];
+/// The header the page sends with its own refreshes, which don't count as
+/// a use of a session.
+const BACKGROUND_HEADER: &str = "x-workboard-background";
 /// A header's value, if it is text.
 fn text(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
@@ -204,7 +234,10 @@ async fn protect(State(app): State<App>, req: Request, next: Next) -> Response {
 }
 async fn session(State(app): State<App>, headers: HeaderMap) -> Response {
     if !app.access.pairing {
-        let message = "Browser pairing is off on this hub: start it with --pairing";
+        let message = match app.access.logins {
+            Some(_) => "Browser pairing is off on this hub, which has its GitHub App: sign in with GitHub",
+            None => "Browser pairing is off on this hub: set up its GitHub App (docs/github-app.md), or start it with --pairing",
+        };
         return (StatusCode::FORBIDDEN, Json(json!({ "error": message }))).into_response();
     }
     let host = headers
@@ -246,11 +279,11 @@ fn only_hubs() -> anyhow::Error {
     anyhow::anyhow!("Only a hub has a companion token")
 }
 /// A new random credential.
-fn new_token() -> String {
+pub(crate) fn new_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 /// Write `value` to the private file at `path`, replacing it all at once.
-fn replace_secret(path: &std::path::Path, value: &str) -> Result<()> {
+pub(crate) fn replace_secret(path: &std::path::Path, value: &str) -> Result<()> {
     let staged = path.with_extension("new");
     db::remove_if_there(&staged)?;
     db::write_secret(&staged, value)?;
@@ -748,6 +781,174 @@ async fn abandon(
         input.force,
     )?))
 }
+/// A sign-in step's refusal, as JSON, saying when to try again after a
+/// rate limit.
+fn refusal(error: LoginError) -> Response {
+    let mut response = (error.status, Json(json!({ "error": error.message }))).into_response();
+    if let Some(after) = error.retry_after {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from(after.as_secs().max(1)),
+        );
+    }
+    response
+}
+fn refused(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({ "error": message }))).into_response()
+}
+/// The answer of a service without a GitHub App to a sign-in step.
+fn no_app() -> Response {
+    refused(
+        StatusCode::NOT_FOUND,
+        "This service has no GitHub App; see docs/github-app.md",
+    )
+}
+/// The refusal of a browser's sign-in step that didn't come by the name
+/// people sign in on, or, for a change, from that name's page.
+fn off_sign_in_name(logins: &Logins, headers: &HeaderMap, change: bool) -> Option<Response> {
+    let name = logins.config().host();
+    let came = text(headers, header::HOST).map(str::to_ascii_lowercase);
+    if came.as_deref() != Some(name.as_str()) {
+        return Some(refused(
+            StatusCode::FORBIDDEN,
+            &format!("Sign in on https://{name}/"),
+        ));
+    }
+    if change && text(headers, header::ORIGIN) != Some(format!("https://{name}").as_str()) {
+        return Some(Denied::CrossOrigin.response());
+    }
+    None
+}
+/// A `Set-Cookie` value for a cookie of the hub's sign-in: kept to the
+/// hub's exact name over HTTPS, and out of the page's scripts.
+fn sign_in_cookie(name: &str, value: &str, same_site: &str, max_age: Duration) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{name}={value}; Path=/; HttpOnly; Secure; SameSite={same_site}; Max-Age={}",
+        max_age.as_secs()
+    ))
+    .expect("invariant: cookie names and random values are header text")
+}
+/// How this service signs browsers in, and who this one is, if signed in.
+async fn auth_status(State(app): State<App>, headers: HeaderMap) -> Response {
+    if text(&headers, header::HOST)
+        .and_then(|h| app.access.origin(h))
+        .is_none()
+    {
+        return Denied::Host.response();
+    }
+    let logins = app.access.logins.as_ref();
+    let user = logins.and_then(|logins| {
+        cookie(&headers, login::SESSION_COOKIE).and_then(|v| logins.session(v, false))
+    });
+    Json(json!({
+        "github_app": logins.is_some(),
+        "pairing": app.access.pairing,
+        "sign_in": logins.map(|l| format!("https://{}/", l.config().host())),
+        "user": user,
+    }))
+    .into_response()
+}
+/// Start a browser's sign-in with GitHub: where to send it, and a cookie
+/// that binds the sign-in to it. Only from the page under the name people
+/// sign in on.
+async fn login_start(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some(logins) = app.access.logins.as_ref() else {
+        return no_app();
+    };
+    if let Some(response) = off_sign_in_name(logins, &headers, true) {
+        return response;
+    }
+    match logins.start(&login::peer(&headers)) {
+        Ok((binding, url)) => {
+            let mut response = Json(json!({ "url": url.as_str() })).into_response();
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                // Lax, so it comes back with GitHub's redirect.
+                sign_in_cookie(login::LOGIN_COOKIE, &binding, "Lax", login::LOGIN_TTL),
+            );
+            response
+        }
+        Err(e) => refusal(e),
+    }
+}
+/// Where GitHub sends the browser back: finish its sign-in, give it a
+/// session, and send it to the board.
+async fn login_callback(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(callback): Query<Callback>,
+) -> Response {
+    let Some(logins) = app.access.logins.as_ref() else {
+        return no_app();
+    };
+    if let Some(response) = off_sign_in_name(logins, &headers, false) {
+        return response;
+    }
+    let finished = logins
+        .finish(
+            &login::peer(&headers),
+            cookie(&headers, login::LOGIN_COOKIE),
+            &callback,
+        )
+        .await;
+    let mut response = match finished {
+        Ok((session, _)) => {
+            let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                sign_in_cookie(
+                    login::SESSION_COOKIE,
+                    &session,
+                    "Strict",
+                    login::SESSION_MAX,
+                ),
+            );
+            response
+        }
+        Err(e) => {
+            let body = format!(
+                "{}\n\nOpen https://{}/ to try again.\n",
+                e.message,
+                logins.config().host()
+            );
+            (
+                e.status,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                body,
+            )
+                .into_response()
+        }
+    };
+    // The sign-in is used up either way.
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        sign_in_cookie(login::LOGIN_COOKIE, "", "Lax", Duration::ZERO),
+    );
+    response
+}
+/// End this browser's session, from its own page.
+async fn logout(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some(logins) = app.access.logins.as_ref() else {
+        return no_app();
+    };
+    if let Some(response) = off_sign_in_name(logins, &headers, true) {
+        return response;
+    }
+    if let Some(session) = cookie(&headers, login::SESSION_COOKIE) {
+        if logins.logout(session).is_err() {
+            return refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Cannot forget the GitHub token",
+            );
+        }
+    }
+    let mut response = Json(json!({ "ok": true })).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        sign_in_cookie(login::SESSION_COOKIE, "", "Strict", Duration::ZERO),
+    );
+    response
+}
 async fn assets(req: Request) -> Response {
     let path = req.uri().path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -809,8 +1010,12 @@ fn welcome(access: &Access, mode: Mode) -> String {
         Mode::Hub => "Workboard is running as a hub, for external work only",
     };
     let cli = "CLI commands use the same data directory.";
+    if let Some(logins) = &access.logins {
+        let name = logins.config().host();
+        return format!("{running}. Sign in with GitHub at https://{name}/. {cli}");
+    }
     if !access.pairing {
-        return format!("{running}. No browser can sign in: start it with --pairing. {cli}");
+        return format!("{running}. No browser can sign in: set up its GitHub App (docs/github-app.md), or start it with --pairing. {cli}");
     }
     let token = &access.token;
     let local = &access.local;
@@ -837,10 +1042,22 @@ pub struct Options {
     pub hub: bool,
     /// Other names a hub is reached by, through an HTTPS front.
     pub hosts: Vec<String>,
-    /// Let a hub's browsers pair with the application token.
+    /// Let a hub's browsers pair with the application token, without a
+    /// GitHub App.
     pub pairing: bool,
+    /// The GitHub App a hub signs people in with.
+    pub github_app: Option<GitHubApp>,
 }
-/// The service's routes: the API, which [`Access`] guards, and the page.
+/// A hub's GitHub App, as given on the command line. Its client secret is
+/// in the data directory.
+pub struct GitHubApp {
+    pub client_id: String,
+    pub callback: String,
+    /// The numeric GitHub user IDs allowed in.
+    pub users: Vec<u64>,
+}
+/// The service's routes: the API, which [`Access`] guards, the sign-in
+/// steps, which guard themselves, and the page.
 fn router(app: App) -> Router {
     let api = Router::new()
         .route("/snapshot", get(snapshot))
@@ -867,8 +1084,14 @@ fn router(app: App) -> Router {
         .route("/items/{id}", axum::routing::patch(update_manual))
         .route("/items/{id}/abandon", post(abandon))
         .layer(middleware::from_fn_with_state(app.clone(), protect));
+    let auth = Router::new()
+        .route("/status", get(auth_status))
+        .route("/github/login", post(login_start))
+        .route("/github/callback", get(login_callback))
+        .route("/logout", post(logout));
     Router::new()
         .nest("/api", api)
+        .nest("/auth", auth)
         .fallback(assets)
         .layer(DefaultBodyLimit::max(65536))
         .layer(middleware::from_fn(headers))
@@ -885,6 +1108,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         hub,
         hosts,
         pairing,
+        github_app,
     } = options;
     let mode = if hub { Mode::Hub } else { Mode::Local };
     if hub && demo {
@@ -899,12 +1123,37 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     if let Some(host) = hosts.iter().find(|h| !valid_host(h)) {
         bail!("Enter a host name such as hub.example.ts.net, with a port only if it isn't 443: {host}")
     }
-    if !hub && pairing {
-        bail!("Only a hub takes --pairing; a local service pairs its browser on loopback")
+    if !hub && (pairing || github_app.is_some()) {
+        bail!("Only a hub takes --pairing or a GitHub App; a local service pairs its browser on loopback")
     }
+    if pairing && github_app.is_some() {
+        bail!("Browser pairing is off once the hub has its GitHub App; leave out --pairing")
+    }
+    let config = github_app
+        .map(|app| AppConfig::new(&app.client_id, &app.callback, &app.users, &hosts))
+        .transpose()?;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let mut db = Db::open_as(&root, mode)?;
     let mode = db.mode();
+    // With the App or not: a hub started without it keeps no sessions.
+    login::forget_user_tokens(&root)?;
+    let logins = match config {
+        Some(config) => {
+            let secret = login::read_secret(&root)?;
+            let logins = Logins::new(config, secret, Site::github(), Arc::new(SystemClock), &root)?;
+            let swept = Arc::new(logins);
+            let sweeping = swept.clone();
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(login::SWEEP);
+                loop {
+                    every.tick().await;
+                    sweeping.sweep();
+                }
+            });
+            Some(swept)
+        }
+        None => None,
+    };
     if demo && db.items()?.is_empty() && db.efforts()?.is_empty() {
         db.seed()?
     }
@@ -940,6 +1189,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
             token,
             companion,
             pairing: mode == Mode::Local || pairing,
+            logins,
         }),
         scheduler,
         mode,
@@ -987,6 +1237,8 @@ mod tests {
     const TAILNET: &str = "hub.example.ts.net";
     const TOKEN: &str = "test-only-token";
     const COMPANION: &str = "test-only-companion";
+    /// The origin of the hub's page under its tailnet name.
+    const HUB_ORIGIN: &str = "https://hub.example.ts.net";
 
     /// A local service's or a hub's access, the hub's paired with browsers.
     fn access(hub: bool) -> Access {
@@ -996,6 +1248,7 @@ mod tests {
             token: TOKEN.into(),
             companion: hub.then(|| RwLock::new(COMPANION.into())),
             pairing: true,
+            logins: None,
         }
     }
 
@@ -1078,27 +1331,530 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_hub_without_pairing_takes_the_cli_token_only() {
+    #[tokio::test]
+    async fn a_hub_with_its_app_takes_sessions_and_the_cli_on_loopback_only() {
         use Credential::*;
+        use Denied::*;
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, _) = login::tests::logins(root.path()).await;
+        let (session, _) = login::tests::sign_in(&logins, &fake, "ghu_allowed")
+            .await
+            .unwrap();
+        let hub = Access {
+            pairing: false,
+            logins: Some(logins),
+            ..access(true)
+        };
         let unpaired = Access {
             pairing: false,
             ..access(true)
         };
-        // (host, credential, expected)
-        for (host, credential, expected) in [
-            (TAILNET, Cookie(TOKEN), Err(Denied::Unauthorized)),
-            (LOCAL, Cookie(TOKEN), Err(Denied::Unauthorized)),
-            (TAILNET, Bearer(TOKEN), Ok(())),
-            (LOCAL, Bearer(TOKEN), Ok(())),
-        ] {
-            let got = unpaired.check(
-                &Method::GET,
+        let signed_in = |origin: Option<&str>| {
+            let mut h = headers(TAILNET, Nothing, origin);
+            let value = format!("{}={session}", login::SESSION_COOKIE);
+            h.insert(header::COOKIE, HeaderValue::from_str(&value).unwrap());
+            h
+        };
+        // The CLI's token with the loopback name but a proxy's header.
+        let proxied = |name: &'static str| {
+            let mut h = headers(LOCAL, Bearer(TOKEN), None);
+            h.insert(name, HeaderValue::from_static("100.64.0.7"));
+            h
+        };
+        let (get, post) = (Method::GET, Method::POST);
+        // (access, method, path, headers, expected)
+        let cases = [
+            (&hub, &get, "/api/snapshot", signed_in(None), Ok(())),
+            (
+                &hub,
+                &post,
+                "/api/efforts",
+                signed_in(Some(HUB_ORIGIN)),
+                Ok(()),
+            ),
+            (
+                &hub,
+                &post,
+                "/api/efforts",
+                signed_in(Some("https://attacker.example")),
+                Err(CrossOrigin),
+            ),
+            (
+                &hub,
+                &post,
+                "/api/efforts",
+                signed_in(None),
+                Err(CrossOrigin),
+            ),
+            (
+                &hub,
+                &get,
                 "/api/snapshot",
-                &headers(host, credential, None),
+                headers(TAILNET, Cookie("forged"), None),
+                Err(Unauthorized),
+            ),
+            // The CLI's token works on loopback alone, and pairing not at all.
+            (
+                &hub,
+                &get,
+                "/api/snapshot",
+                headers(LOCAL, Bearer(TOKEN), None),
+                Ok(()),
+            ),
+            (
+                &hub,
+                &get,
+                "/api/snapshot",
+                headers(TAILNET, Bearer(TOKEN), None),
+                Err(Unauthorized),
+            ),
+            (
+                &hub,
+                &get,
+                "/api/snapshot",
+                headers(TAILNET, Cookie(TOKEN), None),
+                Err(Unauthorized),
+            ),
+            (
+                &hub,
+                &get,
+                "/api/snapshot",
+                headers(LOCAL, Cookie(TOKEN), None),
+                Err(Unauthorized),
+            ),
+            (
+                &hub,
+                &get,
+                EXPORT_PATH,
+                headers(TAILNET, Bearer(COMPANION), None),
+                Ok(()),
+            ),
+            // Without pairing and without an App, only the CLI's token.
+            (
+                &unpaired,
+                &get,
+                "/api/snapshot",
+                headers(TAILNET, Cookie(TOKEN), None),
+                Err(Unauthorized),
+            ),
+            (
+                &unpaired,
+                &get,
+                "/api/snapshot",
+                headers(TAILNET, Bearer(TOKEN), None),
+                Ok(()),
+            ),
+        ];
+        for (n, (access, method, path, headers, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                access.check(method, path, &headers),
+                expected,
+                "case {n}: {method} {path}"
             );
-            assert_eq!(got, expected, "{host}");
         }
+        // The loopback name through a proxy, as a tailnet client can send it.
+        for name in PROXY_HEADERS {
+            let got = hub.check(&get, "/api/snapshot", &proxied(name));
+            assert_eq!(got, Err(Unauthorized), "{name}");
+        }
+        assert_eq!(PROXY_HEADERS.len(), 4);
+    }
+
+    /// An app on a fresh data directory at `root`: a hub reached at `local`
+    /// and by its tailnet name, with `logins`, or a local service.
+    fn test_app(
+        root: &std::path::Path,
+        mode: Mode,
+        local: &str,
+        logins: Option<Arc<Logins>>,
+    ) -> App {
+        let db = Arc::new(Mutex::new(Db::open_as(root, mode).unwrap()));
+        let sources = Builtin {
+            plugins: root.join(connectors::PLUGINS_DIR),
+            shared: connectors::Shared::default(),
+        };
+        let policy = Policy {
+            interval: Duration::from_secs(300),
+        };
+        let scheduler =
+            Scheduler::new(db.clone(), Box::new(sources), Arc::new(SystemClock), policy);
+        let hub = mode == Mode::Hub;
+        App {
+            db,
+            access: Arc::new(Access {
+                local: local.into(),
+                pairing: !hub,
+                logins,
+                ..access(hub)
+            }),
+            scheduler,
+            mode,
+        }
+    }
+
+    /// Send `router` a request, and read its answer.
+    // The router itself, in process: no reqwest client is involved.
+    #[allow(clippy::disallowed_methods)]
+    async fn call(
+        router: &Router,
+        method: Method,
+        uri: &str,
+        headers: &[(header::HeaderName, &str)],
+        body: Option<Value>,
+    ) -> (StatusCode, HeaderMap, String) {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            request = request.header(name, *value);
+        }
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        let body = body.map_or_else(Body::empty, |b| Body::from(b.to_string()));
+        let response = router
+            .clone()
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        let (status, headers) = (response.status(), response.headers().clone());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The `Set-Cookie` values of an answer.
+    fn set_cookies(headers: &HeaderMap) -> Vec<String> {
+        headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_callback_route_is_the_one_apps_are_given() {
+        assert_eq!(login::CALLBACK_PATH, "/auth/github/callback");
+    }
+
+    #[tokio::test]
+    async fn the_web_sign_in_gives_a_session_cookie_never_the_token() {
+        use header::{COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, _) = login::tests::logins(root.path()).await;
+        let router = router(test_app(root.path(), Mode::Hub, LOCAL, Some(logins)));
+        let origin = format!("https://{TAILNET}");
+        let (status, headers, body) = call(
+            &router,
+            Method::POST,
+            "/auth/github/login",
+            &[(HOST, TAILNET), (ORIGIN, origin.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let cookies = set_cookies(&headers);
+        let [started] = &cookies[..] else {
+            panic!("{headers:?}")
+        };
+        for flag in [
+            "__Host-workboard_login=",
+            "Path=/",
+            "HttpOnly",
+            "Secure",
+            "SameSite=Lax",
+            "Max-Age=600",
+        ] {
+            assert!(started.contains(flag), "{started}");
+        }
+        let binding = started.split(';').next().unwrap().to_string();
+        let answer: Value = serde_json::from_str(&body).unwrap();
+        let url = url::Url::parse(answer["url"].as_str().unwrap()).unwrap();
+        let query: std::collections::HashMap<String, String> =
+            url.query_pairs().into_owned().collect();
+        {
+            let mut fake = fake.lock().unwrap();
+            fake.challenge = Some(query["code_challenge"].clone());
+            fake.token = "ghu_allowed".into();
+        }
+        let back = format!(
+            "/auth/github/callback?code={}&state={}",
+            crate::oauth::tests::CODE,
+            query["state"]
+        );
+        let (status, headers, body) = call(
+            &router,
+            Method::GET,
+            &back,
+            &[(HOST, TAILNET), (COOKIE, binding.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+        assert_eq!(headers[header::LOCATION], "/");
+        let cookies = set_cookies(&headers);
+        let session = cookies
+            .iter()
+            .find(|c| c.starts_with(login::SESSION_COOKIE))
+            .unwrap();
+        let max_age = format!("Max-Age={}", login::SESSION_MAX.as_secs());
+        for flag in ["Path=/", "HttpOnly", "Secure", "SameSite=Strict", &max_age] {
+            assert!(session.contains(flag), "{session}");
+        }
+        assert!(
+            !session.contains("ghu_"),
+            "the cookie never holds the token"
+        );
+        assert!(cookies
+            .iter()
+            .any(|c| c.starts_with(login::LOGIN_COOKIE) && c.contains("Max-Age=0")));
+        let session = session.split(';').next().unwrap().to_string();
+        // The session reads and, from the hub's own page, changes.
+        let signed_in = [(HOST, TAILNET), (COOKIE, session.as_str())];
+        assert_eq!(
+            call(&router, Method::GET, "/api/snapshot", &signed_in, None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let effort = Some(serde_json::json!({ "title": "Signed in" }));
+        let from = |origin: &'static str| {
+            [
+                (HOST, TAILNET),
+                (COOKIE, session.as_str()),
+                (ORIGIN, origin),
+            ]
+        };
+        let (status, _, body) = call(
+            &router,
+            Method::POST,
+            "/api/efforts",
+            &from(HUB_ORIGIN),
+            effort.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _, _) = call(
+            &router,
+            Method::POST,
+            "/api/efforts",
+            &from("https://attacker.example"),
+            effort,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (_, _, body) = call(&router, Method::GET, "/auth/status", &signed_in, None).await;
+        let status: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status["user"]["id"], login::tests::ALLOWED);
+        assert_eq!(
+            (status["github_app"].as_bool(), status["pairing"].as_bool()),
+            (Some(true), Some(false))
+        );
+        // The same callback again finds nothing to finish.
+        let replay = call(
+            &router,
+            Method::GET,
+            &back,
+            &[(HOST, TAILNET), (COOKIE, binding.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(replay.0, StatusCode::BAD_REQUEST, "{}", replay.2);
+        // Nothing a sign-in carries comes back in what the hub answers.
+        for secret in [query["state"].as_str(), crate::oauth::tests::CODE, "ghu_"] {
+            assert!(
+                !replay.2.contains(secret) && !body.contains(secret),
+                "{secret}"
+            );
+        }
+        // Signing out takes the page's origin, and ends the session.
+        let (status, _, _) = call(&router, Method::POST, "/auth/logout", &signed_in, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, headers, _) = call(
+            &router,
+            Method::POST,
+            "/auth/logout",
+            &from(HUB_ORIGIN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(set_cookies(&headers)[0].contains("Max-Age=0"));
+        let (status, _, _) = call(&router, Method::GET, "/api/snapshot", &signed_in, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sign_in_steps_from_elsewhere_are_refused_before_github_is_asked() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, _) = login::tests::logins(root.path()).await;
+        let router = router(test_app(root.path(), Mode::Hub, LOCAL, Some(logins)));
+        let origin = format!("https://{TAILNET}");
+        let callback = "/auth/github/callback?code=x&state=y";
+        let bearer = format!("Bearer {TOKEN}");
+        let (get, post) = (Method::GET, Method::POST);
+        // (method, path, headers, expected)
+        type Case<'a> = (
+            &'a Method,
+            &'a str,
+            Vec<(header::HeaderName, &'a str)>,
+            StatusCode,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                &post,
+                "/auth/github/login",
+                vec![(HOST, TAILNET)],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &post,
+                "/auth/github/login",
+                vec![(HOST, TAILNET), (ORIGIN, "https://attacker.example")],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &post,
+                "/auth/github/login",
+                vec![(HOST, TAILNET), (ORIGIN, "http://hub.example.ts.net")],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &post,
+                "/auth/github/login",
+                vec![(HOST, LOCAL), (ORIGIN, "http://127.0.0.1:8421")],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &post,
+                "/auth/github/login",
+                vec![
+                    (HOST, "other.example.ts.net"),
+                    (ORIGIN, "https://other.example.ts.net"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &get,
+                callback,
+                vec![(HOST, TAILNET)],
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                &get,
+                callback,
+                vec![(HOST, TAILNET), (COOKIE, "__Host-workboard_login=forged")],
+                StatusCode::BAD_REQUEST,
+            ),
+            (&get, callback, vec![(HOST, LOCAL)], StatusCode::FORBIDDEN),
+            (
+                &post,
+                "/auth/logout",
+                vec![(HOST, TAILNET)],
+                StatusCode::FORBIDDEN,
+            ),
+            // No pairing, and the CLI's token on loopback only.
+            (
+                &post,
+                "/api/session",
+                vec![(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &get,
+                "/api/snapshot",
+                vec![(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())],
+                StatusCode::OK,
+            ),
+            (
+                &get,
+                "/api/snapshot",
+                vec![(HOST, TAILNET), (AUTHORIZATION, bearer.as_str())],
+                StatusCode::UNAUTHORIZED,
+            ),
+        ];
+        for (n, (method, path, headers, expected)) in cases.into_iter().enumerate() {
+            let (status, _, body) = call(&router, method.clone(), path, &headers, None).await;
+            assert_eq!(status, expected, "case {n}: {method} {path}: {body}");
+        }
+        // A sign-in this browser started, with the wrong state.
+        let (_, headers, _) = call(
+            &router,
+            post.clone(),
+            "/auth/github/login",
+            &[(HOST, TAILNET), (ORIGIN, origin.as_str())],
+            None,
+        )
+        .await;
+        let binding = set_cookies(&headers)[0]
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let (status, _, body) = call(
+            &router,
+            get,
+            callback,
+            &[(HOST, TAILNET), (COOKIE, binding.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("doesn't match"), "{body}");
+        assert!(
+            fake.lock().unwrap().seen.is_empty(),
+            "GitHub was never asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_in_attempts_are_rate_limited_and_services_without_an_app_say_so() {
+        use header::{HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let (logins, _, _) = login::tests::logins(root.path()).await;
+        let router = router(test_app(root.path(), Mode::Hub, LOCAL, Some(logins)));
+        let start = [(HOST, TAILNET), (ORIGIN, "https://hub.example.ts.net")];
+        for _ in 0..10 {
+            assert_eq!(
+                call(&router, Method::POST, "/auth/github/login", &start, None)
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        let (status, headers, _) =
+            call(&router, Method::POST, "/auth/github/login", &start, None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.contains_key(header::RETRY_AFTER));
+        // Another peer on the tailnet, as the front says, isn't held up.
+        let other = [
+            (HOST, TAILNET),
+            (ORIGIN, "https://hub.example.ts.net"),
+            (
+                header::HeaderName::from_static("x-forwarded-for"),
+                "100.64.0.9",
+            ),
+        ];
+        let (status, _, _) = call(&router, Method::POST, "/auth/github/login", &other, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let local = tempfile::tempdir().unwrap();
+        let router = super::router(test_app(local.path(), Mode::Local, LOCAL, None));
+        let (status, _, _) = call(
+            &router,
+            Method::POST,
+            "/auth/github/login",
+            &[(HOST, LOCAL), (ORIGIN, "http://127.0.0.1:8421")],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, _, body) = call(&router, Method::GET, "/auth/status", &[(HOST, LOCAL)], None).await;
+        let status: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            (status["github_app"].as_bool(), status["pairing"].as_bool()),
+            (Some(false), Some(true))
+        );
     }
 
     #[test]
