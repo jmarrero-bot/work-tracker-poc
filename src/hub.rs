@@ -209,11 +209,20 @@ fn unique_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<HashSet<&'a 
     Some(set)
 }
 
+/// `text` without control characters, which a terminal could take as
+/// escapes when the CLI prints it.
+fn printable(text: &mut String) {
+    if text.contains(char::is_control) {
+        text.retain(|c| !c.is_control());
+    }
+}
+
 /// What a hub sent, if all of it is external and well formed: every object
 /// says it is external, items belong to connections it sent and efforts
 /// to efforts it sent, links are HTTP(S), and nothing is out of bounds.
-/// Anything else refuses all of it.
-pub fn checked(s: ExternalSnapshot) -> ConnectorResult<ExternalSnapshot> {
+/// Anything else refuses all of it. What passes keeps links as they are
+/// parsed, and text without control characters.
+pub fn checked(mut s: ExternalSnapshot) -> ConnectorResult<ExternalSnapshot> {
     let fail = |why: &str| Err(ConnectorError::invalid(format!("The hub's export {why}")));
     if s.zone != Zone::External
         || s.connections.iter().any(|c| c.zone != Zone::External)
@@ -265,6 +274,28 @@ pub fn checked(s: ExternalSnapshot) -> ConnectorResult<ExternalSnapshot> {
     }
     if !s.efforts.iter().all(|e| text_ok(&[&e.title])) {
         return fail("has an effort that isn't valid");
+    }
+    for c in &mut s.connections {
+        for text in [&mut c.label, &mut c.account_name] {
+            printable(text);
+        }
+    }
+    for i in &mut s.items {
+        // Checked above, so this only puts the link in its parsed form.
+        i.url = connectors::source_url(&i.url).map_err(ConnectorError::invalid)?;
+        for text in [
+            &mut i.key,
+            &mut i.title,
+            &mut i.status,
+            &mut i.outcome_reason,
+            &mut i.action,
+            &mut i.updated_at,
+        ] {
+            printable(text);
+        }
+    }
+    for e in &mut s.efforts {
+        printable(&mut e.title);
     }
     Ok(s)
 }
@@ -841,6 +872,20 @@ pub mod tests {
             // One request, and a redirect never followed.
             assert_eq!(seen.lock().unwrap().len(), 1, "case {n}");
         }
+    }
+
+    #[test]
+    fn what_passes_has_parsed_links_and_printable_text() {
+        let mut s = export(1);
+        s.items[0].url = "HTTPS://GitHub.com/o/r/pull/0".into();
+        s.items[0].title = "Change \u{1b}[31m0\u{7}".into();
+        s.connections[0].account_name = "some\none".into();
+        s.efforts[0].title = "Effort\r".into();
+        let s = checked(s).unwrap();
+        assert_eq!(s.items[0].url, "https://github.com/o/r/pull/0");
+        assert_eq!(s.items[0].title, "Change [31m0");
+        assert_eq!(s.connections[0].account_name, "someone");
+        assert_eq!(s.efforts[0].title, "Effort");
     }
 
     #[test]
