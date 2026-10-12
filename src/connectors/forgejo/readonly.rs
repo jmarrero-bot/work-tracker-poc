@@ -153,6 +153,7 @@ fn rate_limited(until: SystemTime) -> ConnectorError {
         ErrorKind::Transient,
         format!("{SOURCE} asked to wait before more requests; try again in about {minutes} min"),
     )
+    .held_until(until)
 }
 
 /// The token, unless `target` is the anonymous test target. Only the live
@@ -526,9 +527,13 @@ pub mod tests {
                 ..target.clone()
             };
             later.get_found(&other, "user", &[]).await.unwrap();
+            // Saying until when, so a scheduled sync waits as long.
+            let held = error.hold_until;
+            assert_eq!(held.is_some(), blocks, "{status}");
             if blocks {
                 let error = next.unwrap_err();
                 assert!(error.message.contains("asked to wait"), "{error}");
+                assert_eq!(error.hold_until, held, "{status}");
                 assert_eq!(seen.load(Ordering::SeqCst), 2, "{status}");
             } else {
                 next.unwrap();

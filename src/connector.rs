@@ -13,7 +13,7 @@ use crate::{
     outcome,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt, future::Future, pin::Pin};
+use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, time::SystemTime};
 use url::Url;
 
 /// The plugin protocol version this build speaks. A change that an existing
@@ -61,6 +61,11 @@ pub enum ErrorKind {
 pub struct ConnectorError {
     pub kind: ErrorKind,
     pub message: String,
+    /// Until when the source asked for no more requests, for a rate limit:
+    /// trying again sooner is refused before anything is sent. Built-in
+    /// connectors only, so not part of the plugin protocol.
+    #[serde(skip)]
+    pub hold_until: Option<SystemTime>,
 }
 
 impl ConnectorError {
@@ -68,7 +73,13 @@ impl ConnectorError {
         Self {
             kind,
             message: message.into(),
+            hold_until: None,
         }
+    }
+    /// The same error, saying the source asked to wait until `until`.
+    pub fn held_until(mut self, until: SystemTime) -> Self {
+        self.hold_until = Some(until);
+        self
     }
     pub fn invalid(message: impl fmt::Display) -> Self {
         Self::new(ErrorKind::Invalid, message.to_string())
