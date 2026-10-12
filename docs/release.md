@@ -16,6 +16,16 @@ The [release workflow](../.github/workflows/release.yml) then builds the image f
 
 Don't move or reuse a tag: the image tag would move with it, and the digest is what's deployed anyway.
 
+## Move the base images
+
+The Containerfile pins its base images by digest, so a tag builds from the same bases however late it's cut, and they move only when someone moves them: before a release, at least for security fixes in the runtime image. Look up each tag's current digest, put it after the tag in its `FROM` line, and land that as a pull request like any other change:
+
+```sh
+skopeo inspect --format '{{.Digest}}' docker://gcr.io/distroless/cc-debian13:nonroot
+skopeo inspect --format '{{.Digest}}' docker://docker.io/library/rust:1-slim-trixie
+skopeo inspect --format '{{.Digest}}' docker://docker.io/library/node:22-trixie-slim
+```
+
 ## Get the digest
 
 The run prints the line for the quadlet, in its log and its summary:
