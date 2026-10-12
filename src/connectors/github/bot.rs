@@ -7,6 +7,9 @@
 //!   and Branch.
 //! - Its open pull requests in its forge organization, with REST search,
 //!   each linked to the board item whose Branch is its address.
+//! - Its coordinator's heartbeat, the comment by the bot on its tracker's
+//!   heartbeat issue, with REST: the coordinator's loop state, and each of
+//!   its workers as an agent run. Agent runs are not items.
 //!
 //! Outcomes follow the rule every connector does: closed is not delivered,
 //! and neither is the board saying Done (see `outcome::bot_board_item`).
@@ -15,13 +18,13 @@ use super::{
     current_user, github_item, readonly::ReadOnly, refresh_issues, search_issues, Got, Memory,
 };
 use crate::{
-    bot::{BoardSummary, BotConfig, BotFields, BotKind},
+    bot::{find_heartbeat, BoardSummary, BotConfig, BotFields, BotKind, Heartbeat},
     connector::{
         Account, BoxFuture, Connector, ConnectorError, ConnectorResult, ErrorKind, Reason,
         Refreshed, RemoteItem, Requests, Target, Tracked,
     },
     connectors::source_url,
-    model::{valid_github_name, Outcome},
+    model::{valid_github_name, Outcome, Timestamp},
     outcome::{self, Linked},
 };
 use anyhow::Result;
@@ -49,6 +52,11 @@ const DRAFT: &str = "Draft";
 const NO_STATUS: &str = "No status";
 /// The GraphQL error GitHub answers for an ID that names nothing.
 const NOT_FOUND: &str = "NOT_FOUND";
+/// Comments per page of the heartbeat issue, GitHub's largest.
+const COMMENTS_PAGE: usize = 100;
+/// Most pages of comments read on the heartbeat issue. It is locked, so
+/// its comments are few.
+const COMMENT_PAGES: usize = 3;
 
 /// What is read of each board item, in listings and refreshes alike.
 const BOARD_ITEM: &str = r#"
@@ -546,6 +554,50 @@ impl Bot {
         }
         Ok(answers)
     }
+    /// The heartbeat the bot publishes, read in a sync that started `at`,
+    /// or none if it publishes none.
+    async fn heartbeat(
+        &self,
+        target: &Target,
+        at: Timestamp,
+    ) -> ConnectorResult<Option<Heartbeat>> {
+        let (owner, repo) = self
+            .config
+            .tracker_parts()
+            .ok_or_else(|| ConnectorError::invalid("Invalid tracker repository"))?;
+        let issue = self.config.heartbeat_issue;
+        let path = format!("repos/{owner}/{repo}/issues/{issue}/comments");
+        for page in 1..=COMMENT_PAGES {
+            let query = [
+                ("per_page", COMMENTS_PAGE.to_string()),
+                ("page", page.to_string()),
+            ];
+            let comments = match self.client.get(target, &path, &query).await? {
+                Got::Found(comments) => comments,
+                Got::Moved(..) | Got::Inaccessible(_) => {
+                    return Err(ConnectorError::invalid(format!(
+                        "The heartbeat issue {owner}/{repo}#{issue} can't be read"
+                    )))
+                }
+            };
+            let comments = comments.as_array().ok_or_else(|| {
+                ConnectorError::invalid(
+                    "GitHub's answer about the heartbeat issue isn't its comments",
+                )
+            })?;
+            let found = find_heartbeat(comments, &self.config.bot_login, &target.base_url, at)
+                .map_err(|why| ConnectorError::invalid(format!("Not a heartbeat: {why}")))?;
+            if found.is_some() || comments.len() < COMMENTS_PAGE {
+                return Ok(found);
+            }
+        }
+        // Not "no heartbeat": there are more comments than are read.
+        Err(ConnectorError::invalid(format!(
+            "No heartbeat by {} among the first {} comments of {owner}/{repo}#{issue}",
+            self.config.bot_login,
+            COMMENTS_PAGE * COMMENT_PAGES
+        )))
+    }
     async fn refresh_all(
         &self,
         target: &Target,
@@ -596,6 +648,13 @@ impl Connector for Bot {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+    fn agents<'a>(
+        &'a self,
+        target: &'a Target,
+        at: Timestamp,
+    ) -> Option<BoxFuture<'a, ConnectorResult<Option<Heartbeat>>>> {
+        Some(Box::pin(self.heartbeat(target, at)))
     }
     fn requests(&self) -> Option<Requests> {
         Some(self.client.requests())
@@ -1098,6 +1157,99 @@ mod tests {
             "{error}"
         );
         assert_eq!(bot.requests().unwrap().sent["POST /graphql (query)"], 10);
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_is_read_as_agent_runs_apart_from_items() {
+        let comments = |headers: HeaderMap| async move {
+            let base = base(&headers);
+            let heartbeat = json!({
+                "schema": "bot-heartbeat/v1", "updated_at": "2026-10-12T03:58:44Z",
+                "coordinator": {"session": "s1", "loop_state": "working"},
+                "workers": [
+                    {"name": "wtp-slice8", "item_url": format!("{base}jmarrero-bot/work-tracker-poc/issues/9"),
+                     "started_at": "2026-10-12T03:28:44Z", "status": "working"},
+                    // Not on this instance.
+                    {"name": "elsewhere", "item_url": "https://github.com/o/r/issues/1",
+                     "started_at": "2026-10-12T03:28:44Z", "status": "working"},
+                ],
+            });
+            let body = format!(
+                "{}\nCoordinator.\n\n```json\n{heartbeat}\n```\n",
+                crate::bot::HEARTBEAT_MARKER
+            );
+            Json(json!([
+                {"user": {"login": "someone"}, "body": "Hi"},
+                {"user": {"login": "jmarrero-bot"}, "body": body,
+                 "html_url": format!("{base}jmarrero-forge/tracker/issues/1#issuecomment-1")},
+            ]))
+        };
+        let with_comments = router().route(
+            "/api/v3/repos/jmarrero-forge/tracker/issues/1/comments",
+            get(comments),
+        );
+        let (target, task) = crate::connectors::fixture(with_comments, "test-only-token").await;
+        let bot = Bot::new(Arc::default(), config()).unwrap();
+        let at = Timestamp::parse("2026-10-12T04:00:00Z").unwrap();
+        let c = connection();
+        let runs = connector::agents(&bot, &target, &c, None, at)
+            .await
+            .unwrap();
+        let heartbeat = runs.heartbeat.clone().unwrap();
+        assert_eq!(
+            (heartbeat.loop_state.as_str(), heartbeat.skipped),
+            ("working", 1)
+        );
+        let [run] = &heartbeat.runs[..] else {
+            panic!("{heartbeat:?}")
+        };
+        assert_eq!(
+            (run.name.as_str(), run.item_key.as_str()),
+            ("wtp-slice8", "jmarrero-bot/work-tracker-poc#9")
+        );
+        assert_eq!((runs.last_success, runs.error.as_deref()), (Some(at), None));
+        task.abort();
+        // A heartbeat that can't be read keeps what was read before, as of
+        // when, with the error; the board's sync is untouched by it.
+        let (target, task) = crate::connectors::fixture(router(), "test-only-token").await;
+        let later = Timestamp::parse("2026-10-12T04:05:00Z").unwrap();
+        let kept = connector::agents(&bot, &target, &c, Some(&runs), later)
+            .await
+            .unwrap();
+        task.abort();
+        assert_eq!(kept.heartbeat, runs.heartbeat);
+        assert_eq!(kept.last_success, Some(at));
+        let error = kept.error.unwrap();
+        assert!(
+            error.contains("heartbeat issue jmarrero-forge/tracker#1"),
+            "{error}"
+        );
+        // Only GETs of the comments went out.
+        let requests = bot.requests().unwrap();
+        assert_eq!((requests.sent["GET"], requests.refused), (2, 0));
+        assert!(!requests.sent.contains_key("POST /graphql (query)"));
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_past_the_comments_read_is_an_error_not_none() {
+        // Every page full, and none of it a heartbeat.
+        let full = || async {
+            let comments: Vec<_> = (0..COMMENTS_PAGE)
+                .map(|_| json!({"user": {"login": "someone"}, "body": "Hi"}))
+                .collect();
+            Json(json!(comments))
+        };
+        let router = Router::new().route(
+            "/api/v3/repos/jmarrero-forge/tracker/issues/1/comments",
+            get(full),
+        );
+        let (target, task) = crate::connectors::fixture(router, "test-only-token").await;
+        let bot = Bot::new(Arc::default(), config()).unwrap();
+        let at = Timestamp::parse("2026-10-12T04:00:00Z").unwrap();
+        let error = bot.heartbeat(&target, at).await.unwrap_err();
+        task.abort();
+        assert!(error.message.contains("first 300 comments"), "{error}");
+        assert_eq!(bot.requests().unwrap().sent["GET"], COMMENT_PAGES as u64);
     }
 
     #[test]

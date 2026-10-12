@@ -145,6 +145,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show each connected bot: its coordinator's heartbeat and the agent
+    /// runs it lists, and how many items its board and fork pull requests
+    /// have.
+    Bot {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show items that need action now, including any closed without delivery
     /// or unknown.
     Next {
@@ -550,6 +557,12 @@ async fn main() -> Result<()> {
             {
                 bail!("Watching another user could not be updated; the accounts' own work was synced, and the last watch list kept")
             }
+            if v["results"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|x| x["agents"]["error"].is_string()))
+            {
+                bail!("A bot's heartbeat could not be read; its board was synced, and the last heartbeat read kept")
+            }
         }
         Command::Connections => {
             let s: SnapshotClient = request(
@@ -655,6 +668,20 @@ async fn main() -> Result<()> {
                     for e in &view.watch_errors {
                         println!("  Not updated, showing the last list: {}", e.error);
                     }
+                }
+            }
+        }
+        Command::Bot { json } => {
+            let views: Vec<bot::BotView> =
+                request(&client, &root, args.port, reqwest::Method::GET, "bot", None).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&views)?);
+            } else if views.is_empty() {
+                println!("No bot is connected; `workboard connect bot` connects one");
+            } else {
+                let now = Timestamp::of(SystemTime::now());
+                for v in &views {
+                    print_bot(v, now);
                 }
             }
         }
@@ -936,6 +963,83 @@ async fn main() -> Result<()> {
         Command::Serve { .. } => unreachable!(),
     }
     Ok(())
+}
+/// A bot connection: its board's counts, its coordinator's heartbeat and
+/// the agent runs it lists, and how fresh that is.
+fn print_bot(v: &bot::BotView, now: Timestamp) {
+    println!(
+        "{}  {}  {}  {}",
+        v.connection_id, v.label, v.bot_login, v.board_url
+    );
+    let Some(agents) = &v.agents else {
+        println!("    Not read yet");
+        return;
+    };
+    match &agents.board {
+        Some(board) => {
+            let items: usize = board.statuses.values().sum();
+            let statuses: Vec<_> = board
+                .statuses
+                .iter()
+                .map(|(status, n)| format!("{n} {status}"))
+                .collect();
+            println!(
+                "    Board: {items} items ({}); {} open fork pull requests",
+                statuses.join(", "),
+                board.fork_prs
+            );
+            // The board shown is never taken for all of it.
+            if board.unreadable > 0 {
+                println!(
+                    "    And {} items this token can't read: the board above isn't all of it",
+                    board.unreadable
+                );
+            }
+        }
+        None => println!("    Board: not read yet"),
+    }
+    let read = staleness(agents.stale, agents.last_success, now);
+    match &agents.heartbeat {
+        None => println!("    No heartbeat is published{read}"),
+        Some(h) => {
+            let wake = h
+                .next_wake_at
+                .map(|t| format!(", next wake {}", relative(t, now)))
+                .unwrap_or_default();
+            let stale = if h.stale {
+                "Stale, the coordinator may have stopped: "
+            } else {
+                ""
+            };
+            println!(
+                "    {stale}Coordinator {} is {}, as of {}{wake}{read}",
+                h.session,
+                h.loop_state,
+                relative(h.updated_at, now)
+            );
+            println!("    {} agent runs", h.runs.len());
+            for r in &h.runs {
+                let devspace = r
+                    .devspace
+                    .as_ref()
+                    .map(|d| format!("  on {d}"))
+                    .unwrap_or_default();
+                println!(
+                    "      {}  {}  {}  started {}{devspace}",
+                    r.name,
+                    r.item_key,
+                    r.status,
+                    relative(r.started_at, now)
+                );
+            }
+            if h.skipped > 0 {
+                println!("      {} more left out, as malformed", h.skipped);
+            }
+        }
+    }
+    if let Some(error) = &agents.error {
+        println!("    Not updated, showing the last heartbeat read: {error}");
+    }
 }
 /// The hub this machine pulls from, and how its pulls are going.
 fn print_hub(status: &hub::Status, now: Timestamp) {

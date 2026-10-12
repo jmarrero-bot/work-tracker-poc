@@ -1,4 +1,5 @@
 use crate::{
+    bot,
     clock::SystemClock,
     connector::{self, Target},
     connectors,
@@ -333,6 +334,16 @@ async fn unset_hub(State(app): State<App>) -> ApiResult<Value> {
 async fn mine(State(app): State<App>) -> ApiResult<crate::mine::Mine> {
     let (snapshot, watched, _) = board(&app)?;
     Ok(Json(crate::mine::mine(&snapshot, &watched)))
+}
+/// Each bot connection: where its board is, the agent runs of its
+/// heartbeat, and how many of its items there are. This machine's own
+/// connections only: a companion has no settings of the hub's.
+async fn bot_view(State(app): State<App>) -> ApiResult<Vec<bot::BotView>> {
+    let (snapshot, _) = fresh_snapshot(&app)?;
+    let mut agents = app.db.lock().unwrap().agents()?;
+    app.scheduler
+        .annotate_agents(&snapshot.connections, &mut agents);
+    Ok(Json(bot::views(&snapshot, &agents)))
 }
 /// What may leave this machine: the external zone of this machine's own
 /// work only, never the work a companion pulled from a hub. A hub serves
@@ -818,6 +829,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     let api = Router::new()
         .route("/snapshot", get(snapshot))
         .route("/mine", get(mine))
+        .route("/bot", get(bot_view))
         .route("/export/external", get(export_external))
         .route("/session", post(session))
         .route("/hub", get(get_hub).put(set_hub).delete(unset_hub))

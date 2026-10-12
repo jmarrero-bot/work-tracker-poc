@@ -8,7 +8,7 @@
 //! [`Item`], so a plugin can't store an unsafe link or a person's decision.
 
 use crate::{
-    bot::BoardSummary,
+    bot::{AgentRuns, BoardSummary, Heartbeat},
     connectors::source_url,
     model::{BotFields, Connection, Item, Outcome, Timestamp, WatchList},
     outcome,
@@ -349,6 +349,16 @@ pub trait Connector: Send + Sync {
     fn board(&self) -> Option<BoardSummary> {
         None
     }
+    /// The heartbeat a bot publishes, with its agent runs, read in a sync
+    /// that started `at`: `None` for a connector that reads none, and
+    /// `Some(Ok(None))` when the bot publishes none.
+    fn agents<'a>(
+        &'a self,
+        _target: &'a Target,
+        _at: Timestamp,
+    ) -> Option<BoxFuture<'a, ConnectorResult<Option<Heartbeat>>>> {
+        None
+    }
     /// What it has sent to its source, if it counts.
     fn requests(&self) -> Option<Requests> {
         None
@@ -535,6 +545,54 @@ pub async fn watch(
         }
     }
     Ok(all.into_values().collect())
+}
+
+/// The agent runs of connection `c`, from the heartbeat its connector reads,
+/// in a sync that started `at`, if it reads one. Like a watch list, they are
+/// apart from the items: if the heartbeat can't be read, the sync of the
+/// items still counts, and what `last` read stays, with the error. A
+/// heartbeat that repeats the credential is refused.
+pub async fn agents(
+    connector: &dyn Connector,
+    target: &Target,
+    c: &Connection,
+    last: Option<&AgentRuns>,
+    at: Timestamp,
+) -> Option<AgentRuns> {
+    let read = connector.agents(target, at)?.await;
+    let read = read.and_then(|heartbeat| {
+        let text = serde_json::to_string(&heartbeat).unwrap_or_default();
+        if text.contains(target.credential.expose()) {
+            return Err(ConnectorError::invalid(
+                "The heartbeat contains the credential",
+            ));
+        }
+        Ok(heartbeat)
+    });
+    Some(match read {
+        Ok(heartbeat) => AgentRuns {
+            connection_id: c.id.clone(),
+            heartbeat,
+            error: None,
+            last_success: Some(at),
+            stale: false,
+            board: connector.board(),
+        },
+        Err(e) => {
+            let kept = last.filter(|l| l.connection_id == c.id);
+            AgentRuns {
+                connection_id: c.id.clone(),
+                heartbeat: kept.and_then(|l| l.heartbeat.clone()),
+                error: Some(format!(
+                    "Reading the heartbeat: {}",
+                    e.redact(&target.credential).message
+                )),
+                last_success: kept.and_then(|l| l.last_success),
+                stale: false,
+                board: connector.board(),
+            }
+        }
+    })
 }
 
 /// Sync connection `c` and, if it watches another user, what watching
