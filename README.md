@@ -6,7 +6,7 @@ This is an initial single-user prototype for Linux and macOS, not a hosted team 
 
 ## Status and roadmap
 
-This is jmarrero's Workboard prototype from his handoff, now built and tested by CI on every pull request. The goal is one board for internal and external work: internal items stay on the work laptop, and a hub serves the external part over the tailnet. The app also becomes the control plane for jmarrero-bot, while the work itself stays public on the forge. The epic is [jmarrero-forge/tracker#8](https://github.com/jmarrero-forge/tracker/issues/8); the slices below are its sub-issues, in order.
+This is jmarrero's Workboard prototype from his handoff, now built and tested by CI on every pull request. The goal is one board for internal and external work: internal items stay on the work laptop, and a hub serves the external part. The hub is meant to be reached over the tailnet, which depends on Tailscale being allowed on the work laptop; that is still to be confirmed, and the hub's design is revisited if it isn't. The app also becomes the control plane for jmarrero-bot, while the work itself stays public on the forge. The epic is [jmarrero-forge/tracker#8](https://github.com/jmarrero-forge/tracker/issues/8); the slices below are its sub-issues, in order.
 
 1. [Outcome semantics: closed is not delivered](https://github.com/jmarrero-bot/work-tracker-poc/issues/2)
 2. [Connector plugins with per-connection zones](https://github.com/jmarrero-bot/work-tracker-poc/issues/3)
@@ -91,9 +91,19 @@ GitHub, Fedora Forge and Errata are supported as **manual source links**, not li
 
 - Select inbox items and click **New effort** to group them.
 - Open an item to change its effort or follow its source URL.
-- The Efforts view shows source-level progress and lets you attach ungrouped items.
+- The Efforts view shows delivery progress and lets you attach ungrouped items.
 - Add advisory or other work URLs with **Add source link**. They are clearly identified as manual.
-- Search and filter by service or attention category. Completed work remains available in the Completed filter.
+- Search and filter by service or attention category. Delivered and abandoned work remains available in its own filter.
+
+Closed is not delivered. Every item keeps its source's own status and URL, next to an outcome Workboard derives from it and the reason it was chosen:
+
+- **delivered**: a merged merge request, or a Jira issue resolved as Done, Fixed or a similar resolution;
+- **closed without delivery**: closed unmerged, or resolved as Won't Do, Duplicate, Not a Bug and the like;
+- **abandoned**: your decision, kept in Workboard;
+- **open**, in progress or waiting;
+- **unknown**: an item the source no longer shows to you.
+
+Effort progress counts only delivered items. Closed-without-delivery and unknown items need attention instead: once you have decided, mark the item abandoned, and link any rework to the effort. Abandoned items are no longer refreshed, so abandoning open or delivered work takes `--force`. Abandoned items leave the effort's total. A Jira issue in the Done category without a resolution counts as delivered. Finished Jira issues synced before outcomes existed are unknown until the next sync fetches their resolution. Manual links take an explicit outcome; their status text never implies one.
 
 CLI equivalents:
 
@@ -103,15 +113,18 @@ workboard effort 'Ship a fix' --note 'Upstream, downstream, release' --item ITEM
 workboard link ITEM_ID --effort EFFORT_ID
 workboard link ITEM_ID                         # ungroup
 workboard add --provider errata --key ADVISORY --title 'Ship advisory' --url https://errata.example.com/advisory/123 --status 'Needs validation' --action next
-workboard update ITEM_ID --status Released
+workboard update ITEM_ID --status Released --outcome delivered
+workboard abandon ITEM_ID                      # synced, closed without delivery or unknown; --undo reverts
 workboard disconnect CONNECTION_ID
 ```
 
-Source statuses are never changed through this app. Manual links are snapshots; edit their status in Workboard when the source changes. Sync is explicit: the page refreshes cached data every 30 seconds, but does not poll external services automatically.
+Source statuses are never changed through this app. Manual links are snapshots; edit their status and outcome in Workboard when the source changes. Sync is explicit: the page refreshes cached data every 30 seconds, but does not poll external services automatically.
 
 ## Authentication and storage
 
 The initial credential backend is a private local directory, **not encrypted at rest**. On Unix, the directory is mode `0700`; credential files and database are mode `0600`. Only connection metadata is stored in SQLite; tokens are separate files named by a validated UUID. Disconnect removes the credential and its source's cached items. Private filesystem permissions do not protect against programs running as the same user.
+
+A new version may upgrade the database when the service starts. Upgrades are one-way, so the service first copies `work.sqlite` to `work.vN.sqlite` in the same directory, N being the old schema version. To go back to an older version, stop the service and restore that copy as `work.sqlite`.
 
 The web client never receives provider credentials in API responses. Credentials entered in the connection dialog travel only to the local backend, are cleared from the form after saving/closing, and are not put in browser storage. The CLI calls the same API and reads a private service credential from the same data directory.
 
@@ -125,7 +138,7 @@ The credential handling follows the separation established in `jmarrero/atomic-s
 
 Connectors paginate inbox results. Items that were tracked before but no longer appear in the open inbox are fetched individually to detect completion or merge. Sync preserves manual effort assignments and commits each source's fetched item set transactionally. A source failure keeps its previous cache, records a visible error, and does not prevent other sources from syncing. The CLI exits unsuccessfully if any source sync fails. Rate limits are reported without an automatic retry loop.
 
-If a tracked item becomes inaccessible, the source sync fails and the previous cache remains visible; it does not infer that the item is complete. Manual links do not refresh automatically. GitLab pipelines, Jira release fields/blockers, automatic relationship suggestions, live Errata readiness, and hosted/team mode are not implemented yet.
+If a tracked item becomes inaccessible (HTTP 403 or 404), it is marked unknown with its last known status, never complete, and fetched again on the next sync. Other failures fail that source's sync and keep its previous cache. Manual links do not refresh automatically. GitLab pipelines, Jira release fields/blockers, automatic relationship suggestions, live Errata readiness, and hosted/team mode are not implemented yet.
 
 ## Verify
 
@@ -137,7 +150,7 @@ cargo test
 python3 tests/smoke.py target/debug/workboard
 ```
 
-The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, persistent grouping, source-link validation and secret file permissions.
+The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation and secret file permissions.
 
 See `docs/architecture.md` for the next implementation boundaries.
 
