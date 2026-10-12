@@ -32,11 +32,16 @@ def helper():
 
 
 def item(remote_id, outcome, action='next', reasons=()):
+    # An instance whose host starts with "marked-" marks all its work with
+    # its first label, so a test can look for that work where it shouldn't
+    # be. Otherwise every instance lists the same changes.
+    label = host.split('.')[0]
+    marked = label.startswith('marked-')
     return {
         'remote_id': remote_id,
-        'key': f'FF-{remote_id}',
-        'title': f'Fake change {remote_id}',
-        'url': f'https://forge.example/changes/{remote_id}',
+        'key': f'{label.upper() if marked else "FF"}-{remote_id}',
+        'title': f'{label.upper() + " " if marked else ""}Fake change {remote_id}',
+        'url': f'https://{host if marked else "forge.example"}/changes/{remote_id}',
         'status': outcome,
         'outcome': outcome,
         'outcome_reason': f'Fake forge says {outcome}',
