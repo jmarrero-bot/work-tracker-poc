@@ -78,9 +78,16 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         status, _, body = call('/api/items', 'POST', invalid, token=token)
         assert status == 200
         manual = json.loads(body)
+        assert manual['outcome'] == 'open'
+        def manual_item():
+            snapshot = json.loads(call('/api/snapshot', token=token)[2])
+            return snapshot, next(i for i in snapshot['items'] if i['id']==manual['id'])
+        # A manual outcome is explicit: status text alone never marks work delivered.
         subprocess.check_call(command + ['update',manual['id'],'--status','Released'], stdout=subprocess.DEVNULL)
-        snapshot = json.loads(call('/api/snapshot', token=token)[2])
-        assert next(i for i in snapshot['items'] if i['id']==manual['id'])['terminal']
+        assert manual_item()[1]['outcome'] == 'open'
+        subprocess.check_call(command + ['update',manual['id'],'--status','Released','--outcome','delivered'], stdout=subprocess.DEVNULL)
+        snapshot, item = manual_item()
+        assert item['status'] == 'Released' and item['outcome'] == 'delivered' and item['outcome_reason']
         assert token.encode() not in json.dumps(snapshot).encode()
         assert call('/api/connections','POST',{'provider':'jira','base_url':'https://jira.example.invalid','label':'Jira','token':''},token=token)[0] == 400
         if os.name == 'posix':
@@ -100,7 +107,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert call('/api/snapshot',token=token)[0] == 401
         snapshot = json.loads(call('/api/snapshot',token=fresh)[2])
         assert all(i['effort_id']==effort['id'] for i in snapshot['items'] if i['id'] in ['demo-4','demo-5'])
-        print('PASS: authentication, CSRF, host checks, CLI, grouping, rollback, source links, manual completion, permissions and restart persistence')
+        print('PASS: authentication, CSRF, host checks, CLI, grouping, rollback, source links, manual outcomes, permissions and restart persistence')
     finally:
         if process.poll() is None:
             process.terminate()

@@ -237,11 +237,7 @@ async fn manual(State(app): State<App>, Json(input): Json<ManualInput>) -> ApiRe
             .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| {
                 r.get(0)
             })?;
-    let terminal = matches!(
-        input.status.to_lowercase().as_str(),
-        "merged" | "closed" | "done" | "released"
-    );
-    let item = Item {
+    let mut item = Item {
         id: Uuid::new_v4().to_string(),
         connection_id: None,
         provider: input.provider,
@@ -250,12 +246,16 @@ async fn manual(State(app): State<App>, Json(input): Json<ManualInput>) -> ApiRe
         title: input.title.trim().into(),
         url,
         status: input.status,
-        terminal,
-        action: if terminal { "".into() } else { input.action },
+        outcome: Outcome::Open,
+        outcome_reason: String::new(),
+        action: input.action,
         updated_at: updated,
         effort_id: None,
+        abandoned_at: None,
         demo: false,
     };
+    // Manual outcomes are explicit; the status text never implies one.
+    item.set_outcome((input.outcome, input.outcome.manual_reason().into()));
     db.upsert_item(&item)?;
     Ok(Json(item))
 }
@@ -263,6 +263,8 @@ async fn manual(State(app): State<App>, Json(input): Json<ManualInput>) -> ApiRe
 struct StatusInput {
     status: String,
     action: String,
+    /// Unchanged when omitted.
+    outcome: Option<Outcome>,
 }
 async fn update_manual(
     State(app): State<App>,
@@ -288,15 +290,12 @@ async fn update_manual(
         bail_api("Synced statuses can only be updated in the source system")?
     }
     item.status = input.status.trim().into();
-    item.terminal = matches!(
-        item.status.to_lowercase().as_str(),
-        "merged" | "closed" | "done" | "released"
-    );
-    item.action = if item.terminal {
-        "".into()
-    } else {
-        input.action
+    item.action = input.action;
+    let derived = match input.outcome {
+        Some(outcome) if outcome != item.outcome => (outcome, outcome.manual_reason().into()),
+        _ => (item.outcome, std::mem::take(&mut item.outcome_reason)),
     };
+    item.set_outcome(derived);
     item.updated_at = db
         .sql
         .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| {

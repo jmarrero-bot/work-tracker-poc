@@ -1,6 +1,7 @@
 mod connectors;
 mod db;
 mod model;
+mod outcome;
 mod server;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -90,6 +91,9 @@ enum Command {
         status: String,
         #[arg(long, default_value = "next")]
         action: String,
+        /// What the work came to. The status text never implies one.
+        #[arg(long, value_enum, default_value_t = Outcome::Open)]
+        outcome: Outcome,
     },
     /// Update a manually tracked item's status; synced sources remain read-only.
     Update {
@@ -98,6 +102,9 @@ enum Command {
         status: String,
         #[arg(long, default_value = "next")]
         action: String,
+        /// What the work came to. Unchanged when omitted.
+        #[arg(long, value_enum)]
+        outcome: Option<Outcome>,
     },
     /// Print a source URL, or open it with the system browser.
     Open {
@@ -247,7 +254,8 @@ async fn main() -> Result<()> {
                 .items
                 .into_iter()
                 .filter(|i| {
-                    !i.terminal && (!next || matches!(i.action.as_str(), "next" | "review"))
+                    !i.outcome.is_settled()
+                        && (!next || matches!(i.action.as_str(), "next" | "review"))
                 })
                 .collect();
             if json {
@@ -298,7 +306,10 @@ async fn main() -> Result<()> {
                         "{}  {}  {}/{} complete",
                         e.id,
                         e.title,
-                        items.iter().filter(|i| i.terminal).count(),
+                        items
+                            .iter()
+                            .filter(|i| i.outcome == Outcome::Delivered)
+                            .count(),
                         items.len()
                     );
                     for i in items {
@@ -342,6 +353,7 @@ async fn main() -> Result<()> {
             url,
             status,
             action,
+            outcome,
         } => {
             let i: Item = request(
                 &client,
@@ -356,6 +368,7 @@ async fn main() -> Result<()> {
                     url,
                     status,
                     action,
+                    outcome,
                 })?),
             )
             .await?;
@@ -365,6 +378,7 @@ async fn main() -> Result<()> {
             item,
             status,
             action,
+            outcome,
         } => {
             let i: Item = request(
                 &client,
@@ -372,7 +386,7 @@ async fn main() -> Result<()> {
                 args.port,
                 reqwest::Method::PATCH,
                 &format!("items/{item}"),
-                Some(serde_json::json!({"status":status,"action":action})),
+                Some(serde_json::json!({"status":status,"action":action,"outcome":outcome})),
             )
             .await?;
             println!("{}  {}", i.id, i.status)
