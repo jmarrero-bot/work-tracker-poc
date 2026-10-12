@@ -522,15 +522,21 @@ async fn main() -> Result<()> {
                     .as_ref()
                     .map(|login| format!("  watching {login}"))
                     .unwrap_or_default();
+                let hub = if c.from_hub { "  from the hub" } else { "" };
                 println!(
-                    "{}  {}  {}  {}{}",
+                    "{}  {}  {}  {}{}{hub}",
                     c.id,
                     c.label,
                     c.account_name,
                     c.zone.label(),
                     watching,
                 );
-                println!("    {}", sync_status(&c, now));
+                let status = if c.from_hub {
+                    hub_sync_status(&c, now)
+                } else {
+                    sync_status(&c, now)
+                };
+                println!("    {status}");
             }
         }
         Command::Inbox { json } | Command::Next { json } => {
@@ -566,13 +572,14 @@ async fn main() -> Result<()> {
                         format!("  {}: {}", i.outcome.label(), i.outcome_reason)
                     };
                     println!(
-                        "{}  [{}] {}  {}{}{}{}",
+                        "{}  [{}] {}  {}{}{}{}{}",
                         i.id,
                         i.provider,
                         i.title,
                         i.status,
                         outcome,
                         if i.demo { " (demo)" } else { "" },
+                        if i.from_hub { "  (from the hub)" } else { "" },
                         staleness(i.stale, i.synced_at, now)
                     );
                 }
@@ -631,10 +638,11 @@ async fn main() -> Result<()> {
             } else {
                 for e in efforts {
                     println!(
-                        "{}  {}  {}",
+                        "{}  {}  {}{}",
                         e.effort.id,
                         e.effort.title,
-                        e.progress.summary()
+                        e.progress.summary(),
+                        if e.from_hub { "  (from the hub)" } else { "" },
                     );
                     for i in items_of(&s.items, e) {
                         println!(
@@ -900,6 +908,19 @@ fn print_hub(status: &hub::Status, now: Timestamp) {
     };
     println!("    {line}");
 }
+/// How the hub's connection `c` was syncing on the hub, as of the last pull.
+fn hub_sync_status(c: &Connection, now: Timestamp) -> String {
+    let last = c.sync.last_success.map_or("never synced".into(), |t| {
+        format!("last synced {}", relative(t, now))
+    });
+    let stale = if c.schedule.stale { "Stale: " } else { "" };
+    let failed = if c.sync.error_kind.is_some() {
+        "; its last sync there failed"
+    } else {
+        ""
+    };
+    format!("{stale}Synced by the hub, {last}{failed}; read-only here")
+}
 /// How a connection's syncs are going, as of `now`: when it last synced and
 /// syncs next, how it fails, or that it needs the person.
 fn sync_status(c: &Connection, now: Timestamp) -> String {
@@ -977,12 +998,16 @@ fn print_rows(heading: &str, rows: &[mine::Row], now: Timestamp) {
             })
             .collect();
         println!("  [{}] {}  {}", r.provider, r.key, r.title);
+        let zone = if r.from_hub {
+            "external, from the hub"
+        } else {
+            r.zone.label()
+        };
         println!(
-            "      {}  ·  {}  ·  {}  ·  {}  ·  {}{}",
+            "      {}  ·  {}  ·  {}  ·  {zone}  ·  {}{}",
             waits_on.join("; "),
             r.status,
             r.outcome.label(),
-            r.zone.label(),
             r.url,
             staleness(r.stale, r.synced_at, now)
         );

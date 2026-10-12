@@ -309,6 +309,7 @@ mod tests {
                 error: Some(format!("{INTERNAL} error message {n}")),
                 held_until: None,
             },
+            from_hub: false,
         }
     }
     /// An item of `connection`, or a manual one, whose row says `zone`.
@@ -343,6 +344,7 @@ mod tests {
             reasons: vec![],
             synced_at: None,
             stale: false,
+            from_hub: false,
         }
     }
     /// An effort whose title is tagged internal unless it's shared.
@@ -370,6 +372,7 @@ mod tests {
                         .map(|i| i.outcome),
                 ),
                 effort,
+                from_hub: false,
             })
             .collect();
         Snapshot {

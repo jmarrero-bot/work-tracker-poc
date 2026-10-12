@@ -18,6 +18,7 @@ use crate::{
     db::Db,
     hub::{self, Pull},
     model::{Connection, ErrorKind, Item, Schedule, Snapshot, SyncState, WatchList},
+    zone::ExternalSnapshot,
 };
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -635,27 +636,32 @@ impl Scheduler {
         }
         Ok(())
     }
-    /// How the pulls from the hub are going, if one is set. Its work is
-    /// stale when the last pull is too old, as a connection's, and also as
-    /// soon as a pull fails: the hub's work is never shown as current while
-    /// the hub can't be reached.
+    /// How the pulls from the hub are going, if one is set.
     pub fn hub_status(&self) -> Result<Option<hub::Status>> {
+        Ok(self.hub_view()?.map(|(status, _)| status))
+    }
+    /// How the pulls from the hub are going, if one is set, and the last
+    /// export they read. Its work is stale when the last pull is too old,
+    /// as a connection's, and also as soon as a pull fails: the hub's work
+    /// is never shown as current while the hub can't be reached.
+    pub fn hub_view(&self) -> Result<Option<(hub::Status, Option<ExternalSnapshot>)>> {
         let Some(link) = self.db().hub()? else {
             return Ok(None);
         };
         let mut job = link.as_job();
         self.annotate(std::slice::from_mut(&mut job));
-        let snapshot = link.snapshot.as_ref();
-        Ok(Some(hub::Status {
-            url: link.url.clone(),
+        let snapshot = link.snapshot;
+        let status = hub::Status {
+            url: link.url,
             schedule: Schedule {
                 stale: job.schedule.stale || link.sync.error.is_some(),
                 ..job.schedule
             },
             sync: link.sync,
-            connections: snapshot.map_or(0, |s| s.connections.len()),
-            items: snapshot.map_or(0, |s| s.items.len()),
-        }))
+            connections: snapshot.as_ref().map_or(0, |s| s.connections.len()),
+            items: snapshot.as_ref().map_or(0, |s| s.items.len()),
+        };
+        Ok(Some((status, snapshot)))
     }
     /// One sync of connection `id`, start to end: what it found and its
     /// state are saved together once it is processed, or, if it failed,

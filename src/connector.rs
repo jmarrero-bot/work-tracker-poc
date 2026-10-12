@@ -411,6 +411,7 @@ pub fn to_item(c: &Connection, kind: &str, remote: RemoteItem) -> ConnectorResul
         reasons,
         synced_at: None,
         stale: false,
+        from_hub: false,
     };
     item.set_outcome((remote.outcome, remote.outcome_reason));
     Ok(item)

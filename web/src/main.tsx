@@ -76,6 +76,8 @@ type Item = {
   synced_at: string | null;
   // Too long ago for it to be current.
   stale: boolean;
+  // It came from the hub, and is read-only here.
+  from_hub: boolean;
 };
 // One thing that waits in the Mine view, once, with every reason.
 type MineRow = {
@@ -103,6 +105,8 @@ type MineRow = {
   // any of them is stale.
   synced_at: string | null;
   stale: boolean;
+  // Only the hub found it: read-only here.
+  from_hub: boolean;
 };
 // A watch list its last sync couldn't update.
 type WatchError = { connection_id: string; login: string; error: string };
@@ -128,6 +132,18 @@ type Connection = {
   sync_interval: number | null;
   sync: SyncState;
   schedule: Schedule;
+  // The hub's, shown read-only here: its sync is the hub's, as of the
+  // last pull.
+  from_hub: boolean;
+};
+// How a companion's pulls from its hub are going. Its schedule is stale
+// as soon as a pull fails.
+type HubStatus = {
+  url: string;
+  sync: SyncState;
+  schedule: Schedule;
+  connections: number;
+  items: number;
 };
 // How a connection's syncs are scheduled now.
 type Schedule = {
@@ -168,6 +184,8 @@ type Effort = {
   // Whether the title may also be shown on the hub.
   share_title: boolean;
   progress: Progress;
+  // It came from the hub, and is read-only here.
+  from_hub: boolean;
 };
 // A person's own service, or a hub, which keeps external work only.
 type Mode = "local" | "hub";
@@ -176,6 +194,8 @@ type Snapshot = {
   connections: Connection[];
   efforts: Effort[];
   mode: Mode;
+  // The hub this companion pulls from, if one is set.
+  hub: HubStatus | null;
 };
 const providers: Record<
   Provider,
@@ -254,6 +274,11 @@ function every(seconds: number) {
 // How a connection's syncs are going, and whether that needs attention.
 function syncStatus(c: Connection): { text: string; attention: boolean } {
   const s = c.sync;
+  if (c.from_hub)
+    return {
+      text: `${c.schedule.stale ? "Stale: synced" : "Synced"} by the hub, ${s.last_success ? `last ${relative(s.last_success)}` : "never yet"}${s.error_kind ? "; its last sync there failed" : ""}. Read-only here; manage it on the hub.`,
+      attention: c.schedule.stale || s.error_kind !== null,
+    };
   const last = s.last_success
     ? `${c.schedule.stale ? "Stale: last" : "Last"} synced ${relative(s.last_success)}.`
     : "Never synced.";
@@ -282,31 +307,58 @@ function syncStatus(c: Connection): { text: string; attention: boolean } {
     attention: true,
   };
 }
+// How the pulls from the hub are going.
+function hubStatusText(h: HubStatus): string {
+  const last = h.sync.last_success
+    ? `Last pulled ${relative(h.sync.last_success)}.`
+    : "Never pulled.";
+  if (h.schedule.needs_user)
+    return `Needs you: ${h.sync.error ?? "the hub refused the token"}. Pulls stopped until you run workboard hub set with its current companion token. ${last}`;
+  if (h.sync.error)
+    return `${h.sync.error}. Its work is stale until a pull works again. ${last}`;
+  return `${h.schedule.stale ? "Stale: " : ""}${last}`;
+}
+function hubAttention(h: HubStatus): boolean {
+  return h.schedule.stale || h.schedule.needs_user;
+}
 // How many of its intervals after its last success a connection's items
 // are stale, as the service decides.
 const STALE_INTERVALS = 3;
 // Whether data last synced at `at` is past the stale threshold of
-// connection `c` at `now`.
-function pastThreshold(c: Connection, at: string | null, now: number) {
+// something that syncs every `interval` seconds, at `now`.
+function pastThreshold(interval: number, at: string | null, now: number) {
   return (
-    !at ||
-    now - new Date(at).getTime() >
-      STALE_INTERVALS * c.schedule.interval_secs * 1000
+    !at || now - new Date(at).getTime() > STALE_INTERVALS * interval * 1000
   );
 }
 // The snapshot as of `now`. The service marks staleness when the page
 // fetches; this keeps the marks true while the page shows what it fetched:
 // everything synced is stale once the service can't be reached, and a
-// connection's items once its last success is past the threshold.
+// connection's items once its last success is past the threshold. The
+// hub's work is stale once its last pull is: a hub connection's own sync
+// time is the hub's, whose interval isn't known here.
 function age(d: Snapshot, offline: boolean, now: number): Snapshot {
+  const hubStale =
+    offline ||
+    !d.hub ||
+    d.hub.schedule.stale ||
+    pastThreshold(d.hub.schedule.interval_secs, d.hub.sync.last_success, now);
   const stale = new Map(
     d.connections.map((c) => [
       c.id,
-      offline || c.schedule.stale || pastThreshold(c, c.sync.last_success, now),
+      c.from_hub
+        ? hubStale || c.schedule.stale
+        : offline ||
+          c.schedule.stale ||
+          pastThreshold(c.schedule.interval_secs, c.sync.last_success, now),
     ]),
   );
   return {
     ...d,
+    hub: d.hub && {
+      ...d.hub,
+      schedule: { ...d.hub.schedule, stale: hubStale },
+    },
     connections: d.connections.map((c) => ({
       ...c,
       schedule: { ...c.schedule, stale: stale.get(c.id) ?? true },
@@ -336,8 +388,13 @@ function ageMine(
       offline ||
       r.waits_on.some((w) => {
         const c = byId.get(w.connection_id);
+        // A hub connection is aged by the hub's pulls, in `age`.
         return (
-          w.stale || !c || c.schedule.stale || pastThreshold(c, w.synced_at, now)
+          w.stale ||
+          !c ||
+          c.schedule.stale ||
+          (!c.from_hub &&
+            pastThreshold(c.schedule.interval_secs, w.synced_at, now))
         );
       }),
   });
@@ -475,6 +532,11 @@ function MineList({
               <em className={`zone-tag ${r.zone}`}>
                 {r.zone === "external" ? "External" : "Internal"}
               </em>
+              {r.from_hub && (
+                <em className="zone-tag hub" title="From the hub: read-only here">
+                  Hub
+                </em>
+              )}
               <a
                 className="open-source"
                 href={r.url}
@@ -498,6 +560,7 @@ function App() {
     connections: [],
     efforts: [],
     mode: "local",
+    hub: null,
   });
   const [page, setPage] = useState<
     "inbox" | "mine" | "efforts" | "connections"
@@ -1223,6 +1286,12 @@ function App() {
                         <input
                           type="checkbox"
                           aria-label={`Select ${i.title}`}
+                          disabled={i.from_hub}
+                          title={
+                            i.from_hub
+                              ? "From the hub: read-only here"
+                              : undefined
+                          }
                           checked={selected.includes(i.id)}
                           onChange={(e) =>
                             setSelected((s) =>
@@ -1254,6 +1323,12 @@ function App() {
                             {!i.connection_id && !i.demo && (
                               <>
                                 <span className="meta-dot">·</span>Manual
+                              </>
+                            )}
+                            {i.from_hub && (
+                              <>
+                                <span className="meta-dot">·</span>From the
+                                hub
                               </>
                             )}
                             <Stale item={i} />
@@ -1342,7 +1417,7 @@ function App() {
                     <div className="effort-top">
                       <span className="effort-label">
                         <Layers size={14} />
-                        EFFORT
+                        {e.from_hub ? "EFFORT · FROM THE HUB" : "EFFORT"}
                       </span>
                       <span>
                         {p.delivered}/{p.total} delivered
@@ -1350,18 +1425,26 @@ function App() {
                     </div>
                     <h2>{e.title}</h2>
                     {e.note && <p>{e.note}</p>}
-                    <label className="zone-choice">
-                      <input
-                        type="checkbox"
-                        checked={e.share_title}
-                        onChange={(ev) => shareTitle(e, ev.target.checked)}
-                      />
-                      <span>
-                        Show this title on the hub with the effort's external
-                        work. Otherwise it appears there as a neutral label.
-                        The note always stays on this machine.
-                      </span>
-                    </label>
+                    {e.from_hub ? (
+                      <p>
+                        The hub's effort, over its external work only.
+                        Read-only here.
+                      </p>
+                    ) : (
+                      <label className="zone-choice">
+                        <input
+                          type="checkbox"
+                          checked={e.share_title}
+                          onChange={(ev) => shareTitle(e, ev.target.checked)}
+                        />
+                        <span>
+                          Show this title on the hub with the effort's
+                          external work. Otherwise it appears there as a
+                          neutral label. The note always stays on this
+                          machine.
+                        </span>
+                      </label>
+                    )}
                     <div className="progress-track">
                       <div
                         style={{
@@ -1385,20 +1468,22 @@ function App() {
                       >
                         {progressText(p)}
                       </span>
-                      <select
-                        aria-label={`Add an item to ${e.title}`}
-                        value=""
-                        onChange={(ev) => link(ev.target.value, e.id)}
-                      >
-                        <option value="">Add item…</option>
-                        {data.items
-                          .filter((i) => !i.effort_id)
-                          .map((i) => (
-                            <option key={i.id} value={i.id}>
-                              {i.title}
-                            </option>
-                          ))}
-                      </select>
+                      {!e.from_hub && (
+                        <select
+                          aria-label={`Add an item to ${e.title}`}
+                          value=""
+                          onChange={(ev) => link(ev.target.value, e.id)}
+                        >
+                          <option value="">Add item…</option>
+                          {data.items
+                            .filter((i) => !i.effort_id && !i.from_hub)
+                            .map((i) => (
+                              <option key={i.id} value={i.id}>
+                                {i.title}
+                              </option>
+                            ))}
+                        </select>
+                      )}
                     </div>
                   </article>
                 );
@@ -1419,6 +1504,16 @@ function App() {
                   {syncing ? "Syncing…" : "Sync all"}
                 </button>
               </div>
+              {data.hub && (
+                <div className="connection-intro">
+                  <Plug size={20} />
+                  <p className={hubAttention(data.hub) ? "danger" : undefined}>
+                    <strong>Hub</strong> {data.hub.url} ·{" "}
+                    {data.hub.items} items of {data.hub.connections}{" "}
+                    connections, read-only here. {hubStatusText(data.hub)}
+                  </p>
+                </div>
+              )}
               <div className="connection-grid">
                 {names.map((p) => {
                   const connections = data.connections.filter(
@@ -1445,6 +1540,14 @@ function App() {
                               <em className={`zone-tag ${c.zone}`}>
                                 {c.zone === "external" ? "External" : "Internal"}
                               </em>
+                              {c.from_hub && (
+                                <em
+                                  className="zone-tag hub"
+                                  title="The hub's connection, read-only here"
+                                >
+                                  Hub
+                                </em>
+                              )}
                               {c.watch_user && (
                                 <em
                                   className="zone-tag watching"
@@ -1462,7 +1565,7 @@ function App() {
                             >
                               {syncStatus(c).text}
                             </p>
-                            {c.schedule.needs_user && (
+                            {!c.from_hub && c.schedule.needs_user && (
                               <button
                                 className="quiet"
                                 onClick={() => verify(c)}
@@ -1472,13 +1575,15 @@ function App() {
                                 Verify again
                               </button>
                             )}
-                            <button
-                              className="quiet danger"
-                              onClick={() => disconnect(c)}
-                            >
-                              <Unplug size={14} />
-                              Disconnect
-                            </button>
+                            {!c.from_hub && (
+                              <button
+                                className="quiet danger"
+                                onClick={() => disconnect(c)}
+                              >
+                                <Unplug size={14} />
+                                Disconnect
+                              </button>
+                            )}
                           </div>
                         ))
                       ) : (
@@ -1579,15 +1684,19 @@ function App() {
             <dd>
               {detailItem.demo
                 ? "Illustrative demo item"
-                : detailItem.connection_id
-                  ? "Synced from source"
-                  : "Manual source link"}
+                : detailItem.from_hub
+                  ? "Synced by the hub; read-only here"
+                  : detailItem.connection_id
+                    ? "Synced from source"
+                    : "Manual source link"}
             </dd>
             <dt>Zone</dt>
             <dd>
-              {detailItem.zone === "external"
-                ? "External: may also be shown on the hub"
-                : "Internal: shown only on this machine"}
+              {detailItem.from_hub
+                ? "External, from the hub"
+                : detailItem.zone === "external"
+                  ? "External: may also be shown on the hub"
+                  : "Internal: shown only on this machine"}
             </dd>
             <dt>Last source update</dt>
             <dd>
@@ -1596,21 +1705,33 @@ function App() {
                 : "Unknown"}
             </dd>
           </dl>
-          <label className="form-field">
-            Effort
-            <select
-              value={detailItem.effort_id ?? ""}
-              onChange={(e) => link(detailItem.id, e.target.value)}
-            >
-              <option value="">Ungrouped</option>
-              {data.efforts.map((e) => (
-                <option key={e.id} value={e.id}>
-                  {e.title}
-                </option>
-              ))}
-            </select>
-          </label>
+          {detailItem.from_hub ? (
+            <p className="detail-note">
+              {detailItem.effort_id
+                ? `In the hub's effort ${data.efforts.find((e) => e.id === detailItem.effort_id)?.title ?? ""}. `
+                : ""}
+              Group it, or mark it abandoned, on the hub.
+            </p>
+          ) : (
+            <label className="form-field">
+              Effort
+              <select
+                value={detailItem.effort_id ?? ""}
+                onChange={(e) => link(detailItem.id, e.target.value)}
+              >
+                <option value="">Ungrouped</option>
+                {data.efforts
+                  .filter((e) => !e.from_hub)
+                  .map((e) => (
+                    <option key={e.id} value={e.id}>
+                      {e.title}
+                    </option>
+                  ))}
+              </select>
+            </label>
+          )}
           {detailItem.connection_id &&
+            !detailItem.from_hub &&
             (needsDecision(detailItem) || detailItem.abandoned_at) && (
             <div className="manual-edit">
               <p className="detail-note">

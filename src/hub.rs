@@ -11,8 +11,11 @@
 use crate::{
     connector::{BoxFuture, ConnectorError, ConnectorResult, Credential, ErrorKind, Requests},
     connectors::{self, http_error, parse_json, read_body},
-    model::{valid_provider, Connection, Schedule, SyncState},
-    zone::{ExternalSnapshot, Zone},
+    model::{
+        valid_provider, Connection, Effort, EffortView, Item, Progress, Schedule, Snapshot,
+        SyncState,
+    },
+    zone::{ExternalConnection, ExternalSnapshot, Zone},
 };
 use anyhow::{bail, Context, Result};
 use reqwest::{
@@ -21,13 +24,16 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Mutex, PoisonError},
 };
 use url::Url;
 
 /// How the hub is named in messages and reports.
 pub const LABEL: &str = "Hub";
+/// What the IDs of the hub's work start with on its companion, so they never
+/// meet the companion's own.
+pub const PREFIX: &str = "hub:";
 /// Where a hub serves its external export, under its address.
 const EXPORT: &str = "api/export/external";
 const ACCEPT: &str = "application/json";
@@ -289,6 +295,131 @@ pub struct Status {
     pub items: usize,
 }
 
+/// Whether `id` names the hub's work, read-only on its companion.
+pub fn is_from_hub(id: &str) -> bool {
+    id.starts_with(PREFIX)
+}
+
+/// Whether the companion's own connection `mine` is to the same account on
+/// the same instance as the hub's `theirs`. The export carries the
+/// account's name, not its ID, so the name decides, as the instance shows
+/// it, without regard to case.
+fn same_account(mine: &Connection, theirs: &ExternalConnection) -> bool {
+    !mine.from_hub
+        && mine.provider == theirs.provider
+        && mine.base_url == theirs.base_url
+        && mine.account_name.eq_ignore_ascii_case(&theirs.account_name)
+}
+
+/// Add the hub's work in `export`, as of the pulls in `status`, to the
+/// companion's own `snapshot`, marked as the hub's: its connections, items
+/// and efforts, their IDs starting with [`PREFIX`].
+///
+/// A hub connection to an account the companion also connects is left out,
+/// with its items, so nothing shows twice: the companion's own copy is the
+/// one shown, being synced right here. Everything from the hub is as fresh
+/// as the hub's connection that synced it was at the last pull, and stale
+/// whenever the hub's work is.
+///
+/// The result is for showing on the companion only. It never goes into the
+/// companion's own export, which is built from its own work alone.
+pub fn merge(snapshot: &mut Snapshot, export: &ExternalSnapshot, status: &Status) {
+    let id = |id: &str| format!("{PREFIX}{id}");
+    let shown: Vec<&ExternalConnection> = export
+        .connections
+        .iter()
+        .filter(|theirs| {
+            !snapshot
+                .connections
+                .iter()
+                .any(|mine| same_account(mine, theirs))
+        })
+        .collect();
+    let fresh: HashMap<&str, _> = shown
+        .iter()
+        .map(|c| {
+            (
+                c.id.as_str(),
+                (c.last_success, c.stale || status.schedule.stale),
+            )
+        })
+        .collect();
+    for c in &shown {
+        snapshot.connections.push(Connection {
+            id: id(&c.id),
+            provider: c.provider.clone(),
+            label: c.label.clone(),
+            base_url: c.base_url.clone(),
+            account_id: String::new(),
+            account_name: c.account_name.clone(),
+            zone: Zone::External,
+            watch_user: None,
+            sync_interval: None,
+            sync: SyncState {
+                last_success: c.last_success,
+                error_kind: c.error_kind,
+                error: c
+                    .error_kind
+                    .map(|_| "The hub's last sync of it failed".to_string()),
+                ..SyncState::default()
+            },
+            schedule: Schedule {
+                interval_secs: status.schedule.interval_secs,
+                running: false,
+                needs_user: false,
+                stale: fresh[c.id.as_str()].1,
+            },
+            from_hub: true,
+        });
+    }
+    for i in &export.items {
+        let Some(&(synced_at, stale)) = fresh.get(i.connection_id.as_str()) else {
+            continue;
+        };
+        snapshot.items.push(Item {
+            id: id(&i.id),
+            connection_id: Some(id(&i.connection_id)),
+            provider: i.provider.clone(),
+            remote_id: i.key.clone(),
+            key: i.key.clone(),
+            title: i.title.clone(),
+            url: i.url.clone(),
+            status: i.status.clone(),
+            outcome: i.outcome,
+            outcome_reason: i.outcome_reason.clone(),
+            action: i.action.clone(),
+            updated_at: i.updated_at.clone(),
+            effort_id: i.effort_id.as_deref().map(id),
+            abandoned_at: None,
+            demo: false,
+            zone: Zone::External,
+            reasons: i.reasons.clone(),
+            synced_at,
+            stale,
+            from_hub: true,
+        });
+    }
+    for e in &export.efforts {
+        let p = &e.progress;
+        snapshot.efforts.push(EffortView {
+            effort: Effort {
+                id: id(&e.id),
+                title: e.title.clone(),
+                note: String::new(),
+                share_title: false,
+            },
+            progress: Progress {
+                delivered: p.delivered,
+                total: p.total,
+                open: p.open,
+                needs_attention: p.needs_attention,
+                abandoned: p.abandoned,
+            },
+            from_hub: true,
+        });
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -298,7 +429,7 @@ pub mod tests {
     };
     use axum::{
         extract::State,
-        http::{HeaderMap as Headers, Method as AxumMethod, StatusCode as Status, Uri},
+        http::{HeaderMap as Headers, Method as AxumMethod, StatusCode as Code, Uri},
         response::{IntoResponse, Response},
         Router,
     };
@@ -351,6 +482,147 @@ pub mod tests {
                 },
             }],
         }
+    }
+
+    fn status(stale: bool) -> Status {
+        Status {
+            url: "https://hub.example.ts.net/".into(),
+            sync: SyncState::default(),
+            schedule: Schedule {
+                interval_secs: 300,
+                running: false,
+                needs_user: false,
+                stale,
+            },
+            connections: 1,
+            items: 2,
+        }
+    }
+
+    /// The companion's own connection to `account` on GitHub.
+    fn own(account: &str) -> Connection {
+        Connection {
+            id: "c0ffee00-0000-4000-8000-000000000001".into(),
+            provider: "github".into(),
+            base_url: "https://github.com/".into(),
+            account_name: account.into(),
+            ..Connection::default()
+        }
+    }
+
+    #[test]
+    fn the_hubs_work_joins_the_board_marked_and_read_only() {
+        let mut board = Snapshot {
+            connections: vec![own("me")],
+            items: vec![],
+            efforts: vec![],
+        };
+        merge(&mut board, &export(2), &status(false));
+        let [_, c] = &board.connections[..] else {
+            panic!("{board:?}")
+        };
+        assert_eq!(
+            (c.id.as_str(), c.from_hub, c.zone, c.schedule.stale),
+            ("hub:hub-connection", true, Zone::External, false)
+        );
+        let items: Vec<_> = board
+            .items
+            .iter()
+            .map(|i| {
+                (
+                    i.id.as_str(),
+                    i.connection_id.as_deref(),
+                    i.effort_id.as_deref(),
+                    i.from_hub,
+                )
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                (
+                    "hub:hub-connection:github:0",
+                    Some("hub:hub-connection"),
+                    Some("hub:hub-effort"),
+                    true
+                ),
+                (
+                    "hub:hub-connection:github:1",
+                    Some("hub:hub-connection"),
+                    None,
+                    true
+                ),
+            ]
+        );
+        assert!(board.items.iter().all(|i| is_from_hub(&i.id) && !i.stale));
+        assert_eq!(
+            board.items[0].synced_at,
+            export(0).connections[0].last_success
+        );
+        let [e] = &board.efforts[..] else { panic!() };
+        assert_eq!(
+            (e.effort.id.as_str(), e.from_hub, e.progress.total),
+            ("hub:hub-effort", true, 1)
+        );
+        // The Mine view shows them as the hub's account's.
+        let view = crate::mine::mine(&board, &[]);
+        assert_eq!(view.mine.len(), 2);
+        assert!(view
+            .mine
+            .iter()
+            .all(|r| r.from_hub && r.waits_on[0].account == "someone"));
+    }
+
+    #[test]
+    fn the_hubs_work_is_stale_whenever_the_hub_is() {
+        for (hub_stale, connection_stale) in [(false, false), (true, false), (false, true)] {
+            let mut export = export(1);
+            export.connections[0].stale = connection_stale;
+            let mut board = Snapshot {
+                connections: vec![],
+                items: vec![],
+                efforts: vec![],
+            };
+            merge(&mut board, &export, &status(hub_stale));
+            let stale = hub_stale || connection_stale;
+            assert_eq!(board.connections[0].schedule.stale, stale);
+            assert_eq!(board.items[0].stale, stale);
+        }
+    }
+
+    #[test]
+    fn an_account_the_companion_connects_too_shows_once_its_own_copy() {
+        // (the companion's own account, whether the hub's copy shows)
+        for (account, shown) in [
+            ("someone", false),
+            ("SomeOne", false),
+            ("someone-else", true),
+        ] {
+            let mut board = Snapshot {
+                connections: vec![own(account)],
+                items: vec![],
+                efforts: vec![],
+            };
+            merge(&mut board, &export(2), &status(false));
+            let from_hub = |n: usize| if shown { n } else { 0 };
+            assert_eq!(
+                board.connections.iter().filter(|c| c.from_hub).count(),
+                from_hub(1),
+                "{account}"
+            );
+            assert_eq!(board.items.len(), from_hub(2), "{account}");
+        }
+        // Another instance is another account.
+        let mut board = Snapshot {
+            connections: vec![Connection {
+                base_url: "https://github.example.com/".into(),
+                ..own("someone")
+            }],
+            items: vec![],
+            efforts: vec![],
+        };
+        merge(&mut board, &export(2), &status(false));
+        assert_eq!(board.items.len(), 2);
     }
 
     #[test]
@@ -527,12 +799,12 @@ pub mod tests {
         // (answer, kind)
         let cases: Vec<(Response, ErrorKind)> = vec![
             (
-                (Status::FOUND, [("location", "https://elsewhere.example/")]).into_response(),
+                (Code::FOUND, [("location", "https://elsewhere.example/")]).into_response(),
                 ErrorKind::Invalid,
             ),
-            (Status::UNAUTHORIZED.into_response(), ErrorKind::Auth),
-            (Status::FORBIDDEN.into_response(), ErrorKind::Auth),
-            (Status::BAD_GATEWAY.into_response(), ErrorKind::Transient),
+            (Code::UNAUTHORIZED.into_response(), ErrorKind::Auth),
+            (Code::FORBIDDEN.into_response(), ErrorKind::Auth),
+            (Code::BAD_GATEWAY.into_response(), ErrorKind::Transient),
             (axum::Json(internal).into_response(), ErrorKind::Invalid),
             (axum::Json(stray).into_response(), ErrorKind::Invalid),
             ("not json".into_response(), ErrorKind::Invalid),
@@ -544,7 +816,7 @@ pub mod tests {
                     .lock()
                     .unwrap()
                     .take()
-                    .unwrap_or_else(|| Status::GONE.into_response())
+                    .unwrap_or_else(|| Code::GONE.into_response())
             })
             .await;
             let error = HubClient::new()

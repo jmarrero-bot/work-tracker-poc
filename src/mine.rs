@@ -47,6 +47,8 @@ pub struct Row {
     /// Whether any of them is stale, each by its own interval, so it can't
     /// be shown as current.
     pub stale: bool,
+    /// Only the hub found it: it is read-only here.
+    pub from_hub: bool,
 }
 
 /// Why a connection's watch list couldn't be updated by its last sync.
@@ -95,6 +97,7 @@ fn rows<'a>(found: impl IntoIterator<Item = (&'a Item, &'a str)>) -> Vec<Row> {
             waits_on: vec![],
             synced_at: item.synced_at,
             stale: false,
+            from_hub: true,
         });
         if item.zone == Zone::Internal {
             row.zone = Zone::Internal;
@@ -102,6 +105,7 @@ fn rows<'a>(found: impl IntoIterator<Item = (&'a Item, &'a str)>) -> Vec<Row> {
         // As fresh as the stalest connection that found it.
         row.synced_at = row.synced_at.zip(item.synced_at).map(|(a, b)| a.min(b));
         row.stale |= item.stale;
+        row.from_hub &= item.from_hub;
         let mut reasons = item.reasons.clone();
         reasons.sort();
         reasons.dedup();
@@ -199,6 +203,7 @@ mod tests {
             reasons,
             synced_at: None,
             stale: false,
+            from_hub: false,
         }
     }
     fn snapshot(items: Vec<Item>) -> Snapshot {
