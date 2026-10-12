@@ -16,7 +16,7 @@ use crate::{
     model::{is_gitlab, valid_provider},
 };
 use anyhow::{bail, Context, Result};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
 use std::{path::Path, sync::Arc, time::Duration};
 use url::Url;
@@ -128,6 +128,37 @@ fn http_error(status: StatusCode) -> ConnectorError {
         _ => (ErrorKind::Invalid, "Instance API request failed"),
     };
     ConnectorError::new(kind, format!("{reason} (HTTP {})", status.as_u16()))
+}
+
+/// Largest answer read from a source, in bytes.
+const MAX_BODY: usize = 16 * 1024 * 1024;
+
+/// A response's body, read up to [`MAX_BODY`]. Its text is never shown,
+/// since an error body can echo the request.
+async fn read_body(source: &str, mut response: Response) -> ConnectorResult<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        ConnectorError::new(
+            ErrorKind::Transient,
+            format!("{source}'s answer was cut short"),
+        )
+    })? {
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(ConnectorError::invalid(format!(
+                "{source}'s answer was too large"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn parse_json(source: &str, body: &[u8]) -> ConnectorResult<Value> {
+    serde_json::from_slice(body).map_err(|_| {
+        ConnectorError::invalid(format!(
+            "{source} did not return the expected JSON response"
+        ))
+    })
 }
 
 /// How a source takes its credential.

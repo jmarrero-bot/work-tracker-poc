@@ -11,12 +11,12 @@
 
 use crate::{
     connector::{ConnectorError, ConnectorResult, ErrorKind, Requests, Target},
-    connectors::{client, http_error},
+    connectors::{client, http_error, parse_json, read_body},
 };
 use graphql_parser::query::{parse_query, Definition, OperationDefinition};
 use reqwest::{
     header::{self, HeaderMap, HeaderValue},
-    Client, Method, Request, Response, StatusCode,
+    Client, Method, Request, StatusCode,
 };
 use serde_json::{Map, Value};
 use std::{
@@ -31,8 +31,8 @@ use url::Url;
 const API_VERSION: &str = "2022-11-28";
 const ACCEPT: &str = "application/vnd.github+json";
 const USER_AGENT: &str = concat!("workboard/", env!("CARGO_PKG_VERSION"));
-/// Largest answer read from GitHub, in bytes.
-const MAX_BODY: usize = 16 * 1024 * 1024;
+/// How GitHub is named in messages.
+const SOURCE: &str = "GitHub";
 /// Most answers kept for conditional requests, across all connections.
 const MAX_CACHED: usize = 512;
 /// Most bytes of answers kept for conditional requests, across all
@@ -390,7 +390,7 @@ impl ReadOnly {
         let answer = Answer {
             status: response.status(),
             headers: response.headers().clone(),
-            body: read(response).await?,
+            body: read_body(SOURCE, response).await?,
         };
         if let Some((limit, until)) = used_up(&answer, resource) {
             self.memory.block(target, limit, until);
@@ -440,7 +440,7 @@ impl ReadOnly {
                 Ok(Got::Found(body))
             }
             s if s.is_success() => {
-                let body = json(&answer.body)?;
+                let body = parse_json(SOURCE, &answer.body)?;
                 if let Some(etag) = answer.headers.get(header::ETAG) {
                     let size = answer.body.len();
                     self.memory.cache(target, &url, etag.clone(), &body, size);
@@ -499,7 +499,7 @@ impl ReadOnly {
         if !answer.status.is_success() {
             return Err(http_error(answer.status));
         }
-        let mut answer = json(&answer.body)?;
+        let mut answer = parse_json(SOURCE, &answer.body)?;
         if answer["errors"].as_array().is_some_and(|e| !e.is_empty()) {
             return Err(ConnectorError::invalid(
                 "GitHub's GraphQL API answered with errors",
@@ -507,28 +507,6 @@ impl ReadOnly {
         }
         Ok(answer.get_mut("data").map(Value::take).unwrap_or_default())
     }
-}
-
-/// A response's body, read up to [`MAX_BODY`]. Its text is never shown,
-/// since an error body can echo the request.
-async fn read(mut response: Response) -> ConnectorResult<Vec<u8>> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| ConnectorError::new(ErrorKind::Transient, "GitHub's answer was cut short"))?
-    {
-        if body.len() + chunk.len() > MAX_BODY {
-            return Err(ConnectorError::invalid("GitHub's answer was too large"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-fn json(body: &[u8]) -> ConnectorResult<Value> {
-    serde_json::from_slice(body)
-        .map_err(|_| ConnectorError::invalid("GitHub did not return the expected JSON response"))
 }
 
 #[cfg(test)]
