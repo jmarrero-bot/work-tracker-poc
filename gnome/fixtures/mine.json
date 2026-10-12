@@ -1,0 +1,30 @@
+{
+  "mine": [
+    {
+      "id": "hub:github:1",
+      "provider": "github",
+      "key": "bootc-dev/bootc#1234",
+      "title": "Add a composefs fsck",
+      "url": "https://github.com/bootc-dev/bootc/pull/1234",
+      "status": "Open",
+      "outcome": "open",
+      "outcome_reason": "GitHub pull request is open",
+      "zone": "external",
+      "updated_at": "2026-10-12T10:00:00Z",
+      "waits_on": [
+        {
+          "account": "jmarrero",
+          "connection_id": "hub:7d1c",
+          "reasons": ["review_requested", "new_reason"],
+          "synced_at": "2026-10-12T11:55:00Z",
+          "stale": false
+        }
+      ],
+      "synced_at": "2026-10-12T11:55:00Z",
+      "stale": false,
+      "from_hub": true
+    }
+  ],
+  "watching": [],
+  "watch_errors": []
+}
