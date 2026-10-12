@@ -76,6 +76,18 @@ The demo has synthetic tickets and changes. Its internal URLs use `.invalid` dom
 
 In the examples below, use `./target/debug/workboard` in place of `workboard`, or put the executable on your PATH.
 
+## GNOME app
+
+`workboard-gnome` is a native GNOME app (GTK 4 and libadwaita) for the companion's laptop: Mine, Next and the inbox, efforts, connections, the hub and the bot, with notifications for new Mine items, also while its window is closed. It is a client of the running service, like the CLI, and keeps no work of its own. In a toolbox with GTK 4 and libadwaita:
+
+```sh
+cargo run -p workboard-gnome                  # the service's default data directory
+make -C gnome install                         # with its desktop file and icon, under ~/.local
+flatpak-builder --user --install --force-clean build-dir gnome/io.github.jmarrero_bot.Workboard.yml
+```
+
+See [docs/gnome.md](docs/gnome.md) for what it shows, notifications and running in the background, and the Flatpak's permissions.
+
 ## Connect personal accounts
 
 Use **Connections → Connect account** in the browser. Alternatively, set a token environment variable yourself, then use:
@@ -209,9 +221,16 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 python3 tests/smoke.py target/debug/workboard
 python3 tests/hub_smoke.py target/debug/workboard
+# The GNOME app, with GTK 4 and libadwaita installed:
+cargo clippy -p workboard-gnome --all-targets -- -D warnings
+cargo test -p workboard-gnome
+cargo build -p workboard-gnome
+dbus-run-session -- python3 tests/gnome_smoke.py target/debug/workboard target/debug/workboard-gnome screenshots
 ```
 
 The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone, the external export and the Mine view, scheduled sync with backoff, a stopped connection and freshness, sync state across a restart, and secret file permissions. The hub smoke test runs a hub and a companion as two processes on loopback, the companion pulling through a logging proxy, and checks that the companion shows both parts, that it sent the hub only GETs of the export, that nothing of its internal work reaches any hub answer or the hub's data directory, and that the hub's work goes stale on the companion once the hub stops. The scheduler's own tests use a clock they control and fake connectors, so they never wait. GitHub and Fedora Forge are tested against recorded answers in `cargo test`, since CI has no token for either. An ignored test reads a public repository on the real Fedora Forge without a token, and prints counts: `cargo test -- --ignored --nocapture live_fedora_forge`, or `workboard-tests --ignored --nocapture live_fedora_forge` with the test binary CI uploads next to `workboard`.
+
+The GNOME smoke test needs Xvfb, ImageMagick, xdotool, PyGObject and python-xlib; it runs the app against a hub and a companion, and saves screenshots of its views (see [docs/gnome.md](docs/gnome.md#testing)).
 
 See `docs/architecture.md` for the next implementation boundaries.
 
