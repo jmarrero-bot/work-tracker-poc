@@ -14,6 +14,7 @@ flowchart TD
   API --> Bot["Bot connector (GitHub, read only)"]
   API --> Plugins["Connector plugins"]
   API --> Hub["A hub's external export (companion, read only)"]
+  API --> OAuth["GitHub's OAuth endpoints (a hub's sign-in only)"]
 ```
 
 Every client operates on the same API: the page, the CLI and the GNOME app ([gnome.md](gnome.md)). Neither the CLI nor the app is a second database writer, and the app never opens the database. The service enforces URL validation, credentials, grouping and synchronization. UI summaries are computed from the same source data returned to the CLI.
@@ -25,6 +26,7 @@ Every client operates on the same API: the page, the CLI and the GNOME app ([gno
 - **Item:** local ID namespaced by connection, remote identity, source URL, unmodified source status, derived outcome and the reason for it, attention category, the reasons it waits on the account (if it does), source update time, optional effort, its connection's zone, and for the bot's items, the board's fields or the board item that links a fork pull request. When shown, a synced item also carries its connection's last success and whether that is stale. Manually added items have no connection and are internal.
 - **Settings:** the data directory's mode, local or hub, recorded the first time a service opens it.
 - **Hub link:** on a companion, the hub's address, its companion token (a credential file like a connection's), the state of its pulls (in the sync state table) and the last export they read.
+- **Sign-ins:** on a hub with a GitHub App, browser sessions and sign-ins in progress, kept in memory by the SHA-256 of their cookies; the user tokens the web flow got, one private file per numeric user ID (`github-users/`); and the companion credentials the device flow gave, by their SHA-256 and user ID (`companions.json`). See [github-app.md](github-app.md).
 - **Watch list:** what a GitHub connection found by watching another user, as of its last sync. It is stored apart from items, in its own table, so it never reaches the inbox, efforts or the external export.
 - **Agent runs:** what a bot connection last read of its coordinator's heartbeat: its loop state, and each worker as an agent run, with when it was read and why the last read failed, if it did. They are stored apart from items, in their own table, have no outcome, and never reach the inbox, efforts or the external export.
 - **Effort:** a manually named outcome with notes and linked items spanning services and hosts. It persists independently of agent sessions. Progress counts only delivered linked items. Closed-without-delivery and unknown items need attention, and abandoned items leave the total.
@@ -54,7 +56,7 @@ The GitHub and bot connectors hold a token that may be able to write: for testin
 - `POST` to the GraphQL endpoint passes only with a JSON body of a `query` document and optional `variables`, when the document parses and every operation in it is a query. A mutation or subscription anywhere in it, even next to queries, an `operationName`, or anything else in the body refuses it. The document sent is printed from what was parsed, so GitHub reads what was checked;
 - everything else is refused before it is sent, and counted.
 
-Its HTTP client is private to that module, and clippy (`clippy.toml`, run with warnings denied) refuses the calls that could send another method anywhere in the workspace unless marked as an exception. There are five exceptions: the one send of each read-only client, GitHub's, Fedora Forge's (below) and the companion's client of its hub (see Hub mode), after its check, and the CLI's and the GNOME app's calls to their own local service. reqwest sends a request through one of three paths, and each is covered:
+Its HTTP client is private to that module, and clippy (`clippy.toml`, run with warnings denied) refuses the calls that could send another method anywhere in the workspace unless marked as an exception. There are six exceptions: the one send of each read-only client, GitHub's, Fedora Forge's (below) and the companion's client of its hub (see Hub mode), after its check; the one send of the client of GitHub's OAuth endpoints (below), after its check; and the CLI's and the GNOME app's calls to their own local service. Tests also mark a few: requests built only to show they are refused, and the router driven in process with tower's `oneshot`, which is refused too since it would send a reqwest `Client`'s request. reqwest sends a request through one of three paths, and each is covered:
 
 - `Client::execute`, on a client or a reference to one: refused, since it sends a `Request` of any method;
 - tower's `Service::call`, which `Client` and `&Client` implement, also when reached generically through `axum::ServiceExt`: refused, for the same reason;
@@ -63,6 +65,8 @@ Its HTTP client is private to that module, and clippy (`clippy.toml`, run with w
 An HTTP client other than reqwest would need a new dependency, which review would see. Each sync result says what was sent, by method, how many answers came back unchanged, and how many requests were refused.
 
 The connector reads with REST search, whose quota is separate from GraphQL's. Searches are capped at GitHub's 1000 results, page on while GitHub counts more results than it returned, and fail rather than return part of them. Answers with an ETag are kept while the service runs, bounded in number and bytes and keyed by a hash of the token, so later requests ask conditionally, which doesn't count against the rate limit when nothing changed. A used-up rate limit fails the sync as transient and stops further requests until it frees up: for a primary limit (`x-ratelimit-remaining: 0`), only the requests of that resource (core, search or GraphQL); for a secondary limit (`retry-after`, or a refusal whose body says it hit one, then waited out for a minute), every request with that token. A tracked issue whose repository was transferred redirects; it is fetched at its new place once, if that is under the same API root, and is otherwise unknown. A wait GitHub asks for is honored for at most an hour, which covers its rate-limit window.
+
+Signing in to a hub with its GitHub App takes the one kind of request to GitHub that writes: form-encoded `POST`s to GitHub's OAuth endpoints, which exchange an authorization code for a user token, ask for a device code, and poll for the device flow's token. `src/oauth.rs` sends them through a client of its own, whose single send passes only a `POST` to exactly `https://github.com/login/oauth/access_token` or `https://github.com/login/device/code`, with a form of exactly the fields of one of those three requests, and without credential headers; anything else, the API included, is refused before it is sent, and counted. Who signed in is then read with `GET /user` through the read-only client. [github-app.md](github-app.md) covers the flows.
 
 The answers kept for conditional requests stay in memory and are not carried across restarts. Keeping them would mean writing GitHub's raw answers (including private repositories a watched user can see) to disk, keyed by a token hash whose key would have to persist too, with the same bounds, for one cheaper round of requests after each restart; that isn't worth it while a restart costs one ordinary sync.
 
@@ -92,8 +96,9 @@ The scheduler's tests run it with a clock they move by hand and fake connectors,
 
 - **Mode:** `Db::open_as` records the data directory's mode the first time it is opened (`settings`, schema version 6), and refuses to open it as the other. A directory from before modes were recorded becomes a hub only while empty, with no work, watch list, hub or credential in it. A hub checks its database holds nothing but external work before it starts: external connections, their external items and watch lists, links to its own efforts, and no hub to pull from.
 - **Writes:** the SQL connection is private to `Db`, and each write method states what it writes as a `Write`, which `Db::admit` checks first. On a hub it passes only what is shown to be external: an external connection, what a sync of a stored external connection found if every item and watch list belongs to it and says external, and its agent runs are its own, efforts and links over its external items, and writes that add no work (sync state, decisions, disconnecting). Manual links, the demo and pulling from a hub are refused. The match lists every kind, so a new one has to be decided.
-- **Access:** `Access` in `src/server.rs` checks every API request: its Host must be the loopback address or one of the hub's `--allowed-host` names, it needs the application token (bearer, or the cookie paired with it) or, only for `GET /api/export/external`, a hub's companion token, and a browser's change needs the origin of the name it came by, HTTPS under a hub's names. A session cookie set under those names is Secure.
-- **Pulls:** `src/hub.rs` is the companion's only way to its hub. Its one send passes a `GET` of the export at the hub's exact address without a body, and refuses everything else before it is sent, counting it; redirects are never followed, and clippy refuses the other ways to send. What comes back is checked whole (`hub::checked`) before anything is kept.
+- **Access:** `Access` in `src/server.rs` checks every API request: its Host must be the loopback address or one of the hub's `--allowed-host` names, and it needs a credential. That is the application token as a bearer (on loopback only once a hub has its GitHub App), a session of the hub's GitHub App sign-in (`src/login.rs`), the paired cookie on a local service or a hub started with `--pairing`, or, only for `GET /api/export/external`, a hub's companion token or a companion credential its device flow gave. A browser's change needs the origin of the name it came by, HTTPS under a hub's names. A pairing cookie set under those names is Secure; a sign-in's cookies always are, and `__Host-` names keep them to the hub's exact name.
+- **Sign-in:** the routes under `/auth` check themselves, since they come before any credential: a browser's steps only under the callback's name, its changes only from that name's page; a companion's only without a browser's `Origin`. All of them count against one rate limit.
+- **Pulls:** `src/hub.rs` is the companion's only way to its hub. Its one send passes a `GET` of the export at the hub's exact address without a body, and to sign in, `POST`s of the hub's device-flow start and poll without a body, and refuses everything else before it is sent, counting it; redirects are never followed, and clippy refuses the other ways to send. What comes back is checked whole (`hub::checked`) before anything is kept.
 - **Board:** `hub::merge` adds the hub's connections, items and efforts to what the companion shows, under IDs starting with `hub:`, marked `from_hub`, read-only, and leaves out a hub connection to an account the companion connects too, with its items. It is only for showing: the snapshot and Mine view use it, the export never does.
 
 ## Mine
@@ -112,18 +117,26 @@ A GitHub connection can also watch another login's activity (`connect --watch-us
 
 ## API
 
-All `/api` routes require the local application's bearer credential or paired browser session; a hub's companion token reads `GET /api/export/external` and nothing else. JSON responses never serialize provider credentials.
+All `/api` routes require the local application's bearer credential, a browser session (signed in with a hub's GitHub App, or paired), or for `GET /api/export/external` only, a companion's credential. The `/auth` routes are a hub's sign-in. JSON responses never serialize provider credentials.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /api/session` | Establish a browser cookie using the pairing credential |
+| `GET /auth/status` | How this service signs browsers in, and who this browser is signed in as |
+| `POST /auth/github/login` | Start a browser's sign-in with the hub's GitHub App: where to send it, and a cookie binding it to the browser |
+| `GET /auth/github/callback` | Where GitHub sends the browser back: finish the sign-in and set the session cookie |
+| `POST /auth/logout` | End the browser's session |
+| `POST /auth/device` | Start a companion's sign-in with GitHub's device flow |
+| `POST /auth/device/poll` | Poll it with its handle; once done, a companion credential |
+| `POST /api/session` | Establish a browser cookie using the pairing credential, where pairing is on |
 | `GET /api/snapshot` | Connections, items, efforts, the service's mode, and on a companion the hub's work and how its pulls go |
 | `GET /api/export/external` | The external zone only, as a hub serves it to its companions |
 | `GET /api/hub` | The hub a companion pulls from, and how its pulls go |
 | `PUT /api/hub` | Pull from a hub (`url`, `token`), once a first pull works |
 | `DELETE /api/hub` | Stop pulling from the hub, and forget its token and work |
+| `POST /api/hub/login` | Sign in to a hub (`url`) with GitHub's device flow: the code to enter, and where |
+| `POST /api/hub/login/poll` | Whether that sign-in is done; once it is, pull from the hub with what it gave |
 | `GET /api/companion-token` | A hub's companion token |
-| `POST /api/companion-token` | Replace a hub's companion token |
+| `POST /api/companion-token` | Replace a hub's companion token, and revoke the companion credentials its sign-ins gave |
 | `GET /api/mine` | What waits on each connection's account, and apart from it what watching found |
 | `GET /api/bot` | Each bot connection: its board's counts, its heartbeat's agent runs, and links that ask it for something |
 | `POST /api/connections` | Verify an account and store its credential |
@@ -138,7 +151,7 @@ All `/api` routes require the local application's bearer credential or paired br
 | `PATCH /api/items/:id` | Update a manual link’s status, attention and outcome |
 | `POST /api/items/:id/abandon` | Mark a synced item abandoned, or undo it |
 
-Live source requests only read: GET, and for GitHub, GraphQL queries checked as described above. No comments, merges, ticket updates or agent dispatches occur. A companion's requests to its hub are GETs of its export, and nothing else.
+Live source requests only read: GET, and for GitHub, GraphQL queries checked as described above. The one exception is a hub's sign-in, whose requests to GitHub's OAuth endpoints are checked as described above. No comments, merges, ticket updates or agent dispatches occur. A companion's requests to its hub are GETs of its export, and the two body-less POSTs of its sign-in, and nothing else.
 
 ## Next slices
 
