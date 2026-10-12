@@ -350,12 +350,18 @@ fn check_text(field: &str, value: &str) -> ConnectorResult<()> {
     Ok(())
 }
 
+/// Whether `id` can be an identity in the path of a URL without changing
+/// it: every character is an ASCII letter, a digit or one of `-_.:~@+=`,
+/// so there is no slash, and it isn't made of dots only, which a browser
+/// resolves as `.` or `..`, encoded or not.
+pub fn safe_id(id: &str) -> bool {
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.:~@+=".contains(c))
+        && !id.chars().all(|c| c == '.')
+}
+
 fn check_remote_id(value: &str) -> ConnectorResult<()> {
-    let valid = !value.is_empty()
-        && value.len() <= MAX_REMOTE_ID
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.:~@+=".contains(c));
+    let valid = !value.is_empty() && value.len() <= MAX_REMOTE_ID && safe_id(value);
     if !valid {
         return Err(ConnectorError::invalid(
             "The connector returned an invalid item identity",
@@ -872,6 +878,11 @@ mod tests {
             (
                 "identity",
                 Fake::new(vec![remote("a/../b", Open, "next")], vec![]),
+                Invalid,
+            ),
+            (
+                "dots",
+                Fake::new(vec![remote("..", Open, "next")], vec![]),
                 Invalid,
             ),
             (

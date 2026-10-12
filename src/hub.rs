@@ -9,7 +9,9 @@
 //! anywhere in the crate.
 
 use crate::{
-    connector::{BoxFuture, ConnectorError, ConnectorResult, Credential, ErrorKind, Requests},
+    connector::{
+        safe_id, BoxFuture, ConnectorError, ConnectorResult, Credential, ErrorKind, Requests,
+    },
     connectors::{self, http_error, parse_json, read_body},
     model::{
         valid_provider, Connection, Effort, EffortView, Item, Progress, Schedule, Snapshot,
@@ -191,13 +193,16 @@ impl Pull for HubClient {
     }
 }
 
-/// The set of `ids`, if each is there once, and none is empty or overlong.
-/// A set, so checking what each item refers to stays linear: a hub could
-/// send lists of up to [`MAX_COUNT`] each.
+/// The set of `ids`, if each is there once, and none is empty, overlong or
+/// could change a URL path it is part of ([`safe_id`]). The page puts IDs
+/// in the paths of API calls, where a hub's `/../`, or an ID of `..`,
+/// could otherwise send a call to another route. A set, so checking what
+/// each item refers to stays linear: a hub could send lists of up to
+/// [`MAX_COUNT`] each.
 fn unique_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<HashSet<&'a str>> {
     let mut set = HashSet::new();
     for id in ids {
-        if id.is_empty() || id.len() > MAX_ID || !set.insert(id) {
+        if id.is_empty() || id.len() > MAX_ID || !safe_id(id) || !set.insert(id) {
             return None;
         }
     }
@@ -227,7 +232,7 @@ pub fn checked(s: ExternalSnapshot) -> ConnectorResult<ExternalSnapshot> {
         unique_ids(s.efforts.iter().map(|e| e.id.as_str())),
         unique_ids(s.items.iter().map(|i| i.id.as_str())),
     ) else {
-        return fail("has missing, overlong or repeated IDs");
+        return fail("has missing, overlong, unsafe or repeated IDs");
     };
     let text_ok = |fields: &[&str]| fields.iter().all(|f| f.len() <= MAX_FIELD);
     for c in &s.connections {
@@ -841,7 +846,7 @@ pub mod tests {
     #[test]
     fn exports_are_checked_whole() {
         type Break = fn(&mut ExternalSnapshot);
-        let cases: [(&str, Break); 11] = [
+        let cases: [(&str, Break); 17] = [
             ("snapshot zone", |s| s.zone = Zone::Internal),
             ("connection zone", |s| {
                 s.connections[0].zone = Zone::Internal
@@ -864,6 +869,25 @@ pub mod tests {
                 s.connections.push(s.connections[0].clone())
             }),
             ("empty ID", |s| s.efforts[0].id = String::new()),
+            ("path in an item ID", |s| {
+                s.items[0].id = "a/../../hub".into()
+            }),
+            ("path in a connection ID", |s| {
+                s.connections[0].id = "../hub".into();
+                for i in &mut s.items {
+                    i.connection_id = "../hub".into();
+                }
+            }),
+            ("encoded path in an effort ID", |s| {
+                s.efforts[0].id = "%2e%2e%2fhub".into();
+                s.items[0].effort_id = Some("%2e%2e%2fhub".into());
+            }),
+            ("space in an ID", |s| s.items[0].id = "a b".into()),
+            ("dots for an item ID", |s| s.items[0].id = "..".into()),
+            ("a dot for an effort ID", |s| {
+                s.efforts[0].id = ".".into();
+                s.items[0].effort_id = Some(".".into());
+            }),
             ("overlong title", |s| {
                 s.items[0].title = "x".repeat(MAX_FIELD + 1)
             }),

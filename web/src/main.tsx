@@ -815,7 +815,11 @@ function App() {
   }
   async function shareTitle(e: Effort, share: boolean) {
     try {
-      await api(`efforts/${e.id}`, { share_title: share }, "PATCH");
+      await api(
+        `efforts/${encodeURIComponent(e.id)}`,
+        { share_title: share },
+        "PATCH",
+      );
       await reload();
     } catch (err) {
       setError((err as Error).message);
@@ -824,7 +828,7 @@ function App() {
   async function verify(c: Connection) {
     setError("");
     try {
-      await api(`connections/${c.id}/verify`, {});
+      await api(`connections/${encodeURIComponent(c.id)}/verify`, {});
       await reload();
       setNotice(`${c.label} works again and syncs on schedule.`);
     } catch (e) {
@@ -839,7 +843,11 @@ function App() {
     )
       return;
     try {
-      await api(`connections/${c.id}`, undefined, "DELETE");
+      await api(
+        `connections/${encodeURIComponent(c.id)}`,
+        undefined,
+        "DELETE",
+      );
       await reload();
     } catch (e) {
       setError((e as Error).message);
@@ -850,7 +858,7 @@ function App() {
     setBusy(true);
     try {
       await api(
-        `items/${detailItem.id}`,
+        `items/${encodeURIComponent(detailItem.id)}`,
         { status: manualStatus, action: manualAction, outcome: manualOutcome },
         "PATCH",
       );
@@ -865,7 +873,9 @@ function App() {
   async function abandon(item: Item, abandoned: boolean) {
     setBusy(true);
     try {
-      await api(`items/${item.id}/abandon`, { abandoned });
+      await api(`items/${encodeURIComponent(item.id)}/abandon`, {
+        abandoned,
+      });
       await reload();
       setNotice(abandoned ? "Marked abandoned." : "Abandoned mark removed.");
     } catch (e) {
