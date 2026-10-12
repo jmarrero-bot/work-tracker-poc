@@ -416,10 +416,14 @@ pub fn merge(snapshot: &mut Snapshot, export: &ExternalSnapshot, status: &Status
             from_hub: true,
         });
     }
+    // The hub's efforts with work shown here: one whose items are all
+    // left out, as the companion's own copies, would show empty.
+    let mut with_work = HashSet::new();
     for i in &export.items {
         let Some(&(synced_at, stale)) = fresh.get(i.connection_id.as_str()) else {
             continue;
         };
+        with_work.extend(i.effort_id.as_deref());
         snapshot.items.push(Item {
             id: id(&i.id),
             connection_id: Some(id(&i.connection_id)),
@@ -443,7 +447,11 @@ pub fn merge(snapshot: &mut Snapshot, export: &ExternalSnapshot, status: &Status
             from_hub: true,
         });
     }
-    for e in &export.efforts {
+    for e in export
+        .efforts
+        .iter()
+        .filter(|e| with_work.contains(e.id.as_str()))
+    {
         let p = &e.progress;
         snapshot.efforts.push(EffortView {
             effort: Effort {
@@ -655,6 +663,8 @@ pub mod tests {
                 "{account}"
             );
             assert_eq!(board.items.len(), from_hub(2), "{account}");
+            // An effort whose work is all left out isn't shown empty.
+            assert_eq!(board.efforts.len(), from_hub(1), "{account}");
         }
         // Another instance is another account.
         let mut board = Snapshot {
