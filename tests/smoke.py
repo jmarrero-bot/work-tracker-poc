@@ -189,6 +189,26 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         forge = next(c['id'] for c in exported['connections'])
         watch = subprocess.run(command + ['watch', forge, 'someone'], capture_output=True, text=True)
         assert watch.returncode != 0 and 'Only a GitHub connection' in watch.stderr, watch
+        # A bot connection is checked whole before its token goes anywhere:
+        # it takes its board, tracker, heartbeat, login and forge
+        # organization, and the external zone, and nothing else takes them.
+        bot_args = ['--board','orgs/o/1','--tracker','o/tracker','--heartbeat','1','--bot-login','some-bot','--forge-org','o']
+        def connect_bot(provider, *extra):
+            return subprocess.run(command + ['connect',provider,'--url','https://github.example.invalid/','--token-env','WORKBOARD_SMOKE_TOKEN',*extra], env=plugin_env, capture_output=True, text=True)
+        for provider, extra, needle in [
+            ('bot', [], 'board'),
+            ('bot', ['--external','--board','orgs/o/1'], '--tracker'),
+            ('bot', bot_args, 'external'),
+            ('bot', ['--external',*bot_args[:-2],'--forge-org','a/b'], 'organization'),
+            ('errata', bot_args, 'Only a bot connection'),
+        ]:
+            refused = connect_bot(provider, *extra)
+            assert refused.returncode != 0 and needle in refused.stderr, (extra, refused)
+        # Without a bot, there is nothing to show or ask.
+        assert 'No bot is connected' in subprocess.check_output(command + ['bot'], text=True)
+        assert json.loads(subprocess.check_output(command + ['bot','--json'])) == []
+        ask = subprocess.run(command + ['ask','--print'], capture_output=True, text=True)
+        assert ask.returncode != 0 and 'No bot is connected' in ask.stderr, ask
         [effort_out] = exported['efforts']
         assert effort_out['title'] == 'Effort ' + mixed_id.replace('-', '')[:8], effort_out
         assert effort_out['progress']['total'] == 1, effort_out
