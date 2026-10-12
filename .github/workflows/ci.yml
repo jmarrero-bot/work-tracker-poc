@@ -101,6 +101,49 @@ jobs:
         run: cargo test --locked -p workboard-gnome
       - name: cargo build
         run: cargo build --locked -p workboard-gnome
+      - name: Upload the app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workboard-gnome-debug
+          path: target/debug/workboard-gnome
+          retention-days: 1
+          if-no-files-found: error
+
+  # The app against a companion and a hub, on a virtual X server, with
+  # screenshots of its views for review.
+  gnome-smoke:
+    needs: [build, gnome]
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install GTK, libadwaita, an X server and tools
+        run: >-
+          dnf -y install --setopt=install_weak_deps=False gtk4 libadwaita adwaita-icon-theme
+          adwaita-sans-fonts glib2 dbus-daemon python3 python3-gobject xorg-x11-server-Xvfb
+          python3-xlib ImageMagick xdotool
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: workboard-debug
+          path: target/debug
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: workboard-gnome-debug
+          path: target/debug
+      - name: Smoke test and screenshots
+        run: |
+          chmod +x target/debug/workboard target/debug/workboard-gnome
+          dbus-run-session -- python3 tests/gnome_smoke.py target/debug/workboard target/debug/workboard-gnome screenshots
+      - name: Upload the screenshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gnome-screenshots
+          path: screenshots
+          retention-days: 30
+          if-no-files-found: warn
 
   flatpak:
     runs-on: ubuntu-latest
@@ -131,7 +174,7 @@ jobs:
   # unless every job it needs succeeded. List every job above in needs.
   ci:
     if: always()
-    needs: [fmt, build, gnome, flatpak]
+    needs: [fmt, build, gnome, gnome-smoke, flatpak]
     runs-on: ubuntu-latest
     steps:
       - name: Check the jobs it needs
