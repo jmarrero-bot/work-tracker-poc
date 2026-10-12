@@ -4,7 +4,7 @@
 
 use crate::{
     connector::ErrorKind,
-    model::{Item, Outcome, Progress, Reason, Snapshot},
+    model::{Item, Outcome, Progress, Reason, Snapshot, Timestamp},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -53,7 +53,7 @@ pub struct ExternalConnection {
     pub label: String,
     pub base_url: String,
     pub account_name: String,
-    pub last_sync: Option<String>,
+    pub last_sync: Option<Timestamp>,
     pub error_kind: Option<ErrorKind>,
     pub zone: Zone,
 }
@@ -148,11 +148,12 @@ pub fn external_only(snapshot: &Snapshot) -> ExternalSnapshot {
             label: c.label.clone(),
             base_url: c.base_url.clone(),
             account_name: c.account_name.clone(),
-            last_sync: c.last_sync.clone(),
+            last_sync: c.sync.last_success,
             error_kind: c
+                .sync
                 .error
                 .as_ref()
-                .map(|_| c.error_kind.unwrap_or(ErrorKind::Invalid)),
+                .map(|_| c.sync.error_kind.unwrap_or(ErrorKind::Invalid)),
             zone: Zone::External,
         })
         .collect();
@@ -221,7 +222,7 @@ pub fn external_only(snapshot: &Snapshot) -> ExternalSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ConnectInput, Connection, Effort, EffortView};
+    use crate::model::{ConnectInput, Connection, Effort, EffortView, SyncState, Timestamp};
 
     #[test]
     fn zones_default_to_internal() {
@@ -285,11 +286,17 @@ mod tests {
             // Never needed outside, so never exported.
             account_id: format!("{INTERNAL}-account-{n}"),
             account_name: format!("{tag} account {n}"),
-            last_sync: Some(format!("{tag} sync {n}")),
-            error: Some(format!("{INTERNAL} error message {n}")),
             zone,
-            error_kind: Some(ErrorKind::Transient),
             watch_user: Some(format!("{INTERNAL}-watched")),
+            sync: SyncState {
+                last_success: Some(Timestamp::from_unix(1_791_763_200 + n as i64)),
+                last_attempt: Some(Timestamp::from_unix(1_791_763_300)),
+                next_due: None,
+                failures: 2,
+                error_kind: Some(ErrorKind::Transient),
+                error: Some(format!("{INTERNAL} error message {n}")),
+                held_until: None,
+            },
         }
     }
     /// An item of `connection`, or a manual one, whose row says `zone`.

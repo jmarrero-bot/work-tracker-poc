@@ -9,7 +9,7 @@
 
 use crate::{
     connectors::source_url,
-    model::{Connection, Item, Outcome, WatchList},
+    model::{Connection, Item, Outcome, Timestamp, WatchList},
     outcome,
 };
 use serde::{Deserialize, Serialize};
@@ -491,34 +491,37 @@ pub async fn watch(
 }
 
 /// Sync connection `c` and, if it watches another user, what watching
-/// finds. Watching is a separate list: if it fails, the account's own items
-/// are still synced, and the list keeps what `last` found for the same user,
-/// with the error.
+/// finds, in a sync that started `at`. Watching is a separate list: if it
+/// fails, the account's own items are still synced, and the list keeps what
+/// `last` found for the same user, and when, with the error.
 pub async fn sync_and_watch(
     connector: &dyn Connector,
     target: &Target,
     c: &Connection,
     old: &[Item],
     last: Option<&WatchList>,
+    at: Timestamp,
 ) -> ConnectorResult<(Vec<Item>, Option<WatchList>)> {
     let items = sync(connector, target, c, old).await?;
     let Some(login) = &c.watch_user else {
         return Ok((items, None));
     };
-    let list = |found, error| WatchList {
+    let list = |found, error, last_success| WatchList {
         connection_id: c.id.clone(),
         login: login.clone(),
         items: found,
         error,
+        last_success,
     };
     let watched = match watch(connector, target, c, login).await {
-        Ok(found) => list(found, None),
+        Ok(found) => list(found, None, Some(at)),
         Err(e) => {
-            let kept = last
-                .filter(|l| l.connection_id == c.id && l.login == *login)
-                .map(|l| l.items.clone())
-                .unwrap_or_default();
-            list(kept, Some(format!("Watching {login}: {}", e.message)))
+            let kept = last.filter(|l| l.connection_id == c.id && l.login == *login);
+            list(
+                kept.map(|l| l.items.clone()).unwrap_or_default(),
+                Some(format!("Watching {login}: {}", e.message)),
+                kept.and_then(|l| l.last_success),
+            )
         }
     };
     Ok((items, Some(watched)))
@@ -698,11 +701,9 @@ mod tests {
             base_url: "https://example.com/".into(),
             account_id: "42".into(),
             account_name: "me".into(),
-            last_sync: None,
-            error: None,
             zone: Zone::External,
-            error_kind: None,
             watch_user: None,
+            ..Default::default()
         }
     }
     fn target() -> Target {
@@ -999,20 +1000,24 @@ mod tests {
             watch_user: Some("someone".into()),
             ..connection()
         };
+        let found = Timestamp::from_unix(1_791_763_200);
         let last = |login: &str| WatchList {
             connection_id: c.id.clone(),
             login: login.into(),
             items: vec![stored("theirs", Outcome::Open)],
             error: None,
+            last_success: Some(found),
         };
+        let now = Timestamp::from_unix(1_791_766_800);
         // The fake can't watch: its own items still sync, and the list
-        // found before for the same user stays, with the error.
-        for (last, kept) in [
-            (Some(last("someone")), 1),
-            (Some(last("someone-else")), 0),
-            (None, 0),
+        // found before for the same user stays, with the error, as fresh as
+        // when it was found.
+        for (last, kept, last_success) in [
+            (Some(last("someone")), 1, Some(found)),
+            (Some(last("someone-else")), 0, None),
+            (None, 0, None),
         ] {
-            let (items, watched) = sync_and_watch(&fake, &target(), &c, &[], last.as_ref())
+            let (items, watched) = sync_and_watch(&fake, &target(), &c, &[], last.as_ref(), now)
                 .await
                 .unwrap();
             assert_eq!(items.len(), 1);
@@ -1021,11 +1026,12 @@ mod tests {
                 (watched.login.as_str(), watched.items.len()),
                 ("someone", kept)
             );
+            assert_eq!(watched.last_success, last_success);
             let error = watched.error.unwrap();
             assert!(error.starts_with("Watching someone: "), "{error}");
         }
         // Without a watch, there is no list.
-        let (_, watched) = sync_and_watch(&fake, &target(), &connection(), &[], None)
+        let (_, watched) = sync_and_watch(&fake, &target(), &connection(), &[], None, now)
             .await
             .unwrap();
         assert!(watched.is_none());

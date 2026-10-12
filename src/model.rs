@@ -1,11 +1,12 @@
 pub use crate::{
-    connector::{ErrorKind, Reason},
+    clock::Timestamp,
+    connector::{ConnectorError, ErrorKind, Reason},
     outcome::{Outcome, Progress},
     zone::Zone,
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Connection {
     pub id: String,
     pub provider: String,
@@ -13,21 +14,72 @@ pub struct Connection {
     pub base_url: String,
     pub account_id: String,
     pub account_name: String,
-    pub last_sync: Option<String>,
-    pub error: Option<String>,
     /// Chosen when connecting. Connections made before zones existed are
     /// internal.
     #[serde(default)]
     pub zone: Zone,
-    /// The kind of the last sync's error, which unlike its message may
-    /// leave this machine.
-    #[serde(default)]
-    pub error_kind: Option<ErrorKind>,
     /// Another GitHub user whose activity, as far as this connection's
     /// token can see it, the connection also watches, a setting of its own:
     /// what it finds is theirs, never this account's.
     #[serde(default)]
     pub watch_user: Option<String>,
+    /// What its syncs did. Kept in a table of its own, saved with what a
+    /// sync found, and never stored with the connection.
+    #[serde(default)]
+    pub sync: SyncState,
+}
+
+/// What a connection's syncs did: what is saved, in the same transaction as
+/// the items a sync found, once it has processed them. A sync that never got
+/// that far, because it failed or the service stopped, leaves it as it was.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncState {
+    /// When the last sync whose results were saved started: how fresh the
+    /// connection's items are.
+    pub last_success: Option<Timestamp>,
+    /// When the last sync started, whether or not it succeeded.
+    pub last_attempt: Option<Timestamp>,
+    /// When the next scheduled sync is due. None until one was scheduled,
+    /// and while the connection needs the person.
+    pub next_due: Option<Timestamp>,
+    /// Syncs that failed since the last one that succeeded.
+    pub failures: u32,
+    /// The kind of the last sync's error, which unlike its message may
+    /// leave this machine.
+    pub error_kind: Option<ErrorKind>,
+    pub error: Option<String>,
+    /// Until when the source asked for no more requests, after a rate
+    /// limit.
+    pub held_until: Option<Timestamp>,
+}
+
+impl SyncState {
+    /// After a sync that started at `at` saved what it found.
+    pub fn succeeded(&self, at: Timestamp) -> Self {
+        Self {
+            last_success: Some(at),
+            last_attempt: Some(at),
+            ..Self::default()
+        }
+    }
+    /// After a sync that started at `at` failed with `error`. Its items stay
+    /// as the last success left them.
+    pub fn failed(&self, at: Timestamp, error: &anyhow::Error) -> Self {
+        let connector = error.downcast_ref::<ConnectorError>();
+        Self {
+            last_success: self.last_success,
+            last_attempt: Some(at),
+            next_due: None,
+            failures: self.failures.saturating_add(1),
+            // Whether to fix a credential or retry later.
+            error_kind: Some(connector.map_or(ErrorKind::Invalid, |e| e.kind)),
+            error: Some(error.to_string()),
+            held_until: connector
+                .and_then(|e| e.hold_until)
+                .map(Timestamp::of)
+                .filter(|until| *until > at),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +177,11 @@ pub struct WatchList {
     /// earlier sync found. Never the account's own sync error.
     #[serde(default)]
     pub error: Option<String>,
+    /// When the sync that found these items started: how fresh the list is,
+    /// apart from the account's own items, since a watch can keep failing
+    /// while the account syncs.
+    #[serde(default)]
+    pub last_success: Option<Timestamp>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

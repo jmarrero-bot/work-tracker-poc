@@ -30,7 +30,7 @@ pub fn write_secret(path: &Path, value: &str) -> Result<()> {
 
 /// The schema version this build writes, kept in SQLite's `user_version`.
 /// Version 0 is the prototype's schema, whose items only had a `terminal` flag.
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 fn schema_version(sql: &Sqlite) -> Result<i32> {
     let version = sql.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -73,6 +73,9 @@ fn migrate(sql: &mut Sqlite, root: &Path) -> Result<()> {
             "CREATE TABLE IF NOT EXISTS watched(connection_id TEXT PRIMARY KEY, login TEXT NOT NULL, body TEXT NOT NULL, error TEXT)",
         )
         .context("Cannot add watched users")?;
+    }
+    if version < 5 {
+        migrate_sync_state(&tx).context("Cannot move sync state out of stored connections")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -164,6 +167,135 @@ fn migrate_zones(tx: &Transaction) -> Result<()> {
     Ok(())
 }
 
+/// Version 5: each connection's sync state gets a table of its own, written
+/// in the same transaction as what a sync found, instead of fields of the
+/// connection saved after it. A connection whose last sync failed keeps
+/// that error, and one rejected credential still needs the person.
+fn migrate_sync_state(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(SYNC_STATE_TABLE)?;
+    // When each watch list was found, since a watch can fail while its
+    // account syncs. Lists found before this are of unknown age.
+    let has_column: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('watched') WHERE name='last_success')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_column {
+        tx.execute_batch("ALTER TABLE watched ADD COLUMN last_success INTEGER")?;
+    }
+    let rows: Vec<(String, String)> = tx
+        .prepare("SELECT id,body FROM connections")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, body) in rows {
+        let mut v: Value = serde_json::from_str(&body)
+            .with_context(|| format!("Stored connection {id} is not JSON"))?;
+        let c = v
+            .as_object_mut()
+            .with_context(|| format!("Stored connection {id} is not an object"))?;
+        let mut take = |key: &str| c.remove(key).filter(|v| !v.is_null());
+        let last_sync = take("last_sync");
+        let error = take("error").and_then(|e| e.as_str().map(str::to_string));
+        let kind = take("error_kind").and_then(|k| serde_json::from_value(k).ok());
+        let last_success = last_sync.and_then(|t| t.as_str().and_then(Timestamp::parse));
+        let state = SyncState {
+            last_success,
+            last_attempt: last_success,
+            next_due: None,
+            failures: u32::from(error.is_some()),
+            error_kind: error.as_ref().map(|_| kind.unwrap_or(ErrorKind::Invalid)),
+            error,
+            held_until: None,
+        };
+        tx.execute(
+            "UPDATE connections SET body=?1 WHERE id=?2",
+            params![serde_json::to_string(&v)?, id],
+        )?;
+        write_sync_state(tx, &id, &state)?;
+    }
+    Ok(())
+}
+
+/// Each connection's [`SyncState`], one row each.
+const SYNC_STATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS sync_state(
+  connection_id TEXT PRIMARY KEY,
+  last_success INTEGER,
+  last_attempt INTEGER,
+  next_due INTEGER,
+  failures INTEGER NOT NULL DEFAULT 0,
+  error_kind TEXT,
+  error TEXT,
+  held_until INTEGER)";
+
+/// The columns of [`SYNC_STATE_TABLE`] that hold the state, in order.
+const SYNC_STATE_COLUMNS: &str =
+    "last_success,last_attempt,next_due,failures,error_kind,error,held_until";
+
+fn write_sync_state(tx: &Transaction, id: &str, state: &SyncState) -> Result<()> {
+    let kind = state
+        .error_kind
+        .map(|k| serde_json::to_value(k).map(|v| v.as_str().unwrap_or_default().to_string()))
+        .transpose()?;
+    tx.execute(
+        &format!("INSERT OR REPLACE INTO sync_state(connection_id,{SYNC_STATE_COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)"),
+        params![
+            id,
+            state.last_success.map(Timestamp::unix),
+            state.last_attempt.map(Timestamp::unix),
+            state.next_due.map(Timestamp::unix),
+            state.failures,
+            kind,
+            state.error,
+            state.held_until.map(Timestamp::unix),
+        ],
+    )?;
+    Ok(())
+}
+
+/// A [`SyncState`] from its columns, starting at `first`.
+fn read_sync_state(r: &rusqlite::Row, first: usize) -> rusqlite::Result<SyncState> {
+    let time = |n: usize| -> rusqlite::Result<Option<Timestamp>> {
+        Ok(r.get::<_, Option<i64>>(first + n)?
+            .map(Timestamp::from_unix))
+    };
+    let kind: Option<String> = r.get(first + 4)?;
+    Ok(SyncState {
+        last_success: time(0)?,
+        last_attempt: time(1)?,
+        next_due: time(2)?,
+        failures: r.get::<_, Option<u32>>(first + 3)?.unwrap_or_default(),
+        // A kind this build doesn't know is shown as what it can be sure of.
+        error_kind: kind
+            .map(|k| serde_json::from_value(Value::String(k)).unwrap_or(ErrorKind::Invalid)),
+        error: r.get(first + 5)?,
+        held_until: time(6)?,
+    })
+}
+
+/// A connection as it is stored: without its sync state, which has a table
+/// of its own.
+fn connection_body(c: &Connection) -> Result<String> {
+    let mut v = serde_json::to_value(c)?;
+    if let Some(body) = v.as_object_mut() {
+        body.remove("sync");
+    }
+    Ok(serde_json::to_string(&v)?)
+}
+
+/// Fail unless connection `id` is still there, so a sync that finishes
+/// after a disconnect saves nothing.
+fn check_connected(tx: &Transaction, id: &str) -> Result<()> {
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM connections WHERE id=?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        bail!("Connection not found; it was disconnected")
+    }
+    Ok(())
+}
+
 /// Insert or update synced items, keeping their effort links and abandoned
 /// marks, which live in their own columns.
 fn upsert_synced(tx: &Transaction, items: &[Item]) -> Result<()> {
@@ -217,11 +349,22 @@ impl Db {
         })
     }
     pub fn connections(&self) -> Result<Vec<Connection>> {
-        let mut s = self
-            .sql
-            .prepare("SELECT body FROM connections ORDER BY id")?;
-        let rows = s.query_map([], |r| r.get::<_, String>(0))?;
-        rows.map(|v| Ok(serde_json::from_str(&v?)?)).collect()
+        let mut s = self.sql.prepare(&format!(
+            "SELECT c.body,{} FROM connections c LEFT JOIN sync_state s ON s.connection_id=c.id ORDER BY c.id",
+            SYNC_STATE_COLUMNS
+                .split(',')
+                .map(|column| format!("s.{column}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))?;
+        let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, read_sync_state(r, 1)?)))?;
+        rows.map(|row| {
+            let (body, state) = row?;
+            let mut c: Connection = serde_json::from_str(&body)?;
+            c.sync = state;
+            Ok(c)
+        })
+        .collect()
     }
     pub fn connection(&self, id: &str) -> Result<Connection> {
         self.connections()?
@@ -229,8 +372,10 @@ impl Db {
             .find(|c| c.id == id)
             .context("Connection not found")
     }
+    /// Save a connection's settings. Its sync state is saved only with what
+    /// a sync found, by [`Db::save_sync`] or [`Db::save_sync_state`].
     pub fn save_connection(&self, c: &Connection) -> Result<()> {
-        self.sql.execute("INSERT INTO connections VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![c.id,serde_json::to_string(c)?])?;
+        self.sql.execute("INSERT INTO connections VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![c.id,connection_body(c)?])?;
         Ok(())
     }
     pub fn secret(&self, id: &str) -> Result<String> {
@@ -331,16 +476,20 @@ impl Db {
         tx.commit()?;
         Ok(())
     }
-    /// Save what a sync of connection `id` found, all or nothing: its items,
-    /// and what it found watching another user, which replaces the last
-    /// such list.
+    /// Save what a sync of connection `id` found, all or nothing, once it
+    /// has been processed: its items, what it found watching another user,
+    /// which replaces the last such list, and the connection's sync state.
+    /// Nothing is saved before, so a sync that stops halfway leaves the last
+    /// good data and state, and the next one fetches everything again.
     pub fn save_sync(
         &mut self,
         id: &str,
         items: &[Item],
         watched: Option<&WatchList>,
+        state: &SyncState,
     ) -> Result<()> {
         let tx = self.sql.transaction()?;
+        check_connected(&tx, id)?;
         upsert_synced(&tx, items)?;
         tx.execute("DELETE FROM watched WHERE connection_id=?1", [id])?;
         if let Some(w) = watched {
@@ -348,10 +497,26 @@ impl Db {
                 bail!("A watch list was saved for another connection")
             }
             tx.execute(
-                "INSERT INTO watched(connection_id,login,body,error) VALUES(?1,?2,?3,?4)",
-                params![id, w.login, serde_json::to_string(&w.items)?, w.error],
+                "INSERT INTO watched(connection_id,login,body,error,last_success) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    id,
+                    w.login,
+                    serde_json::to_string(&w.items)?,
+                    w.error,
+                    w.last_success.map(Timestamp::unix)
+                ],
             )?;
         }
+        write_sync_state(&tx, id, state)?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Save the sync state of connection `id` after a sync that failed,
+    /// leaving its items as they were.
+    pub fn save_sync_state(&mut self, id: &str, state: &SyncState) -> Result<()> {
+        let tx = self.sql.transaction()?;
+        check_connected(&tx, id)?;
+        write_sync_state(&tx, id, state)?;
         tx.commit()?;
         Ok(())
     }
@@ -361,18 +526,19 @@ impl Db {
         let zones = self.zones()?;
         let mut s = self
             .sql
-            .prepare("SELECT connection_id,login,body,error FROM watched ORDER BY connection_id")?;
+            .prepare("SELECT connection_id,login,body,error,last_success FROM watched ORDER BY connection_id")?;
         let rows = s.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
             ))
         })?;
         let mut lists = Vec::new();
         for row in rows {
-            let (connection_id, login, body, error) = row?;
+            let (connection_id, login, body, error, last_success) = row?;
             let Some(zone) = zones.get(&connection_id).copied() else {
                 continue;
             };
@@ -385,6 +551,7 @@ impl Db {
                 login,
                 items,
                 error,
+                last_success: last_success.map(Timestamp::from_unix),
             });
         }
         Ok(lists)
@@ -397,7 +564,7 @@ impl Db {
         let tx = self.sql.transaction()?;
         tx.execute(
             "UPDATE connections SET body=?1 WHERE id=?2",
-            params![serde_json::to_string(&c)?, id],
+            params![connection_body(&c)?, id],
         )?;
         tx.execute("DELETE FROM watched WHERE connection_id=?1", [id])?;
         tx.commit()?;
@@ -488,6 +655,7 @@ impl Db {
             tx.execute("DELETE FROM items WHERE id=?1", [item])?;
         }
         tx.execute("DELETE FROM watched WHERE connection_id=?1", [id])?;
+        tx.execute("DELETE FROM sync_state WHERE connection_id=?1", [id])?;
         tx.execute("DELETE FROM connections WHERE id=?1", [id])?;
         tx.commit()?;
         match fs::remove_file(self.root.join("secrets").join(id)) {
@@ -596,6 +764,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
     #[test]
     fn synchronization_preserves_manual_effort_assignments() {
         let temp = tempfile::tempdir().unwrap();
@@ -841,11 +1010,9 @@ mod tests {
             base_url: "https://gitlab.com/".into(),
             account_id: "1".into(),
             account_name: "me".into(),
-            last_sync: None,
-            error: None,
             zone,
-            error_kind: None,
             watch_user: None,
+            ..Default::default()
         }
     }
 
@@ -982,15 +1149,18 @@ mod tests {
         db.seed().unwrap();
         let c = connection("c0ffee00-0000-4000-8000-00000000000e", Zone::External);
         db.save_connection(&c).unwrap();
+        let ok = SyncState::default().succeeded(Timestamp::from_unix(1_791_763_200));
         let mut theirs = db.items().unwrap().remove(0);
         theirs.id = format!("{}:github:1", c.id);
         theirs.connection_id = Some(c.id.clone());
         theirs.zone = Zone::Internal;
+        let found_at = Some(Timestamp::from_unix(1_791_763_100));
         let list = |login: &str| WatchList {
             connection_id: c.id.clone(),
             login: login.into(),
             items: vec![theirs.clone()],
             error: None,
+            last_success: found_at,
         };
         // Whom each stored list watches.
         let logins = |db: &Db| -> Vec<String> {
@@ -1002,15 +1172,18 @@ mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .unwrap()
         };
-        db.save_sync(&c.id, &[], Some(&list("someone"))).unwrap();
+        db.save_sync(&c.id, &[], Some(&list("someone")), &ok)
+            .unwrap();
         let other = WatchList {
             connection_id: "another".into(),
             ..list("someone")
         };
-        assert!(db.save_sync(&c.id, &[], Some(&other)).is_err());
+        assert!(db.save_sync(&c.id, &[], Some(&other), &ok).is_err());
         assert_eq!(logins(&db), ["someone"]);
         let found = db.watched().unwrap();
         assert_eq!((found.len(), found[0].login.as_str()), (1, "someone"));
+        // When it was found, apart from the account's own sync.
+        assert_eq!(found[0].last_success, found_at);
         // Its connection's zone, like any item; and never one of the
         // account's own items.
         assert_eq!(found[0].items[0].zone, Zone::External);
@@ -1022,21 +1195,220 @@ mod tests {
             error: Some("Watching someone: refused".into()),
             ..list("someone")
         };
-        db.save_sync(&c.id, &[], Some(&failed)).unwrap();
+        db.save_sync(&c.id, &[], Some(&failed), &ok).unwrap();
         let found = db.watched().unwrap();
         assert_eq!(found[0].error, failed.error);
         assert_eq!(found[0].items.len(), 1);
-        db.save_sync(&c.id, &[], None).unwrap();
+        db.save_sync(&c.id, &[], None, &ok).unwrap();
         assert!(logins(&db).is_empty());
-        db.save_sync(&c.id, &[], Some(&list("someone"))).unwrap();
+        db.save_sync(&c.id, &[], Some(&list("someone")), &ok)
+            .unwrap();
         let changed = db.set_watch_user(&c.id, Some("someone-else")).unwrap();
         assert_eq!(changed.watch_user.as_deref(), Some("someone-else"));
         assert_eq!(db.connection(&c.id).unwrap().watch_user, changed.watch_user);
         assert!(logins(&db).is_empty());
-        db.save_sync(&c.id, &[], Some(&list("someone-else")))
+        db.save_sync(&c.id, &[], Some(&list("someone-else")), &ok)
             .unwrap();
         db.delete_connection(&c.id).unwrap();
         assert!(logins(&db).is_empty());
+    }
+
+    #[test]
+    fn sync_state_is_saved_with_what_the_sync_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("db");
+        let c = connection("c0ffee00-0000-4000-8000-00000000000e", Zone::External);
+        let at = |minutes: i64| Timestamp::from_unix(1_791_763_200 + minutes * 60);
+        let template = {
+            let mut db = Db::open(&root).unwrap();
+            db.seed().unwrap();
+            db.items().unwrap().remove(0)
+        };
+        let item = |title: &str| Item {
+            id: format!("{}:gitlab:1", c.id),
+            connection_id: Some(c.id.clone()),
+            title: title.into(),
+            demo: false,
+            ..template.clone()
+        };
+        let mut db = Db::open(&root).unwrap();
+        // Nothing is saved for a connection that isn't there, such as one
+        // disconnected while it synced.
+        let first = SyncState::default().succeeded(at(0));
+        assert!(db.save_sync(&c.id, &[item("first")], None, &first).is_err());
+        assert!(db.save_sync_state(&c.id, &first).is_err());
+        assert!(db.items().unwrap().iter().all(|i| i.title != "first"));
+        db.save_connection(&c).unwrap();
+        assert_eq!(db.connection(&c.id).unwrap().sync, SyncState::default());
+        db.save_sync(&c.id, &[item("first")], None, &first).unwrap();
+        // A failure keeps the items and the last success, and says why.
+        let error = anyhow::Error::new(
+            ConnectorError::new(ErrorKind::Transient, "Rate limited")
+                .held_until(UNIX_EPOCH + Duration::from_secs(at(30).unix() as u64)),
+        );
+        let failed = first.failed(at(5), &error).failed(at(10), &error);
+        db.save_sync_state(&c.id, &failed).unwrap();
+        // Saving the connection's settings leaves its state alone.
+        db.save_connection(&c).unwrap();
+        drop(db);
+        // As after a restart.
+        let db = Db::open(&root).unwrap();
+        let state = db.connection(&c.id).unwrap().sync;
+        assert_eq!(
+            state,
+            SyncState {
+                last_success: Some(at(0)),
+                last_attempt: Some(at(10)),
+                next_due: None,
+                failures: 2,
+                error_kind: Some(ErrorKind::Transient),
+                error: Some("Rate limited".into()),
+                held_until: Some(at(30)),
+            }
+        );
+        let titles: Vec<_> = db
+            .items()
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.connection_id.is_some())
+            .map(|i| i.title)
+            .collect();
+        assert_eq!(titles, ["first"]);
+        // The state isn't part of the stored connection.
+        let body: String = db
+            .sql
+            .query_row("SELECT body FROM connections", [], |r| r.get(0))
+            .unwrap();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body.get("sync"), None, "{body}");
+        let mut db = db;
+        db.delete_connection(&c.id).unwrap();
+        let rows: i64 = db
+            .sql
+            .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn migrates_sync_state_out_of_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("db");
+        drop(Db::open(&root).unwrap());
+        // Connections as schema version 4 stored them.
+        let legacy = |id: &str, last_sync: Value, error: Value, kind: Value| {
+            serde_json::json!({
+                "id": id, "provider": "github", "label": id,
+                "base_url": "https://github.com/", "account_id": "1", "account_name": "me",
+                "last_sync": last_sync, "error": error, "zone": "external",
+                "error_kind": kind, "watch_user": null,
+            })
+        };
+        let rows = [
+            legacy(
+                "ok",
+                "2026-10-12T00:00:00Z".into(),
+                Value::Null,
+                Value::Null,
+            ),
+            legacy(
+                "denied",
+                Value::Null,
+                "Credential rejected".into(),
+                "auth".into(),
+            ),
+            // Before error kinds were kept.
+            legacy(
+                "old",
+                "2026-10-11T00:00:00Z".into(),
+                "Failed".into(),
+                Value::Null,
+            ),
+        ];
+        {
+            let sql = Sqlite::open(root.join("work.sqlite")).unwrap();
+            sql.execute_batch(
+                "DROP TABLE sync_state; ALTER TABLE watched DROP COLUMN last_success;",
+            )
+            .unwrap();
+            for row in &rows {
+                sql.execute(
+                    "INSERT INTO connections VALUES(?1,?2)",
+                    params![row["id"].as_str().unwrap(), row.to_string()],
+                )
+                .unwrap();
+            }
+            sql.pragma_update(None, "user_version", 4).unwrap();
+        }
+        let db = Db::open(&root).unwrap();
+        // The version 4 database was kept as it was.
+        let backup = Sqlite::open(root.join("work.v4.sqlite")).unwrap();
+        let version: i32 = backup
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let kept: i64 = backup
+            .query_row(
+                "SELECT COUNT(*) FROM connections WHERE body LIKE '%last_sync%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 3);
+        let states: Vec<_> = db
+            .connections()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.id, c.zone, c.sync))
+            .collect();
+        let day = |d: &str| Timestamp::parse(&format!("2026-10-{d}T00:00:00Z"));
+        assert_eq!(
+            states,
+            [
+                (
+                    "denied".to_string(),
+                    Zone::External,
+                    SyncState {
+                        failures: 1,
+                        error_kind: Some(ErrorKind::Auth),
+                        error: Some("Credential rejected".into()),
+                        ..SyncState::default()
+                    }
+                ),
+                (
+                    "ok".into(),
+                    Zone::External,
+                    SyncState::default().succeeded(day("12").unwrap())
+                ),
+                (
+                    "old".into(),
+                    Zone::External,
+                    SyncState {
+                        last_success: day("11"),
+                        last_attempt: day("11"),
+                        next_due: None,
+                        failures: 1,
+                        error_kind: Some(ErrorKind::Invalid),
+                        error: Some("Failed".into()),
+                        held_until: None,
+                    }
+                ),
+            ]
+        );
+        let bodies: Vec<String> = db
+            .sql
+            .prepare("SELECT body FROM connections")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            bodies
+                .iter()
+                .all(|b| !b.contains("last_sync") && !b.contains("error")),
+            "{bodies:?}"
+        );
     }
 
     #[test]

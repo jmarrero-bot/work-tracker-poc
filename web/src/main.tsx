@@ -105,12 +105,26 @@ type Connection = {
   base_url: string;
   account_id: string;
   account_name: string;
-  last_sync: string | null;
-  error: string | null;
   zone: Zone;
   // Another GitHub user whose activity, as far as this connection's token
   // can see it, the connection watches.
   watch_user: string | null;
+  sync: SyncState;
+};
+type ErrorKind = "auth" | "transient" | "inaccessible" | "invalid";
+// What a connection's syncs did. Times are UTC, in RFC 3339.
+type SyncState = {
+  // When the last sync whose results were saved started.
+  last_success: string | null;
+  last_attempt: string | null;
+  // When the next scheduled sync is due.
+  next_due: string | null;
+  // Syncs that failed since the last success.
+  failures: number;
+  error_kind: ErrorKind | null;
+  error: string | null;
+  // Until when the source asked for no more requests.
+  held_until: string | null;
 };
 type Progress = {
   delivered: number;
@@ -1216,9 +1230,9 @@ function App() {
                             </strong>
                             <span>{c.base_url}</span>
                             <p>
-                              {c.error ??
-                                (c.last_sync
-                                  ? `Last sync: ${new Date(c.last_sync).toLocaleString()}`
+                              {c.sync.error ??
+                                (c.sync.last_success
+                                  ? `Last sync: ${new Date(c.sync.last_success).toLocaleString()}`
                                   : "Verified. Ready for the first sync.")}
                             </p>
                             <button
