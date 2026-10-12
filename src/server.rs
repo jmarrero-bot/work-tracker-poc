@@ -123,22 +123,28 @@ async fn session(State(app): State<App>) -> Response {
     );
     res
 }
+/// Everything stored, with how fresh it is, and what watching found.
+fn fresh_snapshot(app: &App) -> Result<(Snapshot, Vec<WatchList>)> {
+    let (mut snapshot, mut watched) = {
+        let db = app.db.lock().unwrap();
+        (db.snapshot()?, db.watched()?)
+    };
+    app.scheduler.annotate_snapshot(&mut snapshot, &mut watched);
+    Ok((snapshot, watched))
+}
 async fn snapshot(State(app): State<App>) -> ApiResult<Snapshot> {
-    let mut snapshot = app.db.lock().unwrap().snapshot()?;
-    app.scheduler.annotate(&mut snapshot.connections);
-    Ok(Json(snapshot))
+    Ok(Json(fresh_snapshot(&app)?.0))
 }
 /// What waits on each connection's account, and apart from it what watching
 /// other users found. A local view: internal work shows here, and never
 /// leaves through it.
 async fn mine(State(app): State<App>) -> ApiResult<crate::mine::Mine> {
-    let db = app.db.lock().unwrap();
-    Ok(Json(crate::mine::mine(&db.snapshot()?, &db.watched()?)))
+    let (snapshot, watched) = fresh_snapshot(&app)?;
+    Ok(Json(crate::mine::mine(&snapshot, &watched)))
 }
 /// What may leave this machine, for the hub: the external zone only.
 async fn export_external(State(app): State<App>) -> ApiResult<zone::ExternalSnapshot> {
-    let snapshot = app.db.lock().unwrap().snapshot()?;
-    Ok(Json(zone::external_only(&snapshot)))
+    Ok(Json(zone::external_only(&fresh_snapshot(&app)?.0)))
 }
 async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> ApiResult<Connection> {
     if input.label.trim().is_empty() || input.label.len() > 100 {
@@ -377,6 +383,8 @@ async fn manual(State(app): State<App>, Json(input): Json<ManualInput>) -> ApiRe
         demo: false,
         zone: Zone::Internal,
         reasons: vec![],
+        synced_at: None,
+        stale: false,
     };
     // Manual outcomes are explicit; the status text never implies one.
     item.set_outcome((input.outcome, input.outcome.manual_reason().into()));

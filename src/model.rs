@@ -37,8 +37,8 @@ pub struct Connection {
     pub schedule: Schedule,
 }
 
-/// How a connection's syncs are scheduled now.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// How a connection's syncs are scheduled now, and how fresh its items are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schedule {
     /// How often it syncs, in seconds: its own interval, or the service's.
     pub interval_secs: u64,
@@ -47,6 +47,21 @@ pub struct Schedule {
     /// Its credential was rejected, so its scheduled syncs stopped until the
     /// person verifies it again, gives it a new credential, or reconnects.
     pub needs_user: bool,
+    /// It never synced, or its last success was more than a few intervals
+    /// ago, so its items can't be shown as current.
+    pub stale: bool,
+}
+
+impl Default for Schedule {
+    /// Until it is worked out, nothing says its items are current.
+    fn default() -> Self {
+        Self {
+            interval_secs: 0,
+            running: false,
+            needs_user: false,
+            stale: true,
+        }
+    }
 }
 
 /// What a connection's syncs did: what is saved, in the same transaction as
@@ -131,6 +146,14 @@ pub struct Item {
     /// Why it waits on its connection's account, as of the last sync.
     #[serde(default)]
     pub reasons: Vec<Reason>,
+    /// When its connection last synced successfully, which is how fresh
+    /// it is. Set when it is shown; none for manual items.
+    #[serde(default)]
+    pub synced_at: Option<Timestamp>,
+    /// Whether that was too long ago for it to be current. Set when it is
+    /// shown.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 impl Item {

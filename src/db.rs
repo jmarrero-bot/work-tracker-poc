@@ -775,6 +775,8 @@ impl Db {
                 demo: true,
                 zone: Zone::Internal,
                 reasons: vec![],
+                synced_at: None,
+                stale: false,
             })?;
         }
         self.create_effort(EffortInput {title:"Ship the bootc storage fix".into(),note:"Example effort linking upstream work, a RHEL backport and an advisory. All items are illustrative.".into(),item_ids:[0,1,2,3,6].map(|n|format!("demo-{n}")).to_vec(),share_title:false})?;

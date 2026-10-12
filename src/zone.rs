@@ -53,7 +53,11 @@ pub struct ExternalConnection {
     pub label: String,
     pub base_url: String,
     pub account_name: String,
-    pub last_sync: Option<Timestamp>,
+    /// When its last successful sync started: how fresh its items are.
+    pub last_success: Option<Timestamp>,
+    /// Whether that was too long ago for its items to be current, so the
+    /// hub never shows them as such.
+    pub stale: bool,
     pub error_kind: Option<ErrorKind>,
     pub zone: Zone,
 }
@@ -148,7 +152,8 @@ pub fn external_only(snapshot: &Snapshot) -> ExternalSnapshot {
             label: c.label.clone(),
             base_url: c.base_url.clone(),
             account_name: c.account_name.clone(),
-            last_sync: c.sync.last_success,
+            last_success: c.sync.last_success,
+            stale: c.schedule.stale,
             error_kind: c
                 .sync
                 .error
@@ -291,7 +296,10 @@ mod tests {
             zone,
             watch_user: Some(format!("{INTERNAL}-watched")),
             sync_interval: None,
-            schedule: Schedule::default(),
+            schedule: Schedule {
+                stale: true,
+                ..Schedule::default()
+            },
             sync: SyncState {
                 last_success: Some(Timestamp::from_unix(1_791_763_200 + n as i64)),
                 last_attempt: Some(Timestamp::from_unix(1_791_763_300)),
@@ -333,6 +341,8 @@ mod tests {
             demo: false,
             zone,
             reasons: vec![],
+            synced_at: None,
+            stale: false,
         }
     }
     /// An effort whose title is tagged internal unless it's shared.
@@ -500,8 +510,9 @@ mod tests {
                     "error_kind",
                     "id",
                     "label",
-                    "last_sync",
+                    "last_success",
                     "provider",
+                    "stale",
                     "zone",
                 ],
             ),
@@ -530,6 +541,13 @@ mod tests {
             assert_eq!(keys(value), expected, "{value}");
         }
         assert_eq!(out["connections"][0]["error_kind"], "transient");
+        // Freshness, and nothing else of the sync state, such as its
+        // message.
+        assert_eq!(
+            out["connections"][0]["last_success"],
+            "2026-10-12T00:00:01Z"
+        );
+        assert_eq!(out["connections"][0]["stale"], true);
     }
 
     /// A small deterministic generator (xorshift64), so a failing case is

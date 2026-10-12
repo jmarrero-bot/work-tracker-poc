@@ -914,6 +914,10 @@ h1 {
 .danger {
   color: #dda0a4;
 }
+.stale-tag {
+  font-style: normal;
+  color: #e3bd78;
+}
 .detail-panel {
   width: 360px;
   flex-shrink: 0;
