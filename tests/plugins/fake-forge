@@ -35,16 +35,15 @@ def item(remote_id, outcome, action='next', reasons=()):
     # An instance whose host starts with "marked-" marks all its work with
     # its first label, so a test can look for that work where it shouldn't
     # be. Otherwise every instance lists the same changes.
-    label = host.split('.')[0]
-    marked = label.startswith('marked-')
+    mark = f'{label} ' if marked else ''
     return {
         'remote_id': remote_id,
         'key': f'{label.upper() if marked else "FF"}-{remote_id}',
-        'title': f'{label.upper() + " " if marked else ""}Fake change {remote_id}',
+        'title': f'{mark.upper()}Fake change {remote_id}',
         'url': f'https://{host if marked else "forge.example"}/changes/{remote_id}',
-        'status': outcome,
+        'status': f'{mark}{outcome}',
         'outcome': outcome,
-        'outcome_reason': f'Fake forge says {outcome}',
+        'outcome_reason': f'{mark}Fake forge says {outcome}',
         'action': action,
         'updated_at': '2026-10-12T00:00:00Z',
         'reasons': list(reasons),
@@ -62,6 +61,8 @@ if request['protocol'] != 1:
 
 base_url = urllib.parse.urlsplit(request['instance']['base_url'])
 host = base_url.hostname
+label = host.split('.')[0]
+marked = label.startswith('marked-')
 if host == 'slow.example':
     time.sleep(30)
 elif host == 'garbage.example':
@@ -98,11 +99,17 @@ elif host == 'hang.example':
         f.write(str(helper().pid))
     time.sleep(30)
 
-if request['credential'] != TOKEN:
+# A marked instance takes a token of its own, marked too, so a test can
+# tell its credential from any other.
+if request['credential'] != (f'test-only-{label}' if marked else TOKEN):
     error('auth', 'Credential rejected')
 method = request['method']
 if method == 'verify':
-    answer({'account': {'id': '42', 'name': 'fixture'}})
+    answer({'account': {'id': '42', 'name': f'{label} fixture' if marked else 'fixture'}})
+# A marked instance whose label ends in "-down" verifies, then fails every
+# sync with a marked message.
+if marked and label.endswith('-down'):
+    error('transient', f'{label} is down')
 if request['account']['id'] != '42':
     error('invalid', 'Unexpected account')
 if method == 'list':

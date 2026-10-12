@@ -23,11 +23,14 @@ from urllib.request import Request, urlopen
 binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'target/debug/workboard').resolve())
 plugin = Path(__file__).resolve().parent / 'plugins' / 'fake-forge'
 TAILNET = 'hub.example.ts.net'
-TOKEN_ENV = dict(os.environ, WORKBOARD_SMOKE_TOKEN='test-only-token')
 # Everything internal on the companion carries this, in some case: the
-# plugin marks the work of an instance named after it.
+# plugin marks the work of an instance named after it (its keys, titles,
+# links, statuses and account), and the error of one that is down. Its
+# credential is marked too, unlike the hub's.
 LABEL = 'marked-' + secrets.token_hex(4)
+DOWN = LABEL + '-down'
 MARKERS = [LABEL.encode()]
+TOKEN_ENV = dict(os.environ, WORKBOARD_SMOKE_TOKEN='test-only-token', WORKBOARD_LABEL_TOKEN='test-only-' + LABEL, WORKBOARD_DOWN_TOKEN='test-only-' + DOWN)
 
 
 def leaks(data):
@@ -217,12 +220,15 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
 
         companion = Service(companion_root)
         services.append(companion)
-        # Its internal work, all of it marked.
-        companion.cli('connect', 'errata', '--url', f'https://{LABEL}.example/', '--label', f'{LABEL} Errata', '--token-env', 'WORKBOARD_SMOKE_TOKEN')
+        # Its internal work, all of it marked, and a connection whose syncs
+        # fail with a marked error.
+        companion.cli('connect', 'errata', '--url', f'https://{LABEL}.example/', '--label', f'{LABEL} Errata', '--token-env', 'WORKBOARD_LABEL_TOKEN')
+        companion.cli('connect', 'errata', '--url', f'https://{DOWN}.example/', '--token-env', 'WORKBOARD_DOWN_TOKEN')
         companion.cli('add', '--provider', 'errata', '--key', f'{LABEL}-advisory', '--title', f'{LABEL} advisory', '--url', f'https://{LABEL}.example/advisory/1')
-        companion.cli('sync')
+        assert DOWN + ' is down' in companion.cli('sync', check=False).stdout
         own = companion.json('/api/snapshot')
         assert own['mode'] == 'local' and own['hub'] is None, own
+        assert all(leaks(json.dumps(c)) for c in own['connections']), own['connections']
         internal_items = [i['id'] for i in own['items']]
         assert len(internal_items) == 3 and all(leaks(json.dumps(i)) for i in own['items']), own
         status, _, body = companion.call('/api/efforts', 'POST', {'title': f'{LABEL} effort', 'note': f'{LABEL} note', 'item_ids': internal_items, 'share_title': True})
@@ -244,7 +250,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         assert sorted(i['id'] for i in from_hub) == sorted('hub:' + i for i in hub_items), board
         assert all(i['zone'] == 'external' and not i['stale'] for i in from_hub), from_hub
         assert {i['id'] for i in board['items'] if not i['from_hub']} == set(internal_items), board
-        assert [c['from_hub'] for c in board['connections']] == [False, True], board['connections']
+        assert [c['from_hub'] for c in board['connections']] == [False, False, True], board['connections']
         # Only efforts with external work leave the hub.
         assert [e['title'] for e in board['efforts'] if e['from_hub']] == ['Hub effort'], board['efforts']
         inbox = json.loads(companion.cli('inbox', '--json').stdout)
@@ -274,8 +280,9 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         companion.cli('disconnect', dup_id)
         assert any(i['from_hub'] for i in companion.json('/api/snapshot')['items'])
 
-        # An explicit sync pulls too.
-        companion.cli('sync')
+        # An explicit sync pulls too, while the connection that is down
+        # fails on its own.
+        companion.cli('sync', check=False)
 
         # The companion sent the hub GETs of its export, and nothing else,
         # and nothing of its internal work.
