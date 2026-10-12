@@ -12,9 +12,9 @@ git tag -a v0.1.0 -m 'workboard v0.1.0'
 git push origin v0.1.0
 ```
 
-The [release workflow](../.github/workflows/release.yml) then builds the image from that tag, pushes it to `ghcr.io/jmarrero-bot/work-tracker-poc` with the tag's name, runs the image smoke test (`tests/image_smoke.py`) against the pushed digest, and attests the image's build provenance. Its `packages: write` permission is that job's alone; pull requests build and test the image in `ci` without pushing.
+The [release workflow](../.github/workflows/release.yml) then builds the image from that tag and runs the image smoke test (`tests/image_smoke.py`) on it. Only then does it push it to `ghcr.io/jmarrero-bot/work-tracker-poc` with the tag's name, run the smoke test again on the pushed digest, and attest the image's build provenance. Its `packages: write` permission is that job's alone; pull requests build and test the image in `ci` without pushing.
 
-Don't move or reuse a tag: the image tag would move with it, and the digest is what's deployed anyway.
+**If the run fails, don't pin anything from it**, even a digest it printed or pushed: an image pushed before a later step failed may be untested or unattested. Fix the cause on `main` and cut a new tag. Don't move or reuse a tag: the image tag would move with it, and the digest is what's deployed anyway.
 
 ## Move the base images
 
