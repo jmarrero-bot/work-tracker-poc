@@ -133,9 +133,9 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         bail_api("Enter a connection name of 1–100 characters")?
     }
     let base = connectors::base_url(&input.base_url)?;
-    let source = connectors::Provider::new(&input.provider)?;
+    let source = connectors::builtin(&input.provider)?;
     let target = Target::new(&base, &input.token)?;
-    let account = connector::verify(&source, &target).await?;
+    let account = connector::verify(source.as_ref(), &target).await?;
     let (id, name) = (account.id, account.name);
     let db = app.db.lock().unwrap();
     if db
@@ -184,9 +184,9 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
         };
         let result = async {
             let token = token?;
-            let source = connectors::Provider::new(&c.provider)?;
+            let source = connectors::builtin(&c.provider)?;
             let target = Target::new(&c.base_url, &token)?;
-            Ok::<_, anyhow::Error>(connector::sync(&source, &target, &c, &old).await?)
+            Ok::<_, anyhow::Error>(connector::sync(source.as_ref(), &target, &c, &old).await?)
         }
         .await;
         let mut db = app.db.lock().unwrap();
