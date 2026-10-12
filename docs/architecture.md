@@ -15,8 +15,11 @@ Both clients operate on the same API. The CLI is not a second database writer. T
 ## Model
 
 - **Connection:** UUID, provider, canonical base URL, stable remote account ID, display name, last successful sync and current sync error. The secret is separate from this record.
-- **Item:** local ID namespaced by connection, remote identity, source URL, unmodified source status, terminal status flag, attention category, source update time, optional effort. Manually added items have no connection.
-- **Effort:** a manually named outcome with notes and linked items spanning services and hosts. It persists independently of agent sessions. Completion is the number of terminal linked items; a closed MR counts as terminal, not necessarily delivered. Users must interpret whether a closed change fulfilled the effort.
+- **Item:** local ID namespaced by connection, remote identity, source URL, unmodified source status, derived outcome and the reason for it, attention category, source update time, optional effort. Manually added items have no connection.
+- **Effort:** a manually named outcome with notes and linked items spanning services and hosts. It persists independently of agent sessions. Progress counts only delivered linked items. Closed-without-delivery and unknown items need attention, and abandoned items leave the total.
+- **Outcome:** open, delivered, closed without delivery, abandoned or unknown, derived per connector in `src/outcome.rs`: GitLab from the merge request state, Jira from the status category and the resolution, manual items from an explicit choice. Abandoned is a person's decision; for synced items it is kept in its own column, so syncs preserve it like effort links.
+
+The SQLite schema version is kept in `user_version`. Opening an older database copies it to `work.vN.sqlite`, then migrates it in one transaction; a newer one is refused.
 
 The six provider identifiers are `jira`, `gitlab-internal`, `gitlab-public`, `github`, `fedora`, and `errata`. Internal/public GitLab share code; their URLs and credentials remain distinct. Different credentials are never tried as a fallback after an access error.
 
@@ -34,7 +37,8 @@ All `/api` routes require the local application's bearer credential or paired br
 | `POST /api/efforts` | Create an effort and attach selected items transactionally |
 | `POST /api/links` | Assign or unassign an item to an effort |
 | `POST /api/items` | Add a manual source link |
-| `PATCH /api/items/:id` | Update a manual link’s status and attention |
+| `PATCH /api/items/:id` | Update a manual link’s status, attention and outcome |
+| `POST /api/items/:id/abandon` | Mark a synced item abandoned, or undo it |
 
 Live source requests are GET-only. No comments, merges, ticket updates or agent dispatches occur.
 
