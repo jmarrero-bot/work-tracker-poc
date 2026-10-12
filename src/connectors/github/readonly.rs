@@ -208,6 +208,15 @@ struct Answer {
     body: Vec<u8>,
 }
 
+/// What GitHub's GraphQL API answered: what it could read, and its errors.
+// The bot plugin (#9) reads Projects v2, which only GraphQL serves.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct GraphqlAnswer {
+    pub data: Value,
+    pub errors: Vec<Value>,
+}
+
 /// What a GET found.
 pub enum Got {
     Found(Value),
@@ -480,7 +489,9 @@ impl ReadOnly {
         }
     }
     /// Ask GitHub's GraphQL API `document`, which has to be queries only,
-    /// and return its `data`.
+    /// and return its `data`, with the errors GitHub answered next to what
+    /// it could read, such as one for each ID that names nothing, for the
+    /// caller to judge.
     // The bot plugin (#9) reads Projects v2, which only GraphQL serves.
     #[allow(dead_code)]
     pub async fn graphql(
@@ -488,7 +499,7 @@ impl ReadOnly {
         target: &Target,
         document: &str,
         variables: Map<String, Value>,
-    ) -> ConnectorResult<Value> {
+    ) -> ConnectorResult<GraphqlAnswer> {
         let document = read_only_document(document).map_err(|why| {
             self.count(|c| c.refused += 1);
             ConnectorError::invalid(format!(
@@ -508,12 +519,19 @@ impl ReadOnly {
             return Err(http_error(answer.status));
         }
         let mut answer = parse_json(SOURCE, &answer.body)?;
-        if answer["errors"].as_array().is_some_and(|e| !e.is_empty()) {
-            return Err(ConnectorError::invalid(
-                "GitHub's GraphQL API answered with errors",
-            ));
-        }
-        Ok(answer.get_mut("data").map(Value::take).unwrap_or_default())
+        let errors = match answer.get_mut("errors").map(Value::take) {
+            None | Some(Value::Null) => vec![],
+            Some(Value::Array(errors)) => errors,
+            Some(_) => {
+                return Err(ConnectorError::invalid(
+                    "GitHub's GraphQL API answered with malformed errors",
+                ))
+            }
+        };
+        Ok(GraphqlAnswer {
+            data: answer.get_mut("data").map(Value::take).unwrap_or_default(),
+            errors,
+        })
     }
 }
 
@@ -726,11 +744,12 @@ mod tests {
         assert_eq!(seen.load(Ordering::SeqCst), 0, "nothing reached GitHub");
         assert_eq!(client.requests().refused, 5);
         // Reads still go out, and are counted by what was sent.
-        let data = client
+        let answer = client
             .graphql(&target, "query { viewer { login } }", Map::new())
             .await
             .unwrap();
-        assert_eq!(data["viewer"]["login"], "me");
+        assert_eq!(answer.data["viewer"]["login"], "me");
+        assert!(answer.errors.is_empty());
         client.get_found(&target, "user", &[]).await.unwrap();
         assert_eq!(seen.load(Ordering::SeqCst), 2);
         let sent: Vec<_> = client.requests().sent.into_iter().collect();
