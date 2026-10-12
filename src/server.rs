@@ -356,6 +356,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         bail_api("This is a hub, which connects external sources only: add --external (or turn on External). Connect internal sources on the companion")?
     }
     let base = connectors::base_url(&input.base_url)?;
+    let bot = bot_config(&input)?;
     let watch_user = input.watch_user.as_deref().map(str::trim);
     if let Some(login) = watch_user {
         check_watch_user(&input.provider, login)?;
@@ -364,7 +365,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
     if let Some(interval) = sync_interval {
         schedule::check_interval(interval)?;
     }
-    let source = app.scheduler.connector(&input.provider)?;
+    let source = app.scheduler.connector(&input.provider, bot.as_ref())?;
     let target = Target::new(&base, &input.token)?;
     let account = connector::verify(source.as_ref(), &target).await?;
     let (id, name) = (account.id, account.name);
@@ -389,6 +390,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         zone: input.zone,
         watch_user: watch_user.map(str::to_string),
         sync_interval: input.sync_interval,
+        bot,
         sync: SyncState::default(),
         schedule: Schedule::default(),
         from_hub: false,
@@ -405,6 +407,25 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
     let mut c = c;
     app.scheduler.annotate(std::slice::from_mut(&mut c));
     Ok(Json(c))
+}
+/// A new connection's bot settings, checked: the bot's are given in full,
+/// and nothing else takes any. The bot's work is public on GitHub, so it is
+/// connected as external.
+fn bot_config(input: &ConnectInput) -> Result<Option<BotConfig>> {
+    let config = match (&input.bot, input.provider == "bot") {
+        (Some(bot), true) => Some(bot.clone().config()?),
+        (None, true) => {
+            bail!("Give the bot's board, tracker, heartbeat issue, login and forge organization")
+        }
+        (Some(_), false) => {
+            bail!("Only a bot connection takes the bot's board, tracker and heartbeat")
+        }
+        (None, false) => None,
+    };
+    if config.is_some() && input.zone != Zone::External {
+        bail!("The bot's work is public on GitHub: connect it as external (--external, or turn on External)")
+    }
+    Ok(config)
 }
 fn bail_api(message: &str) -> Result<()> {
     bail!("{message}")
@@ -599,6 +620,7 @@ async fn manual(State(app): State<App>, Json(input): Json<ManualInput>) -> ApiRe
         synced_at: None,
         stale: false,
         from_hub: false,
+        bot: None,
     };
     // Manual outcomes are explicit; the status text never implies one.
     item.set_outcome((input.outcome, input.outcome.manual_reason().into()));

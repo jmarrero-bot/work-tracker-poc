@@ -240,6 +240,7 @@ pub fn gitlab_item(v: &Value, action: &str) -> Result<RemoteItem> {
         action: action.into(),
         updated_at: string(v, "updated_at")?,
         reasons: vec![],
+        bot: None,
     })
 }
 
@@ -262,6 +263,7 @@ pub fn gitlab_issue_item(v: &Value, action: &str) -> Result<RemoteItem> {
         action: action.into(),
         updated_at: string(v, "updated_at")?,
         reasons: vec![],
+        bot: None,
     })
 }
 

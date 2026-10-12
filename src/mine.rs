@@ -204,6 +204,7 @@ mod tests {
             synced_at: None,
             stale: false,
             from_hub: false,
+            bot: None,
         }
     }
     fn snapshot(items: Vec<Item>) -> Snapshot {

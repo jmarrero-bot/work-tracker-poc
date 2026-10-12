@@ -1,7 +1,7 @@
-//! The connectors: Jira, GitLab, GitHub and Fedora Forge (Forgejo) built in,
-//! sharing URL rules and an HTTP client that keeps TLS verification,
-//! refuses redirects and never surfaces a remote response body; and
-//! third-party plugins run out of process.
+//! The connectors: Jira, GitLab, GitHub, Fedora Forge (Forgejo) and a
+//! harness bot's work on GitHub built in, sharing URL rules and an HTTP
+//! client that keeps TLS verification, refuses redirects and never surfaces
+//! a remote response body; and third-party plugins run out of process.
 
 mod forgejo;
 mod github;
@@ -14,7 +14,7 @@ use crate::{
     connector::{
         Account, Connector, ConnectorError, ConnectorResult, ErrorKind, Refreshed, Target,
     },
-    model::{is_gitlab, valid_provider},
+    model::{is_gitlab, valid_provider, BotConfig},
 };
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, Response, StatusCode};
@@ -86,14 +86,25 @@ pub struct Shared {
     forgejo: Arc<forgejo::Memory>,
 }
 
-/// The connector for a provider: built in for Jira, GitLab, GitHub and
-/// Fedora Forge, otherwise the plugin named after the provider in
-/// `plugins`, if there is one.
-pub fn for_provider(provider: &str, plugins: &Path, shared: &Shared) -> Result<Box<dyn Connector>> {
+/// The connector for a provider: built in for Jira, GitLab, GitHub, Fedora
+/// Forge and the bot, which reads where `bot` says, otherwise the plugin
+/// named after the provider in `plugins`, if there is one.
+pub fn for_provider(
+    provider: &str,
+    bot: Option<&BotConfig>,
+    plugins: &Path,
+    shared: &Shared,
+) -> Result<Box<dyn Connector>> {
     Ok(match provider {
         "jira" => Box::new(jira::Jira::new()?),
         p if is_gitlab(p) => Box::new(gitlab::GitLab::new()?),
         "github" => Box::new(github::GitHub::new(shared.github.clone())?),
+        "bot" => {
+            let config = bot.context(
+                "A bot connection needs the bot's board, tracker, heartbeat issue, login and forge organization",
+            )?;
+            Box::new(github::Bot::new(shared.github.clone(), config.clone())?)
+        }
         "fedora" => Box::new(forgejo::Forgejo::new(shared.forgejo.clone())?),
         p if valid_provider(p) => {
             let program = std::path::absolute(plugins.join(p))?;
@@ -341,20 +352,28 @@ mod tests {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
         // A plugin can serve a known source without a built-in connector,
         // but neither replace a built-in one nor add an unknown source.
-        for name in ["errata", "jira", "github", "fedora", "bugzilla"] {
+        for name in ["errata", "jira", "github", "fedora", "bot", "bugzilla"] {
             std::fs::copy(&script, plugins.path().join(name)).unwrap();
         }
-        for (provider, kind) in [
-            ("jira", Some("jira")),
-            ("gitlab-internal", Some("gitlab")),
-            ("gitlab-public", Some("gitlab")),
-            ("errata", Some("errata")),
-            ("github", Some("github")),
-            ("fedora", Some("fedora")),
-            ("bugzilla", None),
+        let config = crate::bot::tests::config();
+        let mut wrong = config.clone();
+        wrong.tracker = "no-slash".into();
+        // (provider, its bot settings, the connector)
+        for (provider, bot, kind) in [
+            ("jira", None, Some("jira")),
+            ("gitlab-internal", None, Some("gitlab")),
+            ("gitlab-public", None, Some("gitlab")),
+            ("errata", None, Some("errata")),
+            ("github", None, Some("github")),
+            ("fedora", None, Some("fedora")),
+            ("bot", Some(&config), Some("bot")),
+            // The bot only reads where it is told to, never a plugin.
+            ("bot", None, None),
+            ("bot", Some(&wrong), None),
+            ("bugzilla", None, None),
         ] {
             assert_eq!(
-                for_provider(provider, plugins.path(), &Shared::default())
+                for_provider(provider, bot, plugins.path(), &Shared::default())
                     .ok()
                     .map(|c| c.kind().to_string())
                     .as_deref(),
@@ -362,10 +381,11 @@ mod tests {
                 "{provider}"
             );
         }
-        // The built-in GitHub and Forgejo connectors, which count what they
-        // send, and not the plugins of those names.
-        for provider in ["github", "fedora"] {
-            let connector = for_provider(provider, plugins.path(), &Shared::default()).unwrap();
+        // The built-in GitHub, Forgejo and bot connectors, which count what
+        // they send, and not the plugins of those names.
+        for (provider, bot) in [("github", None), ("fedora", None), ("bot", Some(&config))] {
+            let connector =
+                for_provider(provider, bot, plugins.path(), &Shared::default()).unwrap();
             assert!(connector.requests().is_some(), "{provider}");
         }
     }

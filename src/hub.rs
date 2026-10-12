@@ -414,6 +414,7 @@ pub fn merge(snapshot: &mut Snapshot, export: &ExternalSnapshot, status: &Status
                 stale: fresh[c.id.as_str()].1,
             },
             from_hub: true,
+            bot: None,
         });
     }
     // The hub's efforts with work shown here: one whose items are all
@@ -445,6 +446,7 @@ pub fn merge(snapshot: &mut Snapshot, export: &ExternalSnapshot, status: &Status
             synced_at,
             stale,
             from_hub: true,
+            bot: None,
         });
     }
     for e in export

@@ -24,7 +24,13 @@ import {
 import "./style.css";
 
 type Provider =
-  "jira" | "gitlab-internal" | "gitlab-public" | "github" | "fedora" | "errata";
+  | "jira"
+  | "gitlab-internal"
+  | "gitlab-public"
+  | "github"
+  | "fedora"
+  | "bot"
+  | "errata";
 // Internal work is shown only on the machine that syncs it; external work
 // may leave it in the external export, as a hub's does for its companions.
 type Zone = "internal" | "external";
@@ -43,7 +49,8 @@ type Reason =
   | "changes_requested"
   | "checks_failing"
   | "authored"
-  | "todo";
+  | "todo"
+  | "bot_waiting";
 const reasonLabels: Record<Reason, string> = {
   review_requested: "Review requested",
   team_review_requested: "Team review requested",
@@ -53,6 +60,17 @@ const reasonLabels: Record<Reason, string> = {
   checks_failing: "Needs action: checks failing",
   authored: "Authored",
   todo: "On the to-do list",
+  bot_waiting: "Bot waiting on you",
+};
+// What the bot connector reads besides: a board item's fields, or the board
+// item whose Branch links a fork pull request.
+type BotFields = {
+  kind: "board_item" | "fork_pr";
+  priority: string | null;
+  why: string | null;
+  news: string | null;
+  branch: string | null;
+  board_item: string | null;
 };
 type Item = {
   id: string;
@@ -78,6 +96,7 @@ type Item = {
   stale: boolean;
   // It came from the hub, and is read-only here.
   from_hub: boolean;
+  bot?: BotFields;
 };
 // One thing that waits in the Mine view, once, with every reason.
 type MineRow = {
@@ -217,6 +236,7 @@ const providers: Record<
   },
   github: { name: "GitHub", short: "GH", color: "#c6cdd9", live: true },
   fedora: { name: "Fedora Forge", short: "FE", color: "#79bbea", live: true },
+  bot: { name: "Bot", short: "BT", color: "#b9a3f0", live: true },
 };
 const names = Object.keys(providers) as Provider[];
 const outcomes: Record<Outcome, string> = {
@@ -780,6 +800,16 @@ function App() {
           watch_user:
             connectProvider === "github" && form.watch?.trim()
               ? form.watch.trim()
+              : null,
+          bot:
+            connectProvider === "bot"
+              ? {
+                  board: form.board ?? "",
+                  tracker: form.tracker ?? "",
+                  heartbeat_issue: Number(form.heartbeat),
+                  bot_login: form.bot_login ?? "",
+                  forge_org: form.forge_org ?? "",
+                }
               : null,
         });
       if (modal === "manual")
@@ -1605,6 +1635,8 @@ function App() {
                               ? "Connect the instance URL and a token with API read access."
                               : p === "github"
                                 ? "github.com or GitHub Enterprise Server, with a token. Workboard only reads: it refuses any request that could change GitHub."
+                              : p === "bot"
+                                ? "A harness bot's work: its board, its fork pull requests and its heartbeat, read with a GitHub token. Workboard only reads."
                               : p === "fedora"
                                 ? "forge.fedoraproject.org, with a Forgejo access token (read:user, read:issue and read:repository are enough). Workboard only reads: it refuses any request that could change it. Package dist-git on src.fedoraproject.org takes source links for now."
                               : p === "errata"
@@ -1924,13 +1956,51 @@ function App() {
                     true,
                     connectProvider === "jira"
                       ? "https://jira.example.com/"
-                      : connectProvider === "github"
+                      : connectProvider === "github" ||
+                          connectProvider === "bot"
                         ? "https://github.com/"
                         : connectProvider === "fedora"
                           ? "https://forge.fedoraproject.org/"
                           : "https://gitlab.example.com/",
                   )}
                   {field("token", "Personal access token", "password", true)}
+                  {connectProvider === "bot" && (
+                    <>
+                      {field(
+                        "board",
+                        "The bot's board",
+                        "text",
+                        true,
+                        "orgs/OWNER/NUMBER",
+                      )}
+                      {field(
+                        "tracker",
+                        "Its tracker repository",
+                        "text",
+                        true,
+                        "OWNER/REPO",
+                      )}
+                      {field(
+                        "heartbeat",
+                        "Its heartbeat issue number",
+                        "number",
+                        true,
+                        "1",
+                      )}
+                      {field("bot_login", "The bot's login", "text", true)}
+                      {field(
+                        "forge_org",
+                        "The organization of its forks",
+                        "text",
+                        true,
+                      )}
+                      <p className="token-note">
+                        Reads the board's items, the bot's open fork pull
+                        requests and its heartbeat, and nothing else: no
+                        request that could change GitHub is sent.
+                      </p>
+                    </>
+                  )}
                   {connectProvider === "github" && (
                     <>
                       {field(

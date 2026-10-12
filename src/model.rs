@@ -1,4 +1,5 @@
 pub use crate::{
+    bot::{BotConfig, BotFields, BotInput},
     clock::Timestamp,
     connector::{ConnectorError, ErrorKind, Reason},
     outcome::{Outcome, Progress},
@@ -27,6 +28,10 @@ pub struct Connection {
     /// default.
     #[serde(default)]
     pub sync_interval: Option<u64>,
+    /// For the bot connector: where the bot's board, tracker and heartbeat
+    /// are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<BotConfig>,
     /// What its syncs did. Kept in a table of its own, saved with what a
     /// sync found, and never stored with the connection.
     #[serde(default)]
@@ -160,6 +165,10 @@ pub struct Item {
     /// It came from the hub, and is read-only here. Never stored.
     #[serde(default)]
     pub from_hub: bool,
+    /// What the bot connector read besides: a board item's fields, or the
+    /// board item that links a fork pull request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<BotFields>,
 }
 
 impl Item {
@@ -219,6 +228,10 @@ pub struct ConnectInput {
     /// default.
     #[serde(default)]
     pub sync_interval: Option<u64>,
+    /// For the bot connector: where the bot's board, tracker and heartbeat
+    /// are.
+    #[serde(default)]
+    pub bot: Option<BotInput>,
 }
 
 /// The items a connection found by watching another user, as of its last
@@ -275,8 +288,20 @@ pub fn valid_github_login(login: &str) -> bool {
         && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// Whether `name` can be a GitHub owner or repository name, and so is safe
+/// in an API path.
+pub fn valid_github_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 100
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
 pub fn valid_provider(provider: &str) -> bool {
-    is_gitlab(provider) || matches!(provider, "jira" | "github" | "fedora" | "errata")
+    is_gitlab(provider) || matches!(provider, "jira" | "github" | "fedora" | "errata" | "bot")
 }
 
 #[cfg(test)]

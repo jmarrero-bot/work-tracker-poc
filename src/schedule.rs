@@ -12,12 +12,13 @@
 //! so a sync that stops halfway leaves the last good data and is due again.
 
 use crate::{
+    bot::BoardSummary,
     clock::{Clock, Timestamp},
     connector::{self, Connector, Credential, Requests, Target},
     connectors,
     db::Db,
     hub::{self, Pull},
-    model::{Connection, ErrorKind, Item, Schedule, Snapshot, SyncState, WatchList},
+    model::{BotConfig, Connection, ErrorKind, Item, Schedule, Snapshot, SyncState, WatchList},
     zone::ExternalSnapshot,
 };
 use anyhow::{bail, Context, Result};
@@ -162,7 +163,8 @@ pub fn freshness(connections: &[Connection], items: &mut [Item]) {
 /// Where the scheduler gets a connector for a provider, and the client it
 /// reads a hub with.
 pub trait Sources: Send + Sync {
-    fn connector(&self, provider: &str) -> Result<Box<dyn Connector>>;
+    /// The connector for `provider`; for the bot, reading where `bot` says.
+    fn connector(&self, provider: &str, bot: Option<&BotConfig>) -> Result<Box<dyn Connector>>;
     fn hub(&self) -> Result<Box<dyn Pull>>;
 }
 
@@ -174,8 +176,8 @@ pub struct Builtin {
 }
 
 impl Sources for Builtin {
-    fn connector(&self, provider: &str) -> Result<Box<dyn Connector>> {
-        connectors::for_provider(provider, &self.plugins, &self.shared)
+    fn connector(&self, provider: &str, bot: Option<&BotConfig>) -> Result<Box<dyn Connector>> {
+        connectors::for_provider(provider, bot, &self.plugins, &self.shared)
     }
     fn hub(&self) -> Result<Box<dyn Pull>> {
         Ok(Box::new(hub::HubClient::new()?))
@@ -215,6 +217,10 @@ pub struct Report {
     pub items: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watched: Option<Watched>,
+    /// For a bot: its board as listed, and how many of its items this
+    /// token can't read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -235,6 +241,7 @@ impl Report {
             coalesced: false,
             items: None,
             watched: None,
+            board: None,
             error: None,
             error_kind: None,
             requests: None,
@@ -355,8 +362,8 @@ impl Scheduler {
         Timestamp::of(self.clock.now())
     }
     /// The connector for `provider`.
-    pub fn connector(&self, provider: &str) -> Result<Box<dyn Connector>> {
-        self.sources.connector(provider)
+    pub fn connector(&self, provider: &str, bot: Option<&BotConfig>) -> Result<Box<dyn Connector>> {
+        self.sources.connector(provider, bot)
     }
     /// Look at the schedule again, as after a connection was added or
     /// changed.
@@ -683,7 +690,7 @@ impl Scheduler {
             Err(e) => return Report::new(id, id, trigger).failed(&e),
         };
         let mut report = Report::new(id, &c.label, trigger);
-        let source = self.sources.connector(&c.provider);
+        let source = self.sources.connector(&c.provider, c.bot.as_ref());
         let result = async {
             let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
             let target = Target::new(&c.base_url, &token?)?;
@@ -700,7 +707,9 @@ impl Scheduler {
             )
         }
         .await;
-        report.requests = source.ok().and_then(|s| s.requests());
+        let source = source.ok();
+        report.requests = source.as_ref().and_then(|s| s.requests());
+        let board = source.as_ref().and_then(|s| s.board());
         let finished = self.now();
         let sample = (self.sample)();
         let mut db = self.db();
@@ -714,6 +723,7 @@ impl Scheduler {
                     items: w.items.len(),
                     error: w.error.clone(),
                 });
+                report.board = board;
                 db.save_sync(&c.id, &items, watched.as_ref(), &state)
                     .map(|()| state)
             }
@@ -730,6 +740,7 @@ impl Scheduler {
             Err(e) => {
                 report.items = None;
                 report.watched = None;
+                report.board = None;
                 report = report.failed(&anyhow::anyhow!("Cannot save what the sync found: {e:#}"));
             }
         }
@@ -754,7 +765,7 @@ impl Scheduler {
                 None => stored?,
             },
         )?;
-        let source = self.sources.connector(&c.provider)?;
+        let source = self.sources.connector(&c.provider, c.bot.as_ref())?;
         let account = connector::verify(source.as_ref(), &target).await?;
         if account.id != c.account_id {
             bail!(
@@ -909,6 +920,7 @@ mod tests {
                 } else {
                     vec![Reason::Assigned]
                 },
+                bot: None,
             })
             .collect()
     }
@@ -1012,7 +1024,7 @@ mod tests {
     struct FakeSources(Arc<World>);
 
     impl Sources for FakeSources {
-        fn connector(&self, _: &str) -> Result<Box<dyn Connector>> {
+        fn connector(&self, _: &str, _: Option<&BotConfig>) -> Result<Box<dyn Connector>> {
             Ok(Box::new(Fake(self.0.clone())))
         }
         fn hub(&self) -> Result<Box<dyn Pull>> {
