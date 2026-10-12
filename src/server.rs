@@ -334,8 +334,9 @@ async fn mine(State(app): State<App>) -> ApiResult<crate::mine::Mine> {
     let (snapshot, watched, _) = board(&app)?;
     Ok(Json(crate::mine::mine(&snapshot, &watched)))
 }
-/// What may leave this machine, for the hub: the external zone of this
-/// machine's own work only, never the work a companion pulled from a hub.
+/// What may leave this machine: the external zone of this machine's own
+/// work only, never the work a companion pulled from a hub. A hub serves
+/// it to its companions.
 async fn export_external(State(app): State<App>) -> ApiResult<zone::ExternalSnapshot> {
     Ok(Json(zone::external_only(&fresh_snapshot(&app)?.0)))
 }

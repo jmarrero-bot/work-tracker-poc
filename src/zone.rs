@@ -1,6 +1,7 @@
 //! Zones: where a connection's work may be seen. Internal work (Jira,
 //! internal GitLab, Errata) stays on the machine that syncs it; only external
-//! work may leave it, for the hub, and only through [`external_only`].
+//! work may leave it, only through [`external_only`], as a hub's export
+//! does for its companions.
 
 use crate::{
     connector::ErrorKind,
@@ -19,7 +20,8 @@ pub enum Zone {
     /// Seen only on the machine that syncs it.
     #[default]
     Internal,
-    /// May also be seen away from that machine, on the hub.
+    /// May leave that machine in its external export; the only zone a hub
+    /// keeps.
     External,
 }
 
@@ -79,7 +81,8 @@ pub struct ExternalItem {
     /// Only an exported effort.
     pub effort_id: Option<String>,
     pub zone: Zone,
-    /// Why it waits on its connection's account, for the hub's Mine view.
+    /// Why it waits on its connection's account, for a companion's Mine
+    /// view.
     pub reasons: Vec<Reason>,
 }
 
