@@ -110,6 +110,7 @@ If a tracked item becomes inaccessible, the source sync fails and the previous c
 ```sh
 cd web && npm run build && cd ..
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 python3 tests/smoke.py target/debug/workboard
 ```
