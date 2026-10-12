@@ -477,6 +477,9 @@ h1 {
 .mini-stage .stage-complete {
   color: #92b9a1;
 }
+.mini-stage .stage-attention {
+  color: #d8b883;
+}
 .section-heading {
   display: flex;
   justify-content: space-between;
@@ -610,6 +613,20 @@ h1 {
   color: #ea9a99;
   border-color: #694044;
   background: #342326;
+}
+.status.attention {
+  color: #d8b883;
+  border-color: #5c4d33;
+  background: #2f2a20;
+}
+.status.abandoned {
+  color: #8d97a8;
+}
+.status .outcome {
+  opacity: 0.85;
+}
+.attention-text {
+  color: #d8b883;
 }
 .open-source {
   color: #8490a1;
@@ -915,6 +932,12 @@ h1 {
   margin: 0;
   font-size: 0.875rem;
   color: #c1ccdc;
+}
+.outcome-reason {
+  display: block;
+  font-size: 0.75rem;
+  color: #8d9bae;
+  margin-top: 2px;
 }
 .detail-note {
   font-size: 0.75rem;

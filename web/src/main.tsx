@@ -24,6 +24,12 @@ import "./style.css";
 
 type Provider =
   "jira" | "gitlab-internal" | "gitlab-public" | "github" | "fedora" | "errata";
+type Outcome =
+  | "open"
+  | "delivered"
+  | "closed_without_delivery"
+  | "abandoned"
+  | "unknown";
 type Item = {
   id: string;
   connection_id: string | null;
@@ -33,10 +39,12 @@ type Item = {
   title: string;
   url: string;
   status: string;
-  terminal: boolean;
+  outcome: Outcome;
+  outcome_reason: string;
   action: string;
   updated_at: string;
   effort_id: string | null;
+  abandoned_at: string | null;
   demo: boolean;
 };
 type Connection = {
@@ -49,7 +57,14 @@ type Connection = {
   last_sync: string | null;
   error: string | null;
 };
-type Effort = { id: string; title: string; note: string };
+type Progress = {
+  delivered: number;
+  total: number;
+  open: number;
+  needs_attention: number;
+  abandoned: number;
+};
+type Effort = { id: string; title: string; note: string; progress: Progress };
 type Snapshot = { items: Item[]; connections: Connection[]; efforts: Effort[] };
 const providers: Record<
   Provider,
@@ -73,6 +88,43 @@ const providers: Record<
   fedora: { name: "Fedora Forge", short: "FE", color: "#79bbea", live: false },
 };
 const names = Object.keys(providers) as Provider[];
+const outcomes: Record<Outcome, string> = {
+  open: "Open",
+  delivered: "Delivered",
+  closed_without_delivery: "Closed, not delivered",
+  abandoned: "Abandoned",
+  unknown: "Unknown",
+};
+const outcomeNames = Object.keys(outcomes) as Outcome[];
+// Finished: delivered, or abandoned by a person.
+const settled = (i: Item) =>
+  i.outcome === "delivered" || i.outcome === "abandoned";
+// Never progress: a person decides what happened.
+const needsDecision = (i: Item) =>
+  i.outcome === "closed_without_delivery" || i.outcome === "unknown";
+const outcomeClass = (i: Item) =>
+  i.outcome === "delivered"
+    ? "complete"
+    : needsDecision(i)
+      ? "attention"
+      : i.outcome === "abandoned"
+        ? "abandoned"
+        : "";
+function OutcomeIcon({ item, size }: { item: Item; size: number }) {
+  if (item.outcome === "delivered") return <Check size={size} />;
+  if (needsDecision(item)) return <AlertCircle size={size} />;
+  if (item.outcome === "abandoned") return <X size={size} />;
+  return <Circle size={size - 4} fill="currentColor" />;
+}
+function progressText(p: Progress) {
+  const parts = [
+    p.open && `${p.open} open`,
+    p.needs_attention &&
+      `${p.needs_attention} ${p.needs_attention === 1 ? "needs" : "need"} attention`,
+    p.abandoned && `${p.abandoned} abandoned`,
+  ].filter(Boolean);
+  return parts.length ? parts.join(" · ") : "Nothing remaining";
+}
 async function api<T>(
   path: string,
   body?: unknown,
@@ -107,16 +159,19 @@ function Mark({
   );
 }
 function Status({ item }: { item: Item }) {
+  const kind =
+    outcomeClass(item) ||
+    (item.status.toLowerCase().includes("fail") ? "failed" : "");
   return (
     <span
-      className={`status ${item.terminal ? "complete" : item.status.toLowerCase().includes("fail") ? "failed" : ""}`}
+      className={`status ${kind}`}
+      title={`${outcomes[item.outcome]}: ${item.outcome_reason}`}
     >
-      {item.terminal ? (
-        <Check size={12} />
-      ) : (
-        <Circle size={8} fill="currentColor" />
-      )}
+      <OutcomeIcon item={item} size={12} />
       {item.status}
+      {item.outcome !== "open" && (
+        <span className="outcome">· {outcomes[item.outcome]}</span>
+      )}
     </span>
   );
 }
@@ -147,6 +202,7 @@ function App() {
   const [form, setForm] = useState<Record<string, string>>({});
   const [manualStatus, setManualStatus] = useState("");
   const [manualAction, setManualAction] = useState("next");
+  const [manualOutcome, setManualOutcome] = useState<Outcome>("open");
   useEffect(() => {
     if (!modal) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -184,14 +240,20 @@ function App() {
     };
   }, [modal, busy]);
   const demo = data.items.some((i) => i.demo);
-  const active = data.items.filter((i) => !i.terminal);
+  const active = data.items.filter((i) => !settled(i));
   const detailItem = data.items.find((i) => i.id === detail);
   useEffect(() => {
     if (detailItem) {
       setManualStatus(detailItem.status);
       setManualAction(detailItem.action || "next");
+      setManualOutcome(detailItem.outcome);
     }
-  }, [detailItem?.id, detailItem?.status, detailItem?.action]);
+  }, [
+    detailItem?.id,
+    detailItem?.status,
+    detailItem?.action,
+    detailItem?.outcome,
+  ]);
   async function reload() {
     const next = await api<Snapshot>("snapshot");
     setData(next);
@@ -230,11 +292,15 @@ function App() {
     () =>
       data.items.filter(
         (i) =>
-          (attention === "complete" ? i.terminal : !i.terminal) &&
+          (attention === "complete" ? settled(i) : !settled(i)) &&
           (source === "all" || i.provider === source) &&
           (attention === "all" ||
             attention === "complete" ||
-            i.action === attention) &&
+            (attention === "decide"
+              ? needsDecision(i)
+              : i.action === attention ||
+                // Like `workboard next`: a decision is a next action too.
+                (attention === "next" && needsDecision(i)))) &&
           `${i.title} ${i.key} ${providers[i.provider].name}`
             .toLowerCase()
             .includes(query.toLowerCase()),
@@ -242,7 +308,7 @@ function App() {
     [data, source, attention, query],
   );
   function openModal(type: typeof modal, provider: Provider = "jira") {
-    setForm({ provider, status: "Open", action: "next" });
+    setForm({ provider, status: "Open", action: "next", outcome: "open" });
     setConnectProvider(provider);
     setError("");
     setModal(type);
@@ -297,6 +363,7 @@ function App() {
           url: form.url,
           status: form.status,
           action: form.action,
+          outcome: form.outcome,
         });
       await reload();
       setModal(null);
@@ -341,11 +408,23 @@ function App() {
     try {
       await api(
         `items/${detailItem.id}`,
-        { status: manualStatus, action: manualAction },
+        { status: manualStatus, action: manualAction, outcome: manualOutcome },
         "PATCH",
       );
       await reload();
       setNotice("Manual status updated.");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function abandon(item: Item, abandoned: boolean) {
+    setBusy(true);
+    try {
+      await api(`items/${item.id}/abandon`, { abandoned });
+      await reload();
+      setNotice(abandoned ? "Marked abandoned." : "Abandoned mark removed.");
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -559,7 +638,9 @@ function App() {
                 {[
                   {
                     name: "Next actions",
-                    value: active.filter((i) => i.action === "next").length,
+                    value: active.filter(
+                      (i) => i.action === "next" || needsDecision(i),
+                    ).length,
                     filter: "next",
                     icon: <ArrowUpRight size={18} />,
                     color: "coral",
@@ -615,13 +696,10 @@ function App() {
                         .map((i) => (
                           <span className="mini-stage" key={i.id}>
                             <span
-                              className={i.terminal ? "stage-complete" : ""}
+                              className={`stage-${outcomeClass(i)}`}
+                              title={`${outcomes[i.outcome]}: ${i.outcome_reason}`}
                             >
-                              {i.terminal ? (
-                                <Check size={11} />
-                              ) : (
-                                <Circle size={8} />
-                              )}
+                              <OutcomeIcon item={i} size={11} />
                             </span>
                             {providers[i.provider].name}
                           </span>
@@ -683,7 +761,8 @@ function App() {
                     <option value="review">Reviews</option>
                     <option value="waiting">Waiting</option>
                     <option value="follow-up">Follow up</option>
-                    <option value="complete">Completed</option>
+                    <option value="decide">Needs a decision</option>
+                    <option value="complete">Delivered or abandoned</option>
                   </select>
                 </div>
                 <div className="work-list">
@@ -803,7 +882,7 @@ function App() {
               )}
               {data.efforts.map((e) => {
                 const items = data.items.filter((i) => i.effort_id === e.id);
-                const complete = items.filter((i) => i.terminal).length;
+                const p = e.progress;
                 return (
                   <article className="effort-card" key={e.id}>
                     <div className="effort-top">
@@ -812,7 +891,7 @@ function App() {
                         EFFORT
                       </span>
                       <span>
-                        {complete}/{items.length} complete
+                        {p.delivered}/{p.total} delivered
                       </span>
                     </div>
                     <h2>{e.title}</h2>
@@ -820,7 +899,7 @@ function App() {
                     <div className="progress-track">
                       <div
                         style={{
-                          width: `${items.length ? (complete / items.length) * 100 : 0}%`,
+                          width: `${p.total ? (p.delivered / p.total) * 100 : 0}%`,
                         }}
                       />
                     </div>
@@ -835,8 +914,10 @@ function App() {
                       {items.length === 0 && <p>No linked items yet.</p>}
                     </div>
                     <div className="effort-footer">
-                      <span>
-                        {items.filter((i) => !i.terminal).length} remaining
+                      <span
+                        className={p.needs_attention ? "attention-text" : ""}
+                      >
+                        {progressText(p)}
                       </span>
                       <select
                         aria-label={`Add an item to ${e.title}`}
@@ -980,9 +1061,20 @@ function App() {
           <dl>
             <dt>Source</dt>
             <dd>{providers[detailItem.provider].name}</dd>
+            <dt>Outcome</dt>
+            <dd>
+              {outcomes[detailItem.outcome]}
+              <span className="outcome-reason">
+                {detailItem.outcome_reason}
+              </span>
+            </dd>
             <dt>Attention</dt>
             <dd>
-              {detailItem.terminal ? "Complete" : detailItem.action || "None"}
+              {needsDecision(detailItem)
+                ? "Needs a decision"
+                : settled(detailItem)
+                  ? "None"
+                  : detailItem.action || "None"}
             </dd>
             <dt>Tracking</dt>
             <dd>
@@ -1013,6 +1105,23 @@ function App() {
               ))}
             </select>
           </label>
+          {detailItem.connection_id &&
+            (needsDecision(detailItem) || detailItem.abandoned_at) && (
+            <div className="manual-edit">
+              <p className="detail-note">
+                {detailItem.abandoned_at
+                  ? "You marked this abandoned. It no longer counts toward its effort."
+                  : "If this will not deliver, mark it abandoned. Link any rework to the effort."}
+              </p>
+              <button
+                className="quiet"
+                onClick={() => abandon(detailItem, !detailItem.abandoned_at)}
+                disabled={busy}
+              >
+                {detailItem.abandoned_at ? "Undo abandoned" : "Mark abandoned"}
+              </button>
+            </div>
+          )}
           {!detailItem.connection_id && (
             <div className="manual-edit">
               <label className="form-field">
@@ -1035,6 +1144,20 @@ function App() {
                   <option value="review">Review</option>
                   <option value="waiting">Waiting</option>
                   <option value="follow-up">Follow up</option>
+                </select>
+              </label>
+              <label className="form-field">
+                Outcome
+                <select
+                  aria-label="Manual outcome"
+                  value={manualOutcome}
+                  onChange={(e) => setManualOutcome(e.target.value as Outcome)}
+                >
+                  {outcomeNames.map((o) => (
+                    <option key={o} value={o}>
+                      {outcomes[o]}
+                    </option>
+                  ))}
                 </select>
               </label>
               <button
@@ -1210,6 +1333,21 @@ function App() {
                       <option value="review">Review</option>
                       <option value="waiting">Waiting on others</option>
                       <option value="follow-up">Follow up</option>
+                    </select>
+                  </label>
+                  <label className="form-field">
+                    Outcome
+                    <select
+                      value={form.outcome}
+                      onChange={(e) =>
+                        setForm((f) => ({ ...f, outcome: e.target.value }))
+                      }
+                    >
+                      {outcomeNames.map((o) => (
+                        <option key={o} value={o}>
+                          {outcomes[o]}
+                        </option>
+                      ))}
                     </select>
                   </label>
                 </>
