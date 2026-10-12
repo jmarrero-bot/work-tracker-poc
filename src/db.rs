@@ -273,11 +273,12 @@ fn read_sync_state(r: &rusqlite::Row, first: usize) -> rusqlite::Result<SyncStat
 }
 
 /// A connection as it is stored: without its sync state, which has a table
-/// of its own.
+/// of its own, or its schedule, which is worked out when it is shown.
 fn connection_body(c: &Connection) -> Result<String> {
     let mut v = serde_json::to_value(c)?;
     if let Some(body) = v.as_object_mut() {
         body.remove("sync");
+        body.remove("schedule");
     }
     Ok(serde_json::to_string(&v)?)
 }
@@ -386,6 +387,26 @@ impl Db {
             bail!("Missing credential")
         }
         Ok(value)
+    }
+    /// Write `value` as connection `id`'s next credential, beside the one
+    /// in use, for [`Db::install_secret`] to put in place.
+    pub fn stage_secret(&self, id: &str, value: &str) -> Result<PathBuf> {
+        Uuid::parse_str(id)?;
+        let staged = self.root.join("secrets").join(format!("{id}.new"));
+        match fs::remove_file(&staged) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
+        write_secret(&staged, value)?;
+        Ok(staged)
+    }
+    /// Replace connection `id`'s credential with the one staged at
+    /// `staged`, all at once, so a sync reads the old one or the new one.
+    pub fn install_secret(&self, id: &str, staged: &Path) -> Result<()> {
+        Uuid::parse_str(id)?;
+        fs::rename(staged, self.root.join("secrets").join(id))?;
+        Ok(())
     }
     /// Each connection's zone. An item's zone is always its connection's,
     /// never what its row says; anything without a known connection is
@@ -1281,6 +1302,7 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body.get("sync"), None, "{body}");
+        assert_eq!(body.get("schedule"), None, "{body}");
         let mut db = db;
         db.delete_connection(&c.id).unwrap();
         let rows: i64 = db

@@ -5,14 +5,17 @@ mod db;
 mod mine;
 mod model;
 mod outcome;
+mod schedule;
 mod server;
 mod zone;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use clock::{format_interval, relative};
 use model::*;
 use std::{
     io::{self, Read},
     path::PathBuf,
+    time::{Duration, SystemTime},
 };
 
 #[derive(Parser)]
@@ -36,6 +39,10 @@ enum Command {
     Serve {
         #[arg(long)]
         demo: bool,
+        /// How often each connection syncs unless it has its own interval,
+        /// such as 30m or 1h.
+        #[arg(long, value_name = "INTERVAL", default_value = "5m", value_parser = interval)]
+        sync_interval: Duration,
     },
     /// Connect Jira Data Center, a GitLab instance, GitHub, Fedora Forge,
     /// or a source served by a connector plugin, using a personal token.
@@ -62,9 +69,36 @@ enum Command {
         /// is listed as theirs under Watching, never as yours.
         #[arg(long, value_name = "LOGIN")]
         watch_user: Option<String>,
+        /// How often this connection syncs, such as 15m or 1h, if not as
+        /// often as the service's default.
+        #[arg(long, value_name = "INTERVAL", value_parser = interval)]
+        sync_interval: Option<Duration>,
     },
-    /// List connection identities and sync health.
+    /// List connection identities and sync health: when each last synced,
+    /// when it syncs next, and whether it needs you.
     Connections,
+    /// Check a connection's credential again, or give it a new one for the
+    /// same account, and sync it soon. A connection whose credential was
+    /// rejected stops syncing on schedule until this succeeds.
+    Verify {
+        connection: String,
+        /// Replace the credential with the one in this environment variable.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token_env: Option<String>,
+        /// Replace the credential with one read from standard input.
+        #[arg(long)]
+        token_stdin: bool,
+    },
+    /// Change how often a connection syncs on schedule.
+    Schedule {
+        connection: String,
+        /// Such as 15m, 1h or 1d.
+        #[arg(required_unless_present = "default", value_parser = interval)]
+        interval: Option<Duration>,
+        /// Sync as often as the service's default.
+        #[arg(long, conflicts_with = "interval")]
+        default: bool,
+    },
     /// Watch another user's activity visible to a GitHub connection's token, or
     /// stop. What it finds is listed as theirs under Watching, never as
     /// yours, and replaces what an earlier watch found.
@@ -77,8 +111,13 @@ enum Command {
         #[arg(long, conflicts_with = "login")]
         stop: bool,
     },
-    /// Fetch all connected sources. No writes to upstream services.
-    Sync,
+    /// Fetch all connected sources now, or one. Sources also sync on their
+    /// own schedule; a sync already running is joined, not started again.
+    /// No writes to upstream services.
+    Sync {
+        /// Only this connection.
+        connection: Option<String>,
+    },
     /// Show active work. Add --json for agent/script consumption.
     Inbox {
         #[arg(long)]
@@ -188,6 +227,27 @@ enum Command {
     /// Remove a connection, its locally cached items and its stored credential.
     Disconnect { connection: String },
 }
+/// A sync interval given on the command line.
+fn interval(text: &str) -> Result<Duration, String> {
+    let interval = clock::parse_interval(text)?;
+    schedule::check_interval(interval).map_err(|e| e.to_string())?;
+    Ok(interval)
+}
+/// A token from the environment variable `env`, or from standard input; a
+/// token is never a command-line argument.
+fn read_token(env: Option<String>, stdin: bool) -> Result<Option<String>> {
+    if let Some(name) = env {
+        return Ok(Some(
+            std::env::var(name).context("Token environment variable is not set")?,
+        ));
+    }
+    if stdin {
+        let mut s = String::new();
+        io::stdin().take(16385).read_to_string(&mut s)?;
+        return Ok(Some(s.trim().into()));
+    }
+    Ok(None)
+}
 fn default_root() -> Result<PathBuf> {
     if let Some(v) = std::env::var_os("XDG_DATA_HOME") {
         return Ok(PathBuf::from(v).join("workboard"));
@@ -235,8 +295,12 @@ async fn main() -> Result<()> {
         Some(path) => path,
         None => default_root()?,
     };
-    if let Command::Serve { demo } = args.command {
-        return server::serve(root, args.port, demo).await;
+    if let Command::Serve {
+        demo,
+        sync_interval,
+    } = args.command
+    {
+        return server::serve(root, args.port, demo, sync_interval).await;
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(900))
@@ -252,16 +316,11 @@ async fn main() -> Result<()> {
             token_stdin,
             external,
             watch_user,
+            sync_interval,
         } => {
-            let token = if let Some(name) = token_env {
-                std::env::var(name).context("Token environment variable is not set")?
-            } else if token_stdin {
-                let mut s = String::new();
-                io::stdin().take(16385).read_to_string(&mut s)?;
-                s.trim().into()
-            } else {
-                bail!("Use --token-stdin or --token-env NAME. Tokens are never command-line arguments.")
-            };
+            let token = read_token(token_env, token_stdin)?.ok_or_else(|| {
+                anyhow!("Use --token-stdin or --token-env NAME. Tokens are never command-line arguments.")
+            })?;
             let input = ConnectInput {
                 label: label.unwrap_or_else(|| provider.clone()),
                 provider,
@@ -273,6 +332,7 @@ async fn main() -> Result<()> {
                     Zone::Internal
                 },
                 watch_user,
+                sync_interval: sync_interval.map(|i| i.as_secs()),
             };
             let c: Connection = request(
                 &client,
@@ -318,14 +378,61 @@ async fn main() -> Result<()> {
                 None => println!("{} is not watching anyone", c.label),
             }
         }
-        Command::Sync => {
+        Command::Verify {
+            connection,
+            token_env,
+            token_stdin,
+        } => {
+            let token = read_token(token_env, token_stdin)?;
+            let c: Connection = request(
+                &client,
+                &root,
+                args.port,
+                reqwest::Method::POST,
+                &format!("connections/{connection}/verify"),
+                Some(serde_json::json!({ "token": token })),
+            )
+            .await?;
+            let replaced = if token.is_some() {
+                "; its new credential is saved"
+            } else {
+                ""
+            };
+            println!(
+                "{} is {}'s{replaced}. It syncs again soon, and on schedule",
+                c.label, c.account_name
+            );
+        }
+        Command::Schedule {
+            connection,
+            interval,
+            default: _,
+        } => {
+            let c: Connection = request(
+                &client,
+                &root,
+                args.port,
+                reqwest::Method::PATCH,
+                &format!("connections/{connection}"),
+                Some(serde_json::json!({ "sync_interval": interval.map(|i| i.as_secs()) })),
+            )
+            .await?;
+            let every = format_interval(Duration::from_secs(c.schedule.interval_secs));
+            let whose = if c.sync_interval.is_some() {
+                "its own interval"
+            } else {
+                "the service's default"
+            };
+            println!("{} syncs every {every}, {whose}", c.label);
+        }
+        Command::Sync { connection } => {
             let v: serde_json::Value = request(
                 &client,
                 &root,
                 args.port,
                 reqwest::Method::POST,
                 "sync",
-                Some(serde_json::json!({})),
+                Some(serde_json::json!({ "connection": connection })),
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
@@ -352,6 +459,7 @@ async fn main() -> Result<()> {
                 None,
             )
             .await?;
+            let now = Timestamp::of(SystemTime::now());
             for c in s.connections {
                 let watching = c
                     .watch_user
@@ -359,14 +467,14 @@ async fn main() -> Result<()> {
                     .map(|login| format!("  watching {login}"))
                     .unwrap_or_default();
                 println!(
-                    "{}  {}  {}  {}{}  {}",
+                    "{}  {}  {}  {}{}",
                     c.id,
                     c.label,
                     c.account_name,
                     c.zone.label(),
                     watching,
-                    c.sync.error.as_deref().unwrap_or("Ready")
                 );
+                println!("    {}", sync_status(&c, now));
             }
         }
         Command::Inbox { json } | Command::Next { json } => {
@@ -650,6 +758,52 @@ async fn main() -> Result<()> {
         Command::Serve { .. } => unreachable!(),
     }
     Ok(())
+}
+/// How a connection's syncs are going, as of `now`: when it last synced and
+/// syncs next, how it fails, or that it needs the person.
+fn sync_status(c: &Connection, now: Timestamp) -> String {
+    let s = &c.sync;
+    let last = s.last_success.map_or("never synced".into(), |t| {
+        format!("last synced {}", relative(t, now))
+    });
+    let error = s.error.as_deref().unwrap_or("unknown error");
+    let next = s.next_due.map_or("soon".into(), |t| {
+        // The schedule starts it within moments.
+        if t <= now {
+            "due now".into()
+        } else {
+            relative(t, now)
+        }
+    });
+    if c.schedule.needs_user {
+        return format!(
+            "Needs you: {error}. Scheduled syncs stopped until the credential works: fix it, then run `workboard verify {}` (add --token-stdin to give a new one). {}",
+            c.id,
+            capitalized(&last)
+        );
+    }
+    let state = if c.schedule.running {
+        "Syncing now".to_string()
+    } else if s.error.is_none() {
+        let every = format_interval(Duration::from_secs(c.schedule.interval_secs));
+        format!("Next sync {next}, every {every}")
+    } else if s.held_until.is_some_and(|held| held > now) {
+        format!("The source asked to wait; next try {next}: {error}")
+    } else {
+        let syncs = if s.failures == 1 { "sync" } else { "syncs" };
+        format!(
+            "{} failed {syncs} in a row, backing off; next try {next}: {error}",
+            s.failures
+        )
+    };
+    format!("{state}; {last}")
+}
+/// `text` with a capital first letter.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or(String::new(), |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 /// Rows of the Mine view under `heading`: why each waits and on whom, its
 /// native status and outcome, its zone and its link.

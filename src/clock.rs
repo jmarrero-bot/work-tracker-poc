@@ -1,11 +1,49 @@
-//! Time for syncs: timestamps kept as Unix seconds and shown as RFC 3339 in
-//! UTC.
+//! Time for syncs: a clock that tests can control, timestamps kept as Unix
+//! seconds and shown as RFC 3339 in UTC, and sync intervals as people write
+//! them (`30s`, `5m`, `1h`).
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     fmt,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// Where the time comes from. The service reads the system's; tests set it.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> SystemTime;
+}
+
+/// The system's wall clock. Syncs are due by it rather than by a monotonic
+/// clock, so a laptop that slept catches up when it wakes.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// A clock that only moves when a test moves it.
+#[cfg(test)]
+pub struct ManualClock(std::sync::Mutex<SystemTime>);
+
+#[cfg(test)]
+impl ManualClock {
+    pub fn at(t: Timestamp) -> Self {
+        let since_epoch = Duration::from_secs(u64::try_from(t.unix()).unwrap());
+        Self(std::sync::Mutex::new(UNIX_EPOCH + since_epoch))
+    }
+    pub fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+}
+
+#[cfg(test)]
+impl Clock for ManualClock {
+    fn now(&self) -> SystemTime {
+        *self.0.lock().unwrap()
+    }
+}
 
 /// A point in time to the second, kept as Unix seconds and shown as RFC 3339
 /// in UTC, such as `2026-10-12T08:00:00Z`.
@@ -29,6 +67,15 @@ impl Timestamp {
             Ok(after) => Self(seconds(after)),
             Err(before) => Self(-seconds(before.duration())),
         }
+    }
+    /// This time plus `d`, saturating.
+    pub fn after(self, d: Duration) -> Self {
+        let d = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+        Self(self.0.saturating_add(d))
+    }
+    /// How long after `earlier` this is, or zero if it isn't.
+    pub fn since(self, earlier: Self) -> Duration {
+        Duration::from_secs(u64::try_from(self.0.saturating_sub(earlier.0)).unwrap_or(0))
     }
     /// A time as [`Display`](fmt::Display) writes it, and nothing else.
     pub fn parse(text: &str) -> Option<Self> {
@@ -121,6 +168,68 @@ impl<'de> Deserialize<'de> for Timestamp {
     }
 }
 
+/// Units of a sync interval, as people write them.
+const UNITS: [(&str, u64); 4] = [("s", 1), ("m", 60), ("h", 3600), ("d", 86_400)];
+
+/// A sync interval such as `30s`, `5m`, `1h` or `1d`.
+pub fn parse_interval(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let invalid = || {
+        format!("'{text}' is not an interval; use a number and a unit, such as 30s, 5m, 1h or 1d")
+    };
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(invalid)?;
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number.parse().map_err(|_| invalid())?;
+    let (_, seconds) = UNITS
+        .iter()
+        .find(|(name, _)| *name == unit)
+        .ok_or_else(invalid)?;
+    number
+        .checked_mul(*seconds)
+        .map(Duration::from_secs)
+        .ok_or_else(invalid)
+}
+
+/// An interval as [`parse_interval`] reads it, in its largest whole unit.
+pub fn format_interval(d: Duration) -> String {
+    let seconds = d.as_secs();
+    let (name, size) = UNITS
+        .iter()
+        .rev()
+        .find(|(_, size)| seconds.is_multiple_of(*size) && seconds >= *size)
+        .unwrap_or(&UNITS[0]);
+    format!("{}{name}", seconds / size)
+}
+
+/// When `t` is, seen from `now`, as people say it: `in 4 min`, `3 h ago`.
+pub fn relative(t: Timestamp, now: Timestamp) -> String {
+    let (span, future) = if t >= now {
+        (t.since(now).as_secs(), true)
+    } else {
+        (now.since(t).as_secs(), false)
+    };
+    let amount = match span {
+        0..=59 => {
+            return if future {
+                "within a minute"
+            } else {
+                "just now"
+            }
+            .into()
+        }
+        60..=7_199 => format!("{} min", span / 60),
+        7_200..=172_799 => format!("{} h", span / 3600),
+        _ => format!("{} d", span / 86_400),
+    };
+    if future {
+        format!("in {amount}")
+    } else {
+        format!("{amount} ago")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +273,63 @@ mod tests {
             assert_eq!(Timestamp::parse(wrong), None, "{wrong}");
         }
         assert!(serde_json::from_value::<Timestamp>("yesterday".into()).is_err());
+    }
+
+    #[test]
+    fn timestamps_count_seconds() {
+        let t = Timestamp::from_unix(100);
+        assert_eq!(t.after(Duration::from_secs(5)), Timestamp::from_unix(105));
+        assert_eq!(t.after(Duration::MAX), Timestamp::from_unix(i64::MAX));
+        assert_eq!(t.since(Timestamp::from_unix(40)), Duration::from_secs(60));
+        assert_eq!(t.since(Timestamp::from_unix(400)), Duration::ZERO);
+    }
+
+    #[test]
+    fn relative_times() {
+        let now = Timestamp::from_unix(1_791_763_200);
+        for (offset, text) in [
+            (0, "within a minute"),
+            (59, "within a minute"),
+            (-59, "just now"),
+            (60, "in 1 min"),
+            (-300, "5 min ago"),
+            (7_199, "in 119 min"),
+            (7_200, "in 2 h"),
+            (-90_000, "25 h ago"),
+            (3 * 86_400, "in 3 d"),
+        ] {
+            let t = Timestamp::from_unix(now.unix() + offset);
+            assert_eq!(relative(t, now), text, "{offset}");
+        }
+    }
+
+    #[test]
+    fn intervals_as_people_write_them() {
+        for (text, seconds, shown) in [
+            ("30s", 30, "30s"),
+            ("90s", 90, "90s"),
+            ("120s", 120, "2m"),
+            ("5m", 300, "5m"),
+            (" 1h ", 3600, "1h"),
+            ("2d", 172_800, "2d"),
+        ] {
+            let d = parse_interval(text).unwrap();
+            assert_eq!(d, Duration::from_secs(seconds), "{text}");
+            assert_eq!(format_interval(d), shown, "{text}");
+        }
+        for wrong in [
+            "",
+            "5",
+            "m",
+            "5 m",
+            "5min",
+            "-5m",
+            "1.5h",
+            "99999999999999999999d",
+        ] {
+            let error = parse_interval(wrong).unwrap_err();
+            assert!(error.contains("such as 30s"), "{wrong}: {error}");
+        }
+        assert_eq!(format_interval(Duration::ZERO), "0s");
     }
 }
