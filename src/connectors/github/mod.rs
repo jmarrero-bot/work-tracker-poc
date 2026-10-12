@@ -99,77 +99,10 @@ impl GitHub {
             client: ReadOnly::new(memory)?,
         })
     }
-    async fn current_user(&self, target: &Target) -> ConnectorResult<Account> {
-        let v = self.client.get_found(target, "user", &[]).await?;
-        let id = v["id"]
-            .as_u64()
-            .ok_or_else(|| ConnectorError::invalid("GitHub's answer has no account ID"))?;
-        let login = v["login"]
-            .as_str()
-            .ok_or_else(|| ConnectorError::invalid("GitHub's answer has no login"))?;
-        Ok(Account {
-            id: id.to_string(),
-            name: login.into(),
-        })
-    }
-    /// Every open issue and pull request `query` finds, or an error: never
-    /// part of them.
-    async fn search(&self, target: &Target, query: &str) -> ConnectorResult<Vec<Value>> {
-        let q = format!("{query} {OPEN}");
-        let mut all = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let v = self
-                .client
-                .get_found(
-                    target,
-                    "search/issues",
-                    &[
-                        ("q", q.clone()),
-                        ("sort", "updated".into()),
-                        ("order", "desc".into()),
-                        ("per_page", PER_PAGE.to_string()),
-                        ("page", page.to_string()),
-                    ],
-                )
-                .await?;
-            if v["incomplete_results"].as_bool() == Some(true) {
-                return Err(ConnectorError::new(
-                    ErrorKind::Transient,
-                    "GitHub's search timed out before finding everything; no partial results were saved",
-                ));
-            }
-            let total = v["total_count"]
-                .as_u64()
-                .ok_or_else(|| ConnectorError::invalid("Unexpected GitHub search answer"))?;
-            if total > (PER_PAGE * MAX_PAGES) as u64 {
-                return Err(ConnectorError::invalid(format!(
-                    "GitHub found {total} items for '{query}', more than one sync reads; no partial results were saved"
-                )));
-            }
-            let rows = v["items"]
-                .as_array()
-                .ok_or_else(|| ConnectorError::invalid("Unexpected GitHub search answer"))?;
-            all.extend(rows.iter().cloned());
-            if all.len() as u64 >= total {
-                return Ok(all);
-            }
-            // A short page doesn't end it while GitHub counts more; an
-            // empty one does, as an error.
-            if rows.is_empty() {
-                return Err(ConnectorError::new(
-                    ErrorKind::Transient,
-                    "GitHub's search returned fewer items than it counted; no partial results were saved",
-                ));
-            }
-        }
-        Err(ConnectorError::invalid(
-            "GitHub's search kept paging; no partial results were saved",
-        ))
-    }
     async fn mine(&self, target: &Target) -> ConnectorResult<Vec<RemoteItem>> {
         let mut all = Listing::default();
         for search in MINE {
-            for row in self.search(target, search.query).await? {
+            for row in search_issues(&self.client, target, search.query).await? {
                 let mut item = github_item(&row, search.action).map_err(ConnectorError::invalid)?;
                 // A draft of one's own isn't waiting on others yet.
                 if search.reason.is_none() && item.status == DRAFT {
@@ -193,7 +126,8 @@ impl GitHub {
         }
         let mut all = Listing::default();
         for (qualifier, reason) in WATCHED {
-            for row in self.search(target, &format!("{qualifier}{login}")).await? {
+            let query = format!("{qualifier}{login}");
+            for row in search_issues(&self.client, target, &query).await? {
                 let mut item = github_item(&row, "").map_err(ConnectorError::invalid)?;
                 item.reasons.push(*reason);
                 all.add(item);
@@ -203,41 +137,117 @@ impl GitHub {
         direct_over_team(&mut items);
         Ok(items)
     }
-    async fn tracked(
-        &self,
-        target: &Target,
-        tracked: &[Tracked],
-    ) -> ConnectorResult<Vec<Refreshed>> {
-        let mut answers = Vec::new();
-        for item in tracked {
-            let (repository, number) = parse_key(&item.key)
-                .ok_or_else(|| ConnectorError::invalid("Invalid stored GitHub item key"))?;
-            let path = format!("repos/{repository}/issues/{number}");
-            let mut got = self.client.get(target, &path, &[]).await?;
-            // A transferred issue redirects to its new place: follow it once,
-            // only within the same API.
-            if let Got::Moved(_, Some(to)) = got {
-                got = self.client.get_url(target, to).await?;
-            }
-            answers.push(match got {
-                Got::Found(row) => {
-                    let found = github_item(&row, "follow-up").map_err(ConnectorError::invalid)?;
-                    if found.remote_id == item.remote_id {
-                        Refreshed::found(&item.remote_id, found)
-                    } else {
-                        Refreshed::inaccessible(
-                            &item.remote_id,
-                            "GitHub now shows another item at this address",
-                        )
-                    }
-                }
-                Got::Moved(status, _) | Got::Inaccessible(status) => {
-                    inaccessible(SOURCE, &item.remote_id, status)
-                }
-            });
+}
+
+/// The account `target`'s token belongs to.
+async fn current_user(client: &ReadOnly, target: &Target) -> ConnectorResult<Account> {
+    let v = client.get_found(target, "user", &[]).await?;
+    let id = v["id"]
+        .as_u64()
+        .ok_or_else(|| ConnectorError::invalid("GitHub's answer has no account ID"))?;
+    let login = v["login"]
+        .as_str()
+        .ok_or_else(|| ConnectorError::invalid("GitHub's answer has no login"))?;
+    Ok(Account {
+        id: id.to_string(),
+        name: login.into(),
+    })
+}
+
+/// Every open issue and pull request `query` finds, or an error: never
+/// part of them.
+async fn search_issues(
+    client: &ReadOnly,
+    target: &Target,
+    query: &str,
+) -> ConnectorResult<Vec<Value>> {
+    let q = format!("{query} {OPEN}");
+    let mut all = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let v = client
+            .get_found(
+                target,
+                "search/issues",
+                &[
+                    ("q", q.clone()),
+                    ("sort", "updated".into()),
+                    ("order", "desc".into()),
+                    ("per_page", PER_PAGE.to_string()),
+                    ("page", page.to_string()),
+                ],
+            )
+            .await?;
+        if v["incomplete_results"].as_bool() == Some(true) {
+            return Err(ConnectorError::new(
+                ErrorKind::Transient,
+                "GitHub's search timed out before finding everything; no partial results were saved",
+            ));
         }
-        Ok(answers)
+        let total = v["total_count"]
+            .as_u64()
+            .ok_or_else(|| ConnectorError::invalid("Unexpected GitHub search answer"))?;
+        if total > (PER_PAGE * MAX_PAGES) as u64 {
+            return Err(ConnectorError::invalid(format!(
+                "GitHub found {total} items for '{query}', more than one sync reads; no partial results were saved"
+            )));
+        }
+        let rows = v["items"]
+            .as_array()
+            .ok_or_else(|| ConnectorError::invalid("Unexpected GitHub search answer"))?;
+        all.extend(rows.iter().cloned());
+        if all.len() as u64 >= total {
+            return Ok(all);
+        }
+        // A short page doesn't end it while GitHub counts more; an
+        // empty one does, as an error.
+        if rows.is_empty() {
+            return Err(ConnectorError::new(
+                ErrorKind::Transient,
+                "GitHub's search returned fewer items than it counted; no partial results were saved",
+            ));
+        }
     }
+    Err(ConnectorError::invalid(
+        "GitHub's search kept paging; no partial results were saved",
+    ))
+}
+
+/// Fetch tracked issues and pull requests again, by their keys, each as
+/// `github_item` reads it.
+async fn refresh_issues(
+    client: &ReadOnly,
+    target: &Target,
+    tracked: &[Tracked],
+) -> ConnectorResult<Vec<Refreshed>> {
+    let mut answers = Vec::new();
+    for item in tracked {
+        let (repository, number) = parse_key(&item.key)
+            .ok_or_else(|| ConnectorError::invalid("Invalid stored GitHub item key"))?;
+        let path = format!("repos/{repository}/issues/{number}");
+        let mut got = client.get(target, &path, &[]).await?;
+        // A transferred issue redirects to its new place: follow it once,
+        // only within the same API.
+        if let Got::Moved(_, Some(to)) = got {
+            got = client.get_url(target, to).await?;
+        }
+        answers.push(match got {
+            Got::Found(row) => {
+                let found = github_item(&row, "follow-up").map_err(ConnectorError::invalid)?;
+                if found.remote_id == item.remote_id {
+                    Refreshed::found(&item.remote_id, found)
+                } else {
+                    Refreshed::inaccessible(
+                        &item.remote_id,
+                        "GitHub now shows another item at this address",
+                    )
+                }
+            }
+            Got::Moved(status, _) | Got::Inaccessible(status) => {
+                inaccessible(SOURCE, &item.remote_id, status)
+            }
+        });
+    }
+    Ok(answers)
 }
 
 impl Connector for GitHub {
@@ -245,7 +255,7 @@ impl Connector for GitHub {
         "github"
     }
     fn verify<'a>(&'a self, target: &'a Target) -> BoxFuture<'a, ConnectorResult<Account>> {
-        Box::pin(self.current_user(target))
+        Box::pin(current_user(&self.client, target))
     }
     fn list<'a>(
         &'a self,
@@ -260,7 +270,7 @@ impl Connector for GitHub {
         _account: &'a Account,
         tracked: &'a [Tracked],
     ) -> BoxFuture<'a, ConnectorResult<Vec<Refreshed>>> {
-        Box::pin(self.tracked(target, tracked))
+        Box::pin(refresh_issues(&self.client, target, tracked))
     }
     fn watch<'a>(
         &'a self,
