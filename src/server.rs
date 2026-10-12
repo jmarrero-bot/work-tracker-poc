@@ -3,6 +3,7 @@ use crate::{
     connector::{self, Target},
     connectors,
     db::{self, Db, Mode},
+    hub,
     model::*,
     schedule::{self, Builtin, Policy, Scheduler, Trigger},
     zone,
@@ -280,12 +281,37 @@ struct Board {
     #[serde(flatten)]
     snapshot: Snapshot,
     mode: Mode,
+    /// The hub this companion pulls from, if one is set.
+    hub: Option<hub::Status>,
 }
 async fn snapshot(State(app): State<App>) -> ApiResult<Board> {
     Ok(Json(Board {
         snapshot: fresh_snapshot(&app)?.0,
         mode: app.mode,
+        hub: app.scheduler.hub_status()?,
     }))
+}
+/// The hub this companion pulls from, if one is set, and how its pulls go.
+async fn get_hub(State(app): State<App>) -> ApiResult<Option<hub::Status>> {
+    Ok(Json(app.scheduler.hub_status()?))
+}
+#[derive(Deserialize)]
+struct HubInput {
+    url: String,
+    token: String,
+}
+/// Pull from a hub from now on, once a first pull shows its address and
+/// token work. Nothing is ever sent to it but that read.
+async fn set_hub(State(app): State<App>, Json(input): Json<HubInput>) -> ApiResult<hub::Status> {
+    if app.mode == Mode::Hub {
+        bail_api("This is a hub; only a companion pulls from one")?
+    }
+    Ok(Json(app.scheduler.set_hub(&input.url, &input.token).await?))
+}
+/// Stop pulling from the hub, and forget its token and its work.
+async fn unset_hub(State(app): State<App>) -> ApiResult<Value> {
+    app.scheduler.unset_hub().await?;
+    Ok(Json(json!({"ok":true})))
 }
 /// What waits on each connection's account, and apart from it what watching
 /// other users found. A local view: internal work shows here, and never
@@ -720,6 +746,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         .route("/mine", get(mine))
         .route("/export/external", get(export_external))
         .route("/session", post(session))
+        .route("/hub", get(get_hub).put(set_hub).delete(unset_hub))
         .route(
             "/companion-token",
             get(companion_token).post(rotate_companion_token),

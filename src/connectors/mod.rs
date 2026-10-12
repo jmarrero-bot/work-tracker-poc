@@ -130,7 +130,7 @@ enum Fetched {
     Inaccessible(StatusCode),
 }
 
-fn http_error(status: StatusCode) -> ConnectorError {
+pub(crate) fn http_error(status: StatusCode) -> ConnectorError {
     let (kind, reason) = match status {
         StatusCode::UNAUTHORIZED => (ErrorKind::Auth, "Credential rejected"),
         StatusCode::FORBIDDEN => (
@@ -153,7 +153,7 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 
 /// A response's body, read up to [`MAX_BODY`]. Its text is never shown,
 /// since an error body can echo the request.
-async fn read_body(source: &str, mut response: Response) -> ConnectorResult<Vec<u8>> {
+pub(crate) async fn read_body(source: &str, mut response: Response) -> ConnectorResult<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| {
         ConnectorError::new(
@@ -171,7 +171,7 @@ async fn read_body(source: &str, mut response: Response) -> ConnectorResult<Vec<
     Ok(body)
 }
 
-fn parse_json(source: &str, body: &[u8]) -> ConnectorResult<Value> {
+pub(crate) fn parse_json(source: &str, body: &[u8]) -> ConnectorResult<Value> {
     serde_json::from_slice(body).map_err(|_| {
         ConnectorError::invalid(format!(
             "{source} did not return the expected JSON response"

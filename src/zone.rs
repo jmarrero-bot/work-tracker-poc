@@ -35,7 +35,7 @@ impl Zone {
 /// The part of a snapshot that may leave this machine. Each object is built
 /// field by field, so a field added to a connection, item or effort stays
 /// behind until someone decides it may leave.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalSnapshot {
     /// Always external, so whoever reads it can check what it was given.
     pub zone: Zone,
@@ -46,7 +46,7 @@ pub struct ExternalSnapshot {
 
 /// An external connection. A sync error's message can name local paths or
 /// users, so only its kind leaves.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalConnection {
     pub id: String,
     pub provider: String,
@@ -63,7 +63,7 @@ pub struct ExternalConnection {
 }
 
 /// An external item.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalItem {
     pub id: String,
     pub connection_id: String,
@@ -86,7 +86,7 @@ pub struct ExternalItem {
 /// An effort as the external zone sees it. Its title and note are free text
 /// that may describe internal work: the note stays behind, and the title
 /// leaves only when a person shared it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalEffort {
     pub id: String,
     /// The effort's title if shared, otherwise a neutral label.
@@ -96,7 +96,7 @@ pub struct ExternalEffort {
 }
 
 /// An exported effort's progress.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalProgress {
     pub delivered: usize,
     pub total: usize,

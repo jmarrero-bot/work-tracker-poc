@@ -1,4 +1,4 @@
-use crate::{model::*, outcome};
+use crate::{hub, model::*, outcome, zone::ExternalSnapshot};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection as Sqlite, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ pub fn remove_if_there(path: &Path) -> Result<()> {
 
 /// The schema version this build writes, kept in SQLite's `user_version`.
 /// Version 0 is the prototype's schema, whose items only had a `terminal` flag.
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 fn schema_version(sql: &Sqlite) -> Result<i32> {
     let version = sql.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -92,6 +92,14 @@ fn migrate(sql: &mut Sqlite, root: &Path) -> Result<()> {
         // recorded when a service first opens it.
         tx.execute_batch(SETTINGS_TABLE)
             .context("Cannot add the data directory's settings")?;
+    }
+    if version < 7 {
+        // Version 7: the hub a companion pulls from, and the last export it
+        // read. Its sync state is kept with the connections'.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hub(id TEXT PRIMARY KEY, url TEXT NOT NULL, snapshot TEXT)",
+        )
+        .context("Cannot add the hub")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -329,6 +337,8 @@ enum Write<'a> {
     Decision,
     /// Removing a connection and everything it brought.
     Disconnect,
+    /// Pulling from a hub: its address, or what it sent.
+    Hub,
 }
 
 /// What a hub refuses, and why.
@@ -539,6 +549,7 @@ impl Db {
                 ))
             }
             Write::Demo => return Err(refused("the demo's illustrative work, which is internal")),
+            Write::Hub => return Err(refused("pulling from a hub; only a companion does")),
             Write::Effort(items) => {
                 for id in items {
                     self.external_item(id)?;
@@ -928,6 +939,111 @@ impl Db {
         tx.commit()?;
         // The credential, and a new one a verify staged but never put in
         // place.
+        self.remove_secrets(id)
+    }
+    /// The hub this companion pulls from, if one is set.
+    pub fn hub(&self) -> Result<Option<hub::Link>> {
+        let mut s = self.sql.prepare(&format!(
+            "SELECT h.id,h.url,h.snapshot,{} FROM hub h LEFT JOIN sync_state s ON s.connection_id=h.id",
+            SYNC_STATE_COLUMNS
+                .split(',')
+                .map(|column| format!("s.{column}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))?;
+        let link = s
+            .query_row([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    read_sync_state(r, 3)?,
+                ))
+            })
+            .optional()?;
+        let Some((id, url, snapshot, sync)) = link else {
+            return Ok(None);
+        };
+        let snapshot = snapshot
+            .map(|body| serde_json::from_str(&body))
+            .transpose()
+            .context("The stored export of the hub is unreadable; set the hub again")?;
+        Ok(Some(hub::Link {
+            id,
+            url,
+            sync,
+            snapshot,
+        }))
+    }
+    /// Pull from the hub at `url` with `token`, in place of any hub set
+    /// before, whose token and export are dropped.
+    pub fn set_hub(&mut self, url: &str, token: &str) -> Result<hub::Link> {
+        self.admit(Write::Hub)?;
+        let old = self.hub()?;
+        let id = Uuid::new_v4().to_string();
+        let secret = self.root.join("secrets").join(&id);
+        write_secret(&secret, token)?;
+        let saved = (|| -> Result<()> {
+            let tx = self.sql.transaction()?;
+            if let Some(old) = &old {
+                tx.execute("DELETE FROM sync_state WHERE connection_id=?1", [&old.id])?;
+            }
+            tx.execute("DELETE FROM hub", [])?;
+            tx.execute("INSERT INTO hub(id,url) VALUES(?1,?2)", params![id, url])?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(e) = saved {
+            let _ = fs::remove_file(&secret);
+            return Err(e);
+        }
+        if let Some(old) = old {
+            self.remove_secrets(&old.id)?;
+        }
+        self.hub()?.context("The hub was not saved")
+    }
+    /// Stop pulling from the hub, and drop its token and what it sent.
+    pub fn unset_hub(&mut self) -> Result<()> {
+        self.admit(Write::Hub)?;
+        let Some(old) = self.hub()? else {
+            bail!("No hub is set")
+        };
+        let tx = self.sql.transaction()?;
+        tx.execute("DELETE FROM sync_state WHERE connection_id=?1", [&old.id])?;
+        tx.execute("DELETE FROM hub", [])?;
+        tx.commit()?;
+        self.remove_secrets(&old.id)
+    }
+    /// Save what a pull from hub `id` read, if it succeeded, and the state
+    /// of its pulls, together. Nothing is saved for a hub that was unset or
+    /// replaced meanwhile.
+    pub fn save_hub_pull(
+        &mut self,
+        id: &str,
+        snapshot: Option<&ExternalSnapshot>,
+        state: &SyncState,
+    ) -> Result<()> {
+        self.admit(Write::Hub)?;
+        let tx = self.sql.transaction()?;
+        let exists: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM hub WHERE id=?1)", [id], |r| {
+                r.get(0)
+            })?;
+        if !exists {
+            bail!("The hub was unset or replaced")
+        }
+        if let Some(snapshot) = snapshot {
+            tx.execute(
+                "UPDATE hub SET snapshot=?1 WHERE id=?2",
+                params![serde_json::to_string(snapshot)?, id],
+            )?;
+        }
+        write_sync_state(&tx, id, state)?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Remove the credential of `id`, and a new one staged beside it.
+    fn remove_secrets(&self, id: &str) -> Result<()> {
         let secrets = self.root.join("secrets");
         for path in [secrets.join(id), secrets.join(format!("{id}.new"))] {
             remove_if_there(&path)?;
@@ -1894,6 +2010,17 @@ mod tests {
                 "watching from an internal connection",
                 Box::new(|db| db.set_watch_user(&internal.id, Some(INTERNAL)).map(drop)),
             ),
+            (
+                "pulling from a hub",
+                Box::new(|db| {
+                    db.set_hub("https://INTERNAL.example/", "test-only-token")
+                        .map(drop)
+                }),
+            ),
+            (
+                "saving a pull",
+                Box::new(|db| db.save_hub_pull(&external.id, None, &ok)),
+            ),
         ];
         for (what, attempt) in &refused {
             let error = attempt(&mut db)
@@ -1927,6 +2054,56 @@ mod tests {
         drop(db);
         // And it opens again.
         Db::open_as(&temp.path().join("hub"), Mode::Hub).unwrap();
+    }
+
+    #[test]
+    fn a_hub_set_again_replaces_the_last_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&temp.path().join("companion")).unwrap();
+        let secrets = db.root.join("secrets");
+        let files = || {
+            let mut names: Vec<_> = fs::read_dir(&secrets)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        assert!(db.hub().unwrap().is_none());
+        assert!(db.unset_hub().is_err());
+        let first = db.set_hub("https://hub.example/", "first-token").unwrap();
+        assert_eq!(files(), [first.id.as_str()]);
+        assert_eq!(db.secret(&first.id).unwrap(), "first-token");
+        let at = Timestamp::from_unix(1_791_763_200);
+        let ok = SyncState::default().succeeded(at);
+        db.save_hub_pull(&first.id, Some(&hub::tests::export(2)), &ok)
+            .unwrap();
+        let read = db.hub().unwrap().unwrap();
+        assert_eq!(
+            (read.sync.last_success, read.snapshot.unwrap().items.len()),
+            (Some(at), 2)
+        );
+        // Set again: the old token, state and export go.
+        let second = db
+            .set_hub("https://other-hub.example/", "second-token")
+            .unwrap();
+        assert_eq!(files(), [second.id.as_str()]);
+        let read = db.hub().unwrap().unwrap();
+        assert_eq!(read.url, "https://other-hub.example/");
+        assert!(read.snapshot.is_none() && read.sync == SyncState::default());
+        // A pull of the old one, finishing late, saves nothing.
+        assert!(db
+            .save_hub_pull(&first.id, Some(&hub::tests::export(1)), &ok)
+            .is_err());
+        assert!(db.hub().unwrap().unwrap().snapshot.is_none());
+        db.unset_hub().unwrap();
+        assert!(db.hub().unwrap().is_none());
+        assert!(files().is_empty());
+        let rows: i64 = db
+            .sql
+            .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]
