@@ -2,7 +2,7 @@ use crate::{
     clock::SystemClock,
     connector::{self, Target},
     connectors,
-    db::{self, Db},
+    db::{self, Db, Mode},
     model::*,
     schedule::{self, Builtin, Policy, Scheduler, Trigger},
     zone,
@@ -18,7 +18,7 @@ use axum::{
     Json, Router,
 };
 use rust_embed::RustEmbed;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
@@ -36,6 +36,7 @@ struct App {
     token: Arc<String>,
     origin: String,
     scheduler: Arc<Scheduler>,
+    mode: Mode,
 }
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 struct ApiError(anyhow::Error);
@@ -132,8 +133,19 @@ fn fresh_snapshot(app: &App) -> Result<(Snapshot, Vec<WatchList>)> {
     app.scheduler.annotate_snapshot(&mut snapshot, &mut watched);
     Ok((snapshot, watched))
 }
-async fn snapshot(State(app): State<App>) -> ApiResult<Snapshot> {
-    Ok(Json(fresh_snapshot(&app)?.0))
+/// What the page and the CLI show: everything stored, and what kind of
+/// service this is.
+#[derive(Serialize)]
+struct Board {
+    #[serde(flatten)]
+    snapshot: Snapshot,
+    mode: Mode,
+}
+async fn snapshot(State(app): State<App>) -> ApiResult<Board> {
+    Ok(Json(Board {
+        snapshot: fresh_snapshot(&app)?.0,
+        mode: app.mode,
+    }))
 }
 /// What waits on each connection's account, and apart from it what watching
 /// other users found. A local view: internal work shows here, and never
@@ -149,6 +161,10 @@ async fn export_external(State(app): State<App>) -> ApiResult<zone::ExternalSnap
 async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> ApiResult<Connection> {
     if input.label.trim().is_empty() || input.label.len() > 100 {
         bail_api("Enter a connection name of 1–100 characters")?
+    }
+    // Before the credential goes anywhere.
+    if app.mode == Mode::Hub && input.zone != Zone::External {
+        bail_api("This is a hub, which connects external sources only: add --external (or turn on External). Connect internal sources on the companion")?
     }
     let base = connectors::base_url(&input.base_url)?;
     let watch_user = input.watch_user.as_deref().map(str::trim);
@@ -484,11 +500,32 @@ async fn headers(req: Request, next: Next) -> Response {
     response.headers_mut().insert("content-security-policy",HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
     response
 }
-pub async fn serve(root: PathBuf, port: u16, demo: bool, interval: Duration) -> Result<()> {
+/// How to serve.
+pub struct Options {
+    pub port: u16,
+    /// Seed illustrative work into an empty local data directory.
+    pub demo: bool,
+    /// How often a connection syncs unless it says otherwise.
+    pub interval: Duration,
+    /// Serve a hub: external work only.
+    pub hub: bool,
+}
+pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     #[cfg(not(unix))]
     bail!("This initial server requires Unix file permissions; use Linux or macOS");
+    let Options {
+        port,
+        demo,
+        interval,
+        hub,
+    } = options;
+    let mode = if hub { Mode::Hub } else { Mode::Local };
+    if hub && demo {
+        bail!("A hub keeps external work only, and the demo's work is internal; start the demo without --hub")
+    }
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-    let mut db = Db::open(&root)?;
+    let mut db = Db::open_as(&root, mode)?;
+    let mode = db.mode();
     if demo && db.items()?.is_empty() && db.efforts()?.is_empty() {
         db.seed()?
     }
@@ -516,6 +553,7 @@ pub async fn serve(root: PathBuf, port: u16, demo: bool, interval: Duration) -> 
         token: Arc::new(token),
         origin: origin.clone(),
         scheduler,
+        mode,
     };
     let api = Router::new()
         .route("/snapshot", get(snapshot))
@@ -542,7 +580,11 @@ pub async fn serve(root: PathBuf, port: u16, demo: bool, interval: Duration) -> 
         .layer(DefaultBodyLimit::max(65536))
         .layer(middleware::from_fn(headers))
         .with_state(app.clone());
-    println!("Workboard is running locally. Open this private pairing URL:\n{origin}/#token={}\nKeep this URL private. CLI commands use the same data directory.",app.token);
+    let running = match mode {
+        Mode::Local => "Workboard is running locally",
+        Mode::Hub => "Workboard is running as a hub, for external work only",
+    };
+    println!("{running}. Open this private pairing URL:\n{origin}/#token={}\nKeep this URL private. CLI commands use the same data directory.",app.token);
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

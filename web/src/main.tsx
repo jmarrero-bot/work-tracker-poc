@@ -169,7 +169,14 @@ type Effort = {
   share_title: boolean;
   progress: Progress;
 };
-type Snapshot = { items: Item[]; connections: Connection[]; efforts: Effort[] };
+// A person's own service, or a hub, which keeps external work only.
+type Mode = "local" | "hub";
+type Snapshot = {
+  items: Item[];
+  connections: Connection[];
+  efforts: Effort[];
+  mode: Mode;
+};
 const providers: Record<
   Provider,
   { name: string; short: string; color: string; live: boolean }
@@ -490,6 +497,7 @@ function App() {
     items: [],
     connections: [],
     efforts: [],
+    mode: "local",
   });
   const [page, setPage] = useState<
     "inbox" | "mine" | "efforts" | "connections"
@@ -568,6 +576,8 @@ function App() {
     };
   }, [modal, busy]);
   const demo = data.items.some((i) => i.demo);
+  // A hub keeps external work only: no manual links, no internal connections.
+  const hub = data.mode === "hub";
   const active = data.items.filter((i) => !settled(i));
   const detailItem = data.items.find((i) => i.id === detail);
   useEffect(() => {
@@ -701,7 +711,7 @@ function App() {
           label: form.label ?? providers[connectProvider].name,
           base_url: form.url,
           token: form.token,
-          zone: form.zone === "external" ? "external" : "internal",
+          zone: hub || form.zone === "external" ? "external" : "internal",
           watch_user:
             connectProvider === "github" && form.watch?.trim()
               ? form.watch.trim()
@@ -851,7 +861,7 @@ function App() {
           <span className="avatar">ME</span>
           <div>
             <strong>My workspace</strong>
-            <span>Personal · Local</span>
+            <span>Personal · {hub ? "Hub" : "Local"}</span>
           </div>
         </div>
         <div className="nav-caption">WORKSPACE</div>
@@ -944,7 +954,7 @@ function App() {
             {demo && <span className="demo-tag">DEMO DATA</span>}
             <span className="local-tag">
               <span />
-              Local instance
+              {hub ? "Hub: external work only" : "Local instance"}
             </span>
           </div>
         </header>
@@ -987,10 +997,15 @@ function App() {
                 </button>
               ) : (
                 <>
-                  <button className="quiet" onClick={() => openModal("manual")}>
-                    <Plus size={16} />
-                    Add source link
-                  </button>
+                  {!hub && (
+                    <button
+                      className="quiet"
+                      onClick={() => openModal("manual")}
+                    >
+                      <Plus size={16} />
+                      Add source link
+                    </button>
+                  )}
                   <button
                     className="primary"
                     onClick={() => openModal("effort")}
@@ -1481,25 +1496,30 @@ function App() {
                                 : "Keep source links in your inbox. Live sync is not implemented yet."}
                         </p>
                       )}
-                      <button
-                        className="quiet connection-button"
-                        onClick={() =>
-                          openModal(providers[p].live ? "connect" : "manual", p)
-                        }
-                      >
-                        <Plus size={15} />
-                        {providers[p].live
-                          ? "Connect account"
-                          : "Add source link"}
-                      </button>
+                      {(providers[p].live || !hub) && (
+                        <button
+                          className="quiet connection-button"
+                          onClick={() =>
+                            openModal(
+                              providers[p].live ? "connect" : "manual",
+                              p,
+                            )
+                          }
+                        >
+                          <Plus size={15} />
+                          {providers[p].live
+                            ? "Connect account"
+                            : "Add source link"}
+                        </button>
+                      )}
                     </article>
                   );
                 })}
               </div>
               <p className="demo-note">
-                This prototype runs as one local user. Credentials remain on the
-                machine running the service. Hosted team login is not
-                implemented.
+                {hub
+                  ? "This hub keeps external work only, and refuses anything else. Internal work stays on the companion. Credentials remain on the machine running the hub."
+                  : "This prototype runs as one local user. Credentials remain on the machine running the service. Hosted team login is not implemented."}
               </p>
             </>
           )}
@@ -1799,7 +1819,8 @@ function App() {
                   <label className="zone-choice">
                     <input
                       type="checkbox"
-                      checked={form.zone === "external"}
+                      checked={hub || form.zone === "external"}
+                      disabled={hub}
                       onChange={(e) =>
                         setForm((f) => ({
                           ...f,
@@ -1808,10 +1829,9 @@ function App() {
                       }
                     />
                     <span>
-                      External: its work may also be shown away from this
-                      machine, on the hub. Leave this off for internal work
-                      such as Jira, internal GitLab or Errata. It can't be
-                      changed later.
+                      {hub
+                        ? "External: this hub connects external sources only. Connect internal work such as Jira, internal GitLab or Errata on the companion."
+                        : "External: its work may also be shown away from this machine, on the hub. Leave this off for internal work such as Jira, internal GitLab or Errata. It can't be changed later."}
                     </span>
                   </label>
                   <p className="token-note">

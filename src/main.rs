@@ -39,6 +39,12 @@ enum Command {
     Serve {
         #[arg(long)]
         demo: bool,
+        /// Serve a hub: it keeps external work only, refusing internal
+        /// connections, manual links and anything else not shown to be
+        /// external. A data directory remembers whether it is a hub's, and
+        /// is never started as the other.
+        #[arg(long, conflicts_with = "demo")]
+        hub: bool,
         /// How often each connection syncs unless it has its own interval,
         /// such as 30m or 1h.
         #[arg(long, value_name = "INTERVAL", default_value = "5m", value_parser = interval)]
@@ -297,10 +303,17 @@ async fn main() -> Result<()> {
     };
     if let Command::Serve {
         demo,
+        hub,
         sync_interval,
     } = args.command
     {
-        return server::serve(root, args.port, demo, sync_interval).await;
+        let options = server::Options {
+            port: args.port,
+            demo,
+            interval: sync_interval,
+            hub,
+        };
+        return server::serve(root, options).await;
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(900))
