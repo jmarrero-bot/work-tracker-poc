@@ -131,7 +131,7 @@ fn backup(sql: &Sqlite, path: &Path) -> Result<()> {
 /// Record that the database is opened as `mode`, or fail if it was first
 /// opened as the other. One that recorded no mode yet, from before modes
 /// existed, may hold internal work, so it becomes a hub only while empty.
-fn claim(sql: &mut Sqlite, mode: Mode) -> Result<()> {
+fn claim(sql: &mut Sqlite, root: &Path, mode: Mode) -> Result<()> {
     let tx = sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let recorded: Option<String> = tx
         .query_row("SELECT value FROM settings WHERE key=?1", [MODE], |r| {
@@ -139,11 +139,19 @@ fn claim(sql: &mut Sqlite, mode: Mode) -> Result<()> {
         })
         .optional()?;
     let recorded = recorded.as_deref().map(Mode::parse).transpose()?;
-    let has_data: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM items) OR EXISTS(SELECT 1 FROM efforts) OR EXISTS(SELECT 1 FROM connections)",
+    let rows: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM items) OR EXISTS(SELECT 1 FROM efforts) OR EXISTS(SELECT 1 FROM connections) OR EXISTS(SELECT 1 FROM watched) OR EXISTS(SELECT 1 FROM hub)",
         [],
         |r| r.get(0),
     )?;
+    // A credential left behind is data too: a connection that was removed
+    // from the database, but not its token.
+    let secrets = root.join(SECRETS);
+    let credentials = fs::read_dir(&secrets)
+        .with_context(|| format!("Cannot read {}", secrets.display()))?
+        .next()
+        .is_some();
+    let has_data = rows || credentials;
     match (recorded, mode) {
         (Some(recorded), mode) if recorded == mode => return Ok(()),
         (Some(Mode::Hub), _) => bail!(
@@ -274,6 +282,9 @@ fn migrate_sync_state(tx: &Transaction) -> Result<()> {
     }
     Ok(())
 }
+
+/// Where a data directory keeps credentials, one file each.
+const SECRETS: &str = "secrets";
 
 /// Settings of the data directory, by name.
 const SETTINGS_TABLE: &str =
@@ -460,7 +471,7 @@ impl Db {
     /// hold internal work, so it never becomes a hub.
     pub fn open_as(root: &Path, mode: Mode) -> Result<Self> {
         private_dir(root)?;
-        private_dir(&root.join("secrets"))?;
+        private_dir(&root.join(SECRETS))?;
         let mut sql = Sqlite::open(root.join("work.sqlite"))?;
         // The prototype's schema; migrate() builds on it.
         sql.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
@@ -470,7 +481,7 @@ impl Db {
         migrate(&mut sql, root)?;
         #[cfg(unix)]
         fs::set_permissions(root.join("work.sqlite"), fs::Permissions::from_mode(0o600))?;
-        claim(&mut sql, mode)?;
+        claim(&mut sql, root, mode)?;
         let db = Self {
             sql,
             root: root.to_path_buf(),
@@ -502,12 +513,30 @@ impl Db {
                 return Err(refuse(format!("work that isn't external ({id})")));
             }
         }
-        for (id, _) in self.rows("SELECT connection_id,body FROM watched")? {
-            if !external(Some(&id)) {
+        for (id, body) in self.rows("SELECT connection_id,body FROM watched")? {
+            let items: Vec<Item> = serde_json::from_str(&body)?;
+            let theirs = |i: &Item| {
+                i.connection_id.as_deref() == Some(id.as_str()) && i.zone == Zone::External
+            };
+            if !external(Some(&id)) || !items.iter().all(theirs) {
                 return Err(refuse(format!(
-                    "a watch list of no external connection ({id})"
+                    "a watch list that isn't an external connection's ({id})"
                 )));
             }
+        }
+        // Efforts link stored items only, which are external as checked
+        // above; one linking anything else was changed behind the hub's back.
+        let efforts: Vec<String> = self.efforts()?.into_iter().map(|e| e.id).collect();
+        for (id, effort) in
+            self.rows("SELECT id,effort_id FROM items WHERE effort_id IS NOT NULL")?
+        {
+            if !efforts.contains(&effort) {
+                return Err(refuse(format!("a link to an unknown effort ({id})")));
+            }
+        }
+        // A hub never pulls from another hub.
+        if let Some(link) = self.hub()? {
+            return Err(refuse(format!("a hub to pull from ({})", link.url)));
         }
         Ok(())
     }
@@ -637,7 +666,7 @@ impl Db {
     }
     pub fn secret(&self, id: &str) -> Result<String> {
         Uuid::parse_str(id)?;
-        let value = fs::read_to_string(self.root.join("secrets").join(id))?;
+        let value = fs::read_to_string(self.root.join(SECRETS).join(id))?;
         let value = value.trim().to_string();
         if value.is_empty() {
             bail!("Missing credential")
@@ -648,7 +677,7 @@ impl Db {
     /// in use, for [`Db::install_secret`] to put in place.
     pub fn stage_secret(&self, id: &str, value: &str) -> Result<PathBuf> {
         Uuid::parse_str(id)?;
-        let staged = self.root.join("secrets").join(format!("{id}.new"));
+        let staged = self.root.join(SECRETS).join(format!("{id}.new"));
         remove_if_there(&staged)?;
         write_secret(&staged, value)?;
         Ok(staged)
@@ -657,7 +686,7 @@ impl Db {
     /// `staged`, all at once, so a sync reads the old one or the new one.
     pub fn install_secret(&self, id: &str, staged: &Path) -> Result<()> {
         Uuid::parse_str(id)?;
-        fs::rename(staged, self.root.join("secrets").join(id))?;
+        fs::rename(staged, self.root.join(SECRETS).join(id))?;
         Ok(())
     }
     /// Each connection's zone. An item's zone is always its connection's,
@@ -988,7 +1017,7 @@ impl Db {
         self.admit(Write::Hub)?;
         let old = self.hub()?;
         let id = Uuid::new_v4().to_string();
-        let secret = self.root.join("secrets").join(&id);
+        let secret = self.root.join(SECRETS).join(&id);
         write_secret(&secret, token)?;
         let saved = (|| -> Result<()> {
             let tx = self.sql.transaction()?;
@@ -1051,7 +1080,7 @@ impl Db {
     }
     /// Remove the credential of `id`, and a new one staged beside it.
     fn remove_secrets(&self, id: &str) -> Result<()> {
-        let secrets = self.root.join("secrets");
+        let secrets = self.root.join(SECRETS);
         for path in [secrets.join(id), secrets.join(format!("{id}.new"))] {
             remove_if_there(&path)?;
         }
@@ -1409,6 +1438,32 @@ mod tests {
             zone,
             watch_user: None,
             ..Default::default()
+        }
+    }
+
+    /// Item `n` of connection `id`, external, as a sync stores it.
+    fn synced_item(id: &str, n: u32) -> Item {
+        Item {
+            id: format!("{id}:errata:{n}"),
+            connection_id: Some(id.into()),
+            provider: "errata".into(),
+            remote_id: n.to_string(),
+            key: format!("K-{n}"),
+            title: format!("Change {n}"),
+            url: format!("https://example.com/{n}"),
+            status: "open".into(),
+            outcome: Outcome::Open,
+            outcome_reason: String::new(),
+            action: "next".into(),
+            updated_at: String::new(),
+            effort_id: None,
+            abandoned_at: None,
+            demo: false,
+            zone: Zone::External,
+            reasons: vec![],
+            synced_at: None,
+            stale: false,
+            from_hub: false,
         }
     }
 
@@ -1837,30 +1892,74 @@ mod tests {
             }
         }
         // From before modes were recorded: it may hold internal work, so it
-        // becomes a hub only while empty.
-        for (seeded, hub) in [(true, false), (false, true)] {
-            let root = fresh(&format!("unrecorded-{seeded}"));
+        // becomes a hub only while empty, credentials included.
+        for (n, (seeded, credential, hub)) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = fresh(&format!("unrecorded-{n}"));
             let mut db = Db::open(&root).unwrap();
             if seeded {
                 db.seed().unwrap();
             }
+            if credential {
+                write_secret(&root.join(SECRETS).join("left-behind"), "x").unwrap();
+            }
             db.sql.execute("DELETE FROM settings", []).unwrap();
             drop(db);
-            assert_eq!(Db::open_as(&root, Hub).is_ok(), hub, "{seeded}");
+            assert_eq!(Db::open_as(&root, Hub).is_ok(), hub, "case {n}");
         }
-        // A hub's database with internal work in it, as if changed behind
-        // its back, isn't opened.
-        let root = fresh("tampered");
-        let db = Db::open_as(&root, Hub).unwrap();
-        db.sql
-            .execute(
+        // A hub's database with anything but external work in it, as if
+        // changed behind its back, isn't opened.
+        let external = connection("c0ffee00-0000-4000-8000-00000000000e", Zone::External);
+        let internal_item = Item {
+            zone: Zone::Internal,
+            ..synced_item(&external.id, 1)
+        };
+        let tamperings: [(&str, &str, Vec<String>); 4] = [
+            (
+                "internal connection",
                 "INSERT INTO connections VALUES('c1',?1)",
-                [serde_json::to_string(&connection("c1", Zone::Internal)).unwrap()],
-            )
-            .unwrap();
-        drop(db);
-        let error = Db::open_as(&root, Hub).err().unwrap().to_string();
-        assert!(error.contains("internal connection"), "{error}");
+                vec![serde_json::to_string(&connection("c1", Zone::Internal)).unwrap()],
+            ),
+            (
+                "watch list",
+                "INSERT INTO watched(connection_id,login,body) VALUES(?1,'someone',?2)",
+                vec![
+                    external.id.clone(),
+                    serde_json::to_string(&[internal_item]).unwrap(),
+                ],
+            ),
+            (
+                "unknown effort",
+                "INSERT INTO items(id,body,effort_id) VALUES(?1,?2,'nowhere')",
+                vec![
+                    synced_item(&external.id, 2).id,
+                    serde_json::to_string(&synced_item(&external.id, 2)).unwrap(),
+                ],
+            ),
+            (
+                "hub to pull from",
+                "INSERT INTO hub(id,url) VALUES(?1,'https://elsewhere.example/')",
+                vec![Uuid::new_v4().to_string()],
+            ),
+        ];
+        for (what, sql, values) in tamperings {
+            let root = fresh(&format!("tampered {what}"));
+            let db = Db::open_as(&root, Hub).unwrap();
+            db.save_connection(&external).unwrap();
+            db.sql.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            db.sql
+                .execute(sql, rusqlite::params_from_iter(values))
+                .unwrap();
+            drop(db);
+            let error = Db::open_as(&root, Hub).err().unwrap().to_string();
+            assert!(error.contains(what), "{what}: {error}");
+        }
     }
 
     /// Every table's rows, as text.
