@@ -4,8 +4,9 @@
 # CLI's and the GNOME app's calls to their own local service, and the
 # one send of each checked client, which checks every request first:
 # GitHub's and Forgejo's read-only clients, the companion's client of its
-# hub, which only GETs the hub's export, and the client of GitHub's OAuth
-# endpoints, which only POSTs a hub's sign-in forms to github.com/login.
+# hub, which only GETs the hub's export and starts and polls its sign-in,
+# and the client of GitHub's OAuth endpoints, which only POSTs a hub's
+# sign-in forms to github.com/login.
 #
 # A reqwest request goes out through `Client::execute`, the tower `Service`
 # that `Client` and `&Client` implement, or `RequestBuilder::send`. The first

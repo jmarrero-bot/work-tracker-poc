@@ -1,19 +1,21 @@
 //! GitHub's OAuth endpoints for a GitHub App: the one exception to Workboard
 //! only reading GitHub.
 //!
-//! Signing a person in to a hub takes a request the read-only client
-//! refuses: exchanging an authorization code for a user access token, a
-//! form-encoded `POST` to `github.com/login/...`, never to the API.
-//! [`TokenClient`] sends that and nothing else. Its one send passes a `POST`
-//! only to the exact token URL, with a form body of exactly the fields that
-//! request takes, and without credential headers. Everything else, the API included, is refused before it is sent,
+//! Signing a person in to a hub takes requests the read-only client refuses:
+//! exchanging an authorization code for a user access token, and GitHub's
+//! device flow, which asks for a device code and then polls for the token.
+//! Both are form-encoded `POST`s to `github.com/login/...`, never to the API.
+//! [`TokenClient`] sends those and nothing else. Its one send passes a `POST`
+//! only to the exact device-code and token URLs, with a form body of exactly
+//! the fields one of those three requests takes, and without credential
+//! headers. Everything else, the API included, is refused before it is sent,
 //! and counted. Who signed in is then read with `GET /user`, through the
 //! read-only client.
 
 use crate::{
     clock::Timestamp,
     connector::{ConnectorError, ConnectorResult, Credential, ErrorKind, Requests},
-    connectors::{client, http_error, parse_json, read_body},
+    connectors::{client, http_error, parse_json, read_body, source_url},
 };
 use reqwest::{
     header::{self, HeaderValue},
@@ -32,6 +34,8 @@ use url::{form_urlencoded, Url};
 const GITHUB: &str = "https://github.com/";
 /// Where a browser is sent to authorize the App, under the site.
 const AUTHORIZE: &str = "login/oauth/authorize";
+/// Where the device flow asks for a device code, under the site.
+const DEVICE_CODE: &str = "login/device/code";
 /// Where codes are exchanged for tokens, under the site.
 const ACCESS_TOKEN: &str = "login/oauth/access_token";
 const FORM: &str = "application/x-www-form-urlencoded";
@@ -39,8 +43,10 @@ const ACCEPT: &str = "application/json";
 const USER_AGENT: &str = concat!("workboard/", env!("CARGO_PKG_VERSION"));
 /// How GitHub's sign-in is named in messages.
 const SOURCE: &str = "GitHub's sign-in";
+/// The grant a device-flow poll asks for.
+pub const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// The form fields of the request the client sends, exactly.
+/// The form fields of each request the client sends, exactly.
 const CODE_EXCHANGE: &[&str] = &[
     "client_id",
     "client_secret",
@@ -48,6 +54,15 @@ const CODE_EXCHANGE: &[&str] = &[
     "code_verifier",
     "redirect_uri",
 ];
+const DEVICE_REQUEST: &[&str] = &["client_id"];
+const DEVICE_POLL: &[&str] = &["client_id", "device_code", "grant_type"];
+
+/// Longest wait between polls GitHub may ask for, and the shortest.
+const MAX_INTERVAL: u64 = 60;
+const MIN_INTERVAL: u64 = 1;
+/// How long a device code lives unless GitHub says, and at most.
+const DEVICE_LIFETIME: u64 = 900;
+const MAX_DEVICE_LIFETIME: u64 = 1800;
 /// Longest error code kept from an answer.
 const MAX_CODE: usize = 64;
 
@@ -57,6 +72,7 @@ const MAX_CODE: usize = 64;
 pub struct Site {
     web: Url,
     authorize: Url,
+    device_code: Url,
     token: Url,
 }
 
@@ -71,6 +87,7 @@ impl Site {
         };
         Self {
             authorize: join(AUTHORIZE),
+            device_code: join(DEVICE_CODE),
             token: join(ACCESS_TOKEN),
             web,
         }
@@ -90,15 +107,18 @@ impl Site {
     }
 }
 
-/// Whether `request`, exactly as it would be sent, is the code exchange, at
-/// GitHub's token endpoint.
+/// Whether `request`, exactly as it would be sent, is one of the three
+/// requests to GitHub's OAuth endpoints: a code exchange, a device-code
+/// request, or a device-flow poll.
 fn check(site: &Site, request: &Request) -> Result<(), String> {
     let url = request.url();
     if request.method() != Method::POST {
         return Err(format!("{} {}", request.method(), url.path()));
     }
-    let shapes: &[&[&str]] = if *url == site.token {
-        &[CODE_EXCHANGE]
+    let shapes: &[&[&str]] = if *url == site.device_code {
+        &[DEVICE_REQUEST]
+    } else if *url == site.token {
+        &[CODE_EXCHANGE, DEVICE_POLL]
     } else {
         return Err(format!(
             "a POST to anything but GitHub's sign-in: {}",
@@ -130,6 +150,9 @@ fn check(site: &Site, request: &Request) -> Result<(), String> {
         if value.is_empty() || !fields.insert(key.to_string()) {
             return Err(format!("an empty or repeated field '{key}'"));
         }
+        if key == "grant_type" && value != DEVICE_GRANT {
+            return Err("a grant other than the device flow's".into());
+        }
     }
     let matches = |shape: &&[&str]| fields.iter().map(String::as_str).eq(shape.iter().copied());
     if !shapes.iter().any(matches) {
@@ -147,6 +170,18 @@ pub struct UserToken {
     pub expires_at: Option<Timestamp>,
     pub refresh: Option<Credential>,
     pub refresh_expires_at: Option<Timestamp>,
+}
+
+/// A device code GitHub gave, and what the person is shown.
+#[derive(Debug)]
+pub struct DeviceCode {
+    /// The code polled with. Never shown.
+    pub device_code: Credential,
+    /// The code the person enters at `verification_uri`.
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: Duration,
+    pub interval: Duration,
 }
 
 /// What GitHub's sign-in answered instead of a token.
@@ -239,6 +274,42 @@ fn user_token(answer: &Value, now: SystemTime) -> ConnectorResult<UserToken> {
         refresh: token("refresh_token")?,
         refresh_expires_at: expiry(now, answer["refresh_token_expires_in"].as_u64()),
     })
+}
+
+/// A device code answer, checked: a user code of letters, digits and
+/// hyphens, an HTTPS page to enter it on, and bounded times.
+fn device_code(answer: &Value) -> ConnectorResult<DeviceCode> {
+    let invalid =
+        || ConnectorError::invalid("GitHub's sign-in answered without a usable device code");
+    let text = |key: &str| answer[key].as_str().ok_or_else(invalid);
+    let user_code = text("user_code")?;
+    if user_code.is_empty()
+        || user_code.len() > 32
+        || !user_code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(invalid());
+    }
+    let verification_uri = source_url(text("verification_uri")?).map_err(|_| invalid())?;
+    if !verification_uri.starts_with("https://") {
+        return Err(invalid());
+    }
+    let seconds = |key: &str, default: u64, min: u64, max: u64| {
+        Duration::from_secs(answer[key].as_u64().unwrap_or(default).clamp(min, max))
+    };
+    Ok(DeviceCode {
+        device_code: Credential::new(text("device_code")?).map_err(|_| invalid())?,
+        user_code: user_code.into(),
+        verification_uri,
+        expires_in: seconds("expires_in", DEVICE_LIFETIME, 1, MAX_DEVICE_LIFETIME),
+        interval: seconds("interval", 5, MIN_INTERVAL, MAX_INTERVAL),
+    })
+}
+
+/// The wait between polls GitHub asked for, bounded.
+pub fn poll_interval(seconds: u64) -> Duration {
+    Duration::from_secs(seconds.clamp(MIN_INTERVAL, MAX_INTERVAL))
 }
 
 /// The client for GitHub's OAuth endpoints, and nothing else.
@@ -337,6 +408,36 @@ impl TokenClient {
             None => Ok(user_token(&answer, SystemTime::now())?),
         }
     }
+    /// Start the device flow: a code for the person to enter on GitHub.
+    pub async fn device_code(&self, client_id: &str) -> Result<DeviceCode, OAuthError> {
+        let request = Self::form(&self.site.device_code, &[("client_id", client_id)]);
+        let answer = self.send(request).await?;
+        match refusal(&answer) {
+            Some(refused) => Err(OAuthError::Refused(refused)),
+            None => Ok(device_code(&answer)?),
+        }
+    }
+    /// Ask once whether the person entered the device code: the user token
+    /// if they did, or why not yet.
+    pub async fn poll_device(
+        &self,
+        client_id: &str,
+        device_code: &Credential,
+    ) -> Result<UserToken, OAuthError> {
+        let request = Self::form(
+            &self.site.token,
+            &[
+                ("client_id", client_id),
+                ("device_code", device_code.expose()),
+                ("grant_type", DEVICE_GRANT),
+            ],
+        );
+        let answer = self.send(request).await?;
+        match refusal(&answer) {
+            Some(refused) => Err(OAuthError::Refused(refused)),
+            None => Ok(user_token(&answer, SystemTime::now())?),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -351,12 +452,17 @@ pub mod tests {
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use serde_json::json;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::{HashMap, VecDeque},
+        sync::Arc,
+    };
 
     pub const CLIENT_ID: &str = "Iv23test";
     pub const SECRET: &str = "test-only-client-secret";
     /// The authorization code the fake GitHub accepts once.
     pub const CODE: &str = "test-only-code";
+    pub const DEVICE: &str = "test-only-device-code";
+    pub const USER_CODE: &str = "ABCD-1234";
 
     /// What reached the fake GitHub: method, path, and the form fields.
     pub type Seen = Vec<(String, String, HashMap<String, String>)>;
@@ -369,6 +475,8 @@ pub mod tests {
         pub challenge: Option<String>,
         /// The user each access token belongs to: numeric ID and login.
         pub users: HashMap<String, (u64, String)>,
+        /// The answers to the next device-flow polls, in order.
+        pub polls: VecDeque<Value>,
         /// The token the next code exchange gives.
         pub token: String,
     }
@@ -400,7 +508,7 @@ pub mod tests {
             .push((method.to_string(), uri.path().to_string(), fields.clone()));
         let field = |k: &str| fields.get(k).map(String::as_str);
         match (method.as_str(), uri.path()) {
-            ("POST", "/login/oauth/access_token") => {
+            ("POST", "/login/oauth/access_token") if field("code").is_some() => {
                 let verifier = field("code_verifier").unwrap_or_default();
                 let digest = ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes());
                 let pkce = fake.challenge.take() == Some(URL_SAFE_NO_PAD.encode(digest));
@@ -414,6 +522,24 @@ pub mod tests {
                 }
                 Json(token_answer(&fake.token)).into_response()
             }
+            ("POST", "/login/oauth/access_token") => {
+                if field("device_code") != Some(DEVICE) {
+                    return Json(json!({"error": "incorrect_device_code"})).into_response();
+                }
+                let next = fake
+                    .polls
+                    .pop_front()
+                    .unwrap_or_else(|| json!({"error": "expired_token"}));
+                Json(next).into_response()
+            }
+            ("POST", "/login/device/code") => Json(json!({
+                "device_code": DEVICE,
+                "user_code": USER_CODE,
+                "verification_uri": "https://github.com/login/device",
+                "expires_in": 900,
+                "interval": 5,
+            }))
+            .into_response(),
             ("GET", "/api/v3/user") => {
                 let token = headers
                     .get("authorization")
@@ -452,14 +578,20 @@ pub mod tests {
     // Requests of other methods are built here only to be refused.
     #[allow(clippy::disallowed_methods)]
     #[test]
-    fn only_the_code_exchange_passes() {
+    fn only_the_three_sign_in_requests_pass() {
         const TOKEN: &str = "https://github.com/login/oauth/access_token";
+        const DEVICE_URL: &str = "https://github.com/login/device/code";
         let exchange = [
             ("client_id", "c"),
             ("client_secret", "s"),
             ("code", "x"),
             ("redirect_uri", "https://hub.example/auth/github/callback"),
             ("code_verifier", "v"),
+        ];
+        let poll = [
+            ("client_id", "c"),
+            ("device_code", "d"),
+            ("grant_type", DEVICE_GRANT),
         ];
         let site = Site::github();
         let with = |mut request: Request, edit: fn(&mut Request)| {
@@ -469,6 +601,12 @@ pub mod tests {
         // (what, request, passes)
         let cases = [
             ("code exchange", github_request(TOKEN, &exchange), true),
+            (
+                "device code",
+                github_request(DEVICE_URL, &[("client_id", "c")]),
+                true,
+            ),
+            ("device poll", github_request(TOKEN, &poll), true),
             (
                 "the API",
                 github_request("https://api.github.com/user", &[("client_id", "c")]),
@@ -522,49 +660,55 @@ pub mod tests {
             ),
             (
                 "a repeated field",
-                github_request(TOKEN, &[&exchange[..], &exchange[..1]].concat()),
+                github_request(DEVICE_URL, &[("client_id", "c"), ("client_id", "c")]),
                 false,
             ),
             (
                 "an empty field",
-                github_request(
-                    TOKEN,
-                    &[&exchange[..4], &[("code_verifier", "")][..]].concat(),
-                ),
+                github_request(DEVICE_URL, &[("client_id", "")]),
                 false,
             ),
             (
-                "the device-code URL",
+                "exchange fields at the device URL",
+                github_request(DEVICE_URL, &exchange),
+                false,
+            ),
+            (
+                "another grant",
                 github_request(
-                    "https://github.com/login/device/code",
-                    &[("client_id", "c")],
+                    TOKEN,
+                    &[
+                        ("client_id", "c"),
+                        ("device_code", "d"),
+                        ("grant_type", "refresh_token"),
+                    ],
                 ),
                 false,
             ),
             (
                 "GET",
-                with(github_request(TOKEN, &exchange), |r| {
+                with(github_request(TOKEN, &poll), |r| {
                     *r.method_mut() = Method::GET
                 }),
                 false,
             ),
             (
                 "PUT",
-                with(github_request(TOKEN, &exchange), |r| {
+                with(github_request(TOKEN, &poll), |r| {
                     *r.method_mut() = Method::PUT
                 }),
                 false,
             ),
             (
                 "DELETE",
-                with(github_request(TOKEN, &exchange), |r| {
+                with(github_request(TOKEN, &poll), |r| {
                     *r.method_mut() = Method::DELETE
                 }),
                 false,
             ),
             (
                 "JSON",
-                with(github_request(TOKEN, &exchange), |r| {
+                with(github_request(TOKEN, &poll), |r| {
                     r.headers_mut().insert(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static("application/json"),
@@ -574,19 +718,19 @@ pub mod tests {
             ),
             (
                 "no content type",
-                with(github_request(TOKEN, &exchange), |r| {
+                with(github_request(TOKEN, &poll), |r| {
                     r.headers_mut().remove(header::CONTENT_TYPE);
                 }),
                 false,
             ),
             (
                 "no body",
-                with(github_request(TOKEN, &exchange), |r| *r.body_mut() = None),
+                with(github_request(TOKEN, &poll), |r| *r.body_mut() = None),
                 false,
             ),
             (
                 "a token header",
-                with(github_request(TOKEN, &exchange), |r| {
+                with(github_request(TOKEN, &poll), |r| {
                     r.headers_mut()
                         .insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer x"));
                 }),
@@ -602,7 +746,7 @@ pub mod tests {
             ),
             (
                 "a cookie",
-                with(github_request(TOKEN, &exchange), |r| {
+                with(github_request(TOKEN, &poll), |r| {
                     r.headers_mut()
                         .insert(header::COOKIE, HeaderValue::from_static("a=b"));
                 }),
@@ -688,6 +832,46 @@ pub mod tests {
         assert_eq!(sent, [("POST /login/oauth/access_token".to_string(), 3)]);
     }
 
+    #[tokio::test]
+    async fn device_polls_say_why_there_is_no_token_yet() {
+        let (site, fake) = fake_github().await;
+        let client = TokenClient::new(site).unwrap();
+        let code = client.device_code(CLIENT_ID).await.unwrap();
+        assert_eq!(code.user_code, USER_CODE);
+        assert_eq!(code.interval, Duration::from_secs(5));
+        fake.lock().unwrap().polls = [
+            json!({"error": "authorization_pending"}),
+            json!({"error": "slow_down", "interval": 10}),
+            json!({"error": "access_denied"}),
+            json!({"error": "expired_token"}),
+            json!({"error": "device_flow_disabled"}),
+            json!({"error": "<script>"}),
+            token_answer("ghu_device"),
+        ]
+        .into();
+        let expected = [
+            Refused::Pending,
+            Refused::SlowDown(Some(10)),
+            Refused::Denied,
+            Refused::Expired,
+            Refused::Other("device_flow_disabled".into()),
+            Refused::Other("unknown".into()),
+        ];
+        for refused in expected {
+            let got = client.poll_device(CLIENT_ID, &code.device_code).await;
+            assert_eq!(got.unwrap_err(), OAuthError::Refused(refused));
+        }
+        let token = client
+            .poll_device(CLIENT_ID, &code.device_code)
+            .await
+            .unwrap();
+        assert_eq!(token.access.expose(), "ghu_device");
+        let seen = fake.lock().unwrap().seen.clone();
+        assert_eq!(seen[0].2.keys().collect::<Vec<_>>(), ["client_id"]);
+        assert_eq!(seen[1].2["grant_type"], DEVICE_GRANT);
+        assert!(seen.iter().all(|(method, _, _)| method == "POST"));
+    }
+
     #[test]
     fn answers_are_checked() {
         let now = SystemTime::now();
@@ -701,5 +885,33 @@ pub mod tests {
         }
         let token = user_token(&json!({"access_token": "ghu_x"}), now).unwrap();
         assert!(token.expires_at.is_none() && token.refresh.is_none());
+        let good = json!({
+            "device_code": "d", "user_code": "WDJB-MJHT",
+            "verification_uri": "https://github.com/login/device",
+        });
+        let code = device_code(&good).unwrap();
+        assert_eq!(
+            (code.expires_in.as_secs(), code.interval.as_secs()),
+            (DEVICE_LIFETIME, 5)
+        );
+        for (key, value) in [
+            ("user_code", json!("<b>")),
+            ("user_code", json!("")),
+            ("verification_uri", json!("javascript:alert(1)")),
+            ("verification_uri", json!("http://github.com/login/device")),
+            ("device_code", json!(null)),
+        ] {
+            let mut bad = good.clone();
+            bad[key] = value.clone();
+            assert!(device_code(&bad).is_err(), "{key}: {value}");
+        }
+        let mut long = good.clone();
+        long["interval"] = json!(100_000);
+        long["expires_in"] = json!(u64::MAX);
+        let code = device_code(&long).unwrap();
+        assert_eq!(
+            (code.expires_in.as_secs(), code.interval.as_secs()),
+            (MAX_DEVICE_LIFETIME, MAX_INTERVAL)
+        );
     }
 }

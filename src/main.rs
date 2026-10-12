@@ -289,7 +289,7 @@ enum Command {
     /// Remove a connection, its locally cached items and its stored credential.
     Disconnect { connection: String },
     /// Pull the external work of a hub, to show it with this machine's own,
-    /// as its companion. Nothing is ever sent to the hub.
+    /// as its companion. Nothing of this machine's is ever sent to the hub.
     Hub {
         #[command(subcommand)]
         command: HubCommand,
@@ -297,7 +297,8 @@ enum Command {
     /// Print a hub's companion token, with which a companion reads the
     /// hub's external export and nothing else. Run it on the hub.
     CompanionToken {
-        /// Replace it; the old one stops working at once.
+        /// Replace it; the old one stops working at once, and so does every
+        /// companion credential `hub login` gave.
         #[arg(long)]
         rotate: bool,
     },
@@ -376,6 +377,12 @@ enum HubCommand {
         #[arg(long)]
         token_stdin: bool,
     },
+    /// Sign in to the hub at URL with GitHub, and pull from it with the
+    /// credential that gives: open the page it shows and enter the code.
+    /// The hub runs GitHub's device flow; it gives this machine a
+    /// credential that only reads its external export, as a GitHub user
+    /// it allows.
+    Login { url: String },
     /// Show the hub this machine pulls from, and how fresh its work is.
     Show,
     /// Stop pulling from the hub, and forget its token and its work.
@@ -1042,6 +1049,7 @@ async fn main() -> Result<()> {
                     status.url, status.items, status.connections
                 );
             }
+            HubCommand::Login { url } => hub_login(&client, &root, args.port, &url).await?,
             HubCommand::Show => {
                 let status: Option<hub::Status> =
                     request(&client, &root, args.port, reqwest::Method::GET, "hub", None).await?;
@@ -1084,6 +1092,59 @@ async fn main() -> Result<()> {
         Command::Serve { .. } | Command::GithubApp { .. } => unreachable!(),
     }
     Ok(())
+}
+/// Sign in to the hub at `url` through the local service: show the code,
+/// then poll until the person entered it on GitHub, or it expired.
+async fn hub_login(
+    client: &reqwest::Client,
+    root: &std::path::Path,
+    port: u16,
+    url: &str,
+) -> Result<()> {
+    let start: serde_json::Value = request(
+        client,
+        root,
+        port,
+        reqwest::Method::POST,
+        "hub/login",
+        Some(serde_json::json!({ "url": url })),
+    )
+    .await?;
+    let text = |key: &str| start[key].as_str().unwrap_or_default().to_string();
+    println!(
+        "Open {} and enter the code {}",
+        text("verification_uri"),
+        text("user_code")
+    );
+    println!("Waiting for GitHub...");
+    let mut interval = start["interval"].as_u64().unwrap_or(5);
+    loop {
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+        let poll: serde_json::Value = request(
+            client,
+            root,
+            port,
+            reqwest::Method::POST,
+            "hub/login/poll",
+            Some(serde_json::json!({})),
+        )
+        .await?;
+        if poll["status"] == "done" {
+            let status: hub::Status = serde_json::from_value(poll["hub"].clone())?;
+            println!(
+                "Signed in to {} as {}. Pulling from it: {} items of {} connections, and on schedule",
+                status.url,
+                poll["login"].as_str().unwrap_or_default(),
+                status.items,
+                status.connections
+            );
+            return Ok(());
+        }
+        if let Some(error) = poll["error"].as_str() {
+            println!("Still waiting; the last poll failed: {error}");
+        }
+        interval = poll["interval"].as_u64().unwrap_or(interval);
+    }
 }
 /// Open `url` with the system browser.
 fn open_in_browser(url: &str) -> Result<()> {
