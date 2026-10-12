@@ -42,8 +42,23 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: type=ref,event=tag
           flavor: latest=false
-      # One manifest, not an index: buildx's own provenance would add one,
-      # and the attestation below takes its place.
+      # Built and smoke-tested before anything is pushed, so a broken image
+      # never reaches the registry.
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          load: true
+          tags: localhost/workboard:release
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+      - name: Smoke test the image
+        run: python3 tests/image_smoke.py localhost/workboard:release --engine docker --network host
+      # The same build again, from the builder's cache, now pushed. One
+      # manifest, not an index: buildx's own provenance would add one, and
+      # the attestation below takes its place.
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -56,6 +71,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
+      # The pushed image's config can differ from the one tested above (its
+      # creation time), so the digest that gets pinned is tested too.
       - name: Smoke test the pushed digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
