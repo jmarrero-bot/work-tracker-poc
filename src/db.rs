@@ -334,12 +334,7 @@ enum Write<'a> {
     /// A connection's settings.
     Connection(&'a Connection),
     /// What a sync of connection `id` found.
-    Sync {
-        id: &'a str,
-        items: &'a [Item],
-        watched: Option<&'a WatchList>,
-        agents: Option<&'a AgentRuns>,
-    },
+    Sync { id: &'a str, found: &'a Found<'a> },
     /// A connection's sync state alone.
     SyncState,
     /// Whom connection `id` watches.
@@ -432,6 +427,23 @@ fn connection_body(c: &Connection) -> Result<String> {
         body.remove("from_hub");
     }
     Ok(serde_json::to_string(&v)?)
+}
+
+/// What a sync of a connection found, to save together.
+#[derive(Clone, Copy)]
+pub struct Found<'a> {
+    pub items: &'a [Item],
+    pub watched: Option<&'a WatchList>,
+    pub agents: Option<&'a AgentRuns>,
+    /// Local IDs of items its connector no longer tracks, to remove.
+    pub dropped: &'a [String],
+}
+
+/// Whether local item ID `item` is one of connection `id`'s, which are
+/// namespaced by it.
+fn of_connection(item: &str, id: &str) -> bool {
+    item.strip_prefix(id)
+        .is_some_and(|rest| rest.starts_with(':'))
 }
 
 /// Fail unless connection `id` is still there, so a sync that finishes
@@ -578,12 +590,13 @@ impl Db {
                     ));
                 }
             }
-            Write::Sync {
-                id,
-                items,
-                watched,
-                agents,
-            } => {
+            Write::Sync { id, found } => {
+                let Found {
+                    items,
+                    watched,
+                    agents,
+                    dropped,
+                } = *found;
                 self.external_connection(id)?;
                 let theirs =
                     |i: &Item| i.connection_id.as_deref() == Some(id) && i.zone == Zone::External;
@@ -592,7 +605,9 @@ impl Db {
                 // Agent runs have no zone of their own: they are the
                 // connection's, which is external.
                 let agents_ok = agents.is_none_or(|a| a.connection_id == id);
-                if !items.iter().all(theirs) || !watched_ok || !agents_ok {
+                // It may stop tracking its own items only.
+                let dropped_ok = dropped.iter().all(|d| of_connection(d, id));
+                if !items.iter().all(theirs) || !watched_ok || !agents_ok || !dropped_ok {
                     return Err(refused("work that isn't its external connection's"));
                 }
             }
@@ -809,7 +824,13 @@ impl Db {
         watched: Option<&WatchList>,
         state: &SyncState,
     ) -> Result<()> {
-        self.save_found(id, items, watched, None, state)
+        let found = Found {
+            items,
+            watched,
+            agents: None,
+            dropped: &[],
+        };
+        self.save_found(id, &found, state)
     }
     /// Save synced items without touching watch lists, as tests set up.
     #[cfg(test)]
@@ -822,27 +843,27 @@ impl Db {
     /// Save what a sync of connection `id` found, all or nothing, once it
     /// has been processed: its items, what it found watching another user,
     /// which replaces the last such list, the agent runs of a bot's
-    /// heartbeat, which replace the last ones, and the connection's sync
-    /// state. Nothing is saved before, so a sync that stops halfway leaves
-    /// the last good data and state, and the next one fetches everything
-    /// again.
-    pub fn save_found(
-        &mut self,
-        id: &str,
-        items: &[Item],
-        watched: Option<&WatchList>,
-        agents: Option<&AgentRuns>,
-        state: &SyncState,
-    ) -> Result<()> {
-        self.admit(Write::Sync {
-            id,
+    /// heartbeat, which replace the last ones, the removal of items its
+    /// connector stopped tracking, and the connection's sync state. Nothing
+    /// is saved before, so a sync that stops halfway leaves the last good
+    /// data and state, and the next one fetches everything again.
+    pub fn save_found(&mut self, id: &str, found: &Found, state: &SyncState) -> Result<()> {
+        self.admit(Write::Sync { id, found })?;
+        let Found {
             items,
             watched,
             agents,
-        })?;
+            dropped,
+        } = *found;
         let tx = self.sql.transaction()?;
         check_connected(&tx, id)?;
         upsert_synced(&tx, items)?;
+        for item in dropped {
+            if !of_connection(item, id) {
+                bail!("An item of another connection was to be removed")
+            }
+            tx.execute("DELETE FROM items WHERE id=?1", [item])?;
+        }
         tx.execute("DELETE FROM watched WHERE connection_id=?1", [id])?;
         if let Some(w) = watched {
             if w.connection_id != id {
@@ -2280,14 +2301,21 @@ mod tests {
                 ..Default::default()
             }),
         };
-        db.save_found(&c.id, &[], None, Some(&runs(&c.id, None)), &ok)
-            .unwrap();
+        let save = |db: &mut Db, runs: &AgentRuns| {
+            let found = Found {
+                items: &[],
+                watched: None,
+                agents: Some(runs),
+                dropped: &[],
+            };
+            db.save_found(&c.id, &found, &ok)
+        };
+        save(&mut db, &runs(&c.id, None)).unwrap();
         assert_eq!(db.agents().unwrap(), [runs(&c.id, None)]);
         // Never another connection's, on a hub or anywhere.
         let other = runs("c0ffee00-0000-4000-8000-000000000001", None);
-        assert!(db.save_found(&c.id, &[], None, Some(&other), &ok).is_err());
-        db.save_found(&c.id, &[], None, Some(&runs(&c.id, Some("down"))), &ok)
-            .unwrap();
+        assert!(save(&mut db, &other).is_err());
+        save(&mut db, &runs(&c.id, Some("down"))).unwrap();
         assert_eq!(db.agents().unwrap(), [runs(&c.id, Some("down"))]);
         // They aren't items.
         assert!(db.items().unwrap().is_empty());
@@ -2310,14 +2338,50 @@ mod tests {
         // Disconnecting removes them.
         let mut db = Db::open(&temp.path().join("local")).unwrap();
         db.save_connection(&c).unwrap();
-        db.save_found(&c.id, &[], None, Some(&runs(&c.id, None)), &ok)
-            .unwrap();
+        save(&mut db, &runs(&c.id, None)).unwrap();
         db.delete_connection(&c.id).unwrap();
         let rows: i64 = db
             .sql
             .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn items_a_connector_stops_tracking_are_removed_and_only_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_as(&temp.path().join("hub"), Mode::Hub).unwrap();
+        let c = connection("c0ffee00-0000-4000-8000-00000000000e", Zone::External);
+        let other = connection("c0ffee00-0000-4000-8000-00000000000f", Zone::External);
+        let ok = SyncState::default().succeeded(Timestamp::from_unix(1_791_763_200));
+        for conn in [&c, &other] {
+            db.save_connection(conn).unwrap();
+            let items = [synced_item(&conn.id, 1), synced_item(&conn.id, 2)];
+            db.save_sync(&conn.id, &items, None, &ok).unwrap();
+        }
+        let drop = |db: &mut Db, dropped: &[String]| {
+            let found = Found {
+                items: &[],
+                watched: None,
+                agents: None,
+                dropped,
+            };
+            db.save_found(&c.id, &found, &ok)
+        };
+        // Never another connection's, even one whose ID starts like it.
+        for theirs in [synced_item(&other.id, 1).id, format!("{}x:errata:1", c.id)] {
+            assert!(drop(&mut db, &[theirs]).is_err());
+        }
+        drop(&mut db, &[synced_item(&c.id, 1).id]).unwrap();
+        let mut left: Vec<_> = db.items().unwrap().into_iter().map(|i| i.id).collect();
+        left.sort();
+        let mut expected = vec![
+            synced_item(&c.id, 2).id,
+            synced_item(&other.id, 1).id,
+            synced_item(&other.id, 2).id,
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
     }
 
     #[test]

@@ -723,7 +723,7 @@ impl Scheduler {
         let result = async {
             let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
             let target = Target::new(&c.base_url, &token?)?;
-            let (items, watched) = connector::sync_and_watch(
+            let (synced, watched) = connector::sync_and_watch(
                 source.as_ref(),
                 &target,
                 &c,
@@ -734,7 +734,7 @@ impl Scheduler {
             .await?;
             let agents =
                 connector::agents(source.as_ref(), &target, &c, runs.as_ref(), started).await;
-            Ok::<_, anyhow::Error>((items, watched, agents))
+            Ok::<_, anyhow::Error>((synced, watched, agents))
         }
         .await;
         let source = source.ok();
@@ -744,10 +744,10 @@ impl Scheduler {
         let sample = (self.sample)();
         let mut db = self.db();
         let saved = match result {
-            Ok((items, watched, agents)) => {
+            Ok((synced, watched, agents)) => {
                 let mut state = c.sync.succeeded(started);
                 state.next_due = self.policy.next_due(&c, &state, finished, sample);
-                report.items = Some(items.len());
+                report.items = Some(synced.items.len());
                 report.watched = watched.as_ref().map(|w| Watched {
                     login: w.login.clone(),
                     items: w.items.len(),
@@ -758,8 +758,13 @@ impl Scheduler {
                     runs: a.heartbeat.as_ref().map_or(0, |h| h.runs.len()),
                     error: a.error.clone(),
                 });
-                db.save_found(&c.id, &items, watched.as_ref(), agents.as_ref(), &state)
-                    .map(|()| state)
+                let found = crate::db::Found {
+                    items: &synced.items,
+                    watched: watched.as_ref(),
+                    agents: agents.as_ref(),
+                    dropped: &synced.dropped,
+                };
+                db.save_found(&c.id, &found, &state).map(|()| state)
             }
             Err(e) => {
                 let mut state = c.sync.failed(started, &e);

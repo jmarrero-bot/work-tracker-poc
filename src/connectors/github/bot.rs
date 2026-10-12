@@ -609,9 +609,29 @@ impl Bot {
         let mut answers = self.refresh_board(target, &board).await?;
         let prs: Vec<Tracked> = prs.into_iter().cloned().collect();
         for mut answer in refresh_issues(&self.client, target, &prs).await? {
+            // The board item that linked it, as the listing last found.
+            let link = prs
+                .iter()
+                .find(|t| t.remote_id == answer.remote_id)
+                .and_then(|t| t.bot.as_ref()?.board_item.clone());
             if let Some(item) = &mut answer.item {
+                // Confirmed closed or merged, as bot-pr closes one it
+                // promotes upstream, and linked: its board item carries what
+                // became of the work, so it is no longer tracked. One no
+                // board item links stays closed without delivery, for a
+                // person to decide; one in a state GitHub doesn't say, or
+                // one that can't be read (no item), stays, unknown.
+                let finished = matches!(
+                    item.outcome,
+                    Outcome::Delivered | Outcome::ClosedWithoutDelivery
+                );
+                if finished && link.is_some() {
+                    answers.push(Refreshed::dropped(&answer.remote_id));
+                    continue;
+                }
                 item.bot = Some(BotFields {
                     kind: BotKind::ForkPr,
+                    board_item: link,
                     ..BotFields::default()
                 });
             }
@@ -910,6 +930,28 @@ mod tests {
                     Json(pr)
                 }),
             )
+            .route(
+                "/api/v3/repos/jmarrero-forge/r/issues/16",
+                get(|headers: HeaderMap| async move {
+                    let mut pr = found_pr(&base(&headers), "jmarrero-forge/r", 16, false);
+                    pr["state"] = "closed".into();
+                    Json(pr)
+                }),
+            )
+            .route(
+                "/api/v3/repos/jmarrero-forge/r/issues/18",
+                get(|headers: HeaderMap| async move {
+                    let mut pr = found_pr(&base(&headers), "jmarrero-forge/r", 18, false);
+                    pr["state"] = "locked".into();
+                    Json(pr)
+                }),
+            )
+            .route(
+                "/api/v3/repos/jmarrero-forge/r/issues/17",
+                get(|headers: HeaderMap| async move {
+                    Json(found_pr(&base(&headers), "jmarrero-forge/r", 17, false))
+                }),
+            )
     }
     fn connection() -> Connection {
         Connection {
@@ -1053,6 +1095,15 @@ mod tests {
         let tracked = |remote_id: &str, key: &str| Tracked {
             remote_id: remote_id.into(),
             key: key.into(),
+            bot: None,
+        };
+        let linked = |remote_id: &str, key: &str, board_item: &str| Tracked {
+            bot: Some(BotFields {
+                kind: BotKind::ForkPr,
+                board_item: Some(board_item.into()),
+                ..BotFields::default()
+            }),
+            ..tracked(remote_id, key)
         };
         let answers = bot
             .refresh_all(
@@ -1062,6 +1113,26 @@ mod tests {
                     tracked("PVTI_y", "o/r#21"),
                     tracked("PVTI_x", "o/r#22"),
                     tracked("5015", "jmarrero-forge/r#15"),
+                    linked(
+                        "5016",
+                        "jmarrero-forge/r#16",
+                        "https://github.com/o/r/issues/2",
+                    ),
+                    linked(
+                        "5017",
+                        "jmarrero-forge/r#17",
+                        "https://github.com/o/r/issues/3",
+                    ),
+                    linked(
+                        "5018",
+                        "jmarrero-forge/r#18",
+                        "https://github.com/o/r/issues/4",
+                    ),
+                    linked(
+                        "5019",
+                        "jmarrero-forge/r#19",
+                        "https://github.com/o/r/issues/5",
+                    ),
                 ],
             )
             .await
@@ -1080,10 +1151,33 @@ mod tests {
                 ("PVTI_y", None),
                 // Another board's.
                 ("PVTI_x", None),
-                // A fork pull request closed without merging, as one is
-                // once it is promoted upstream.
+                // A fork pull request closed without merging, which no
+                // board item links: a person decides.
                 ("5015", Some(Outcome::ClosedWithoutDelivery)),
+                // One a board item links, closed as it is once promoted
+                // upstream: the board item carries what became of it.
+                ("5016", None),
+                // Still open: kept, with its link.
+                ("5017", Some(Outcome::Open)),
+                // Linked, but in a state GitHub doesn't say is closed or
+                // merged: kept, unknown, never removed.
+                ("5018", Some(Outcome::Unknown)),
+                // Linked, but gone (404): an answer that it can't be read,
+                // which the sync keeps as unknown, never removed.
+                ("5019", None),
             ]
+        );
+        assert!(!answers[6].dropped && !answers[7].dropped);
+        assert_eq!(
+            answers[7].error.as_ref().map(|e| e.kind),
+            Some(ErrorKind::Inaccessible)
+        );
+        assert!(answers[4].dropped && answers[4].error.is_none());
+        assert!(answers.iter().filter(|a| a.dropped).count() == 1);
+        let kept = answers[5].item.as_ref().unwrap().bot.clone().unwrap();
+        assert_eq!(
+            (kept.kind, kept.board_item.as_deref()),
+            (BotKind::ForkPr, Some("https://github.com/o/r/issues/3"))
         );
         assert_eq!(
             answers[3].item.as_ref().unwrap().bot.as_ref().unwrap().kind,
@@ -1092,6 +1186,44 @@ mod tests {
         let requests = bot.requests().unwrap();
         assert_eq!(requests.sent["POST /graphql (query)"], 1);
         assert_eq!(requests.refused, 0);
+    }
+
+    #[tokio::test]
+    async fn a_sync_removes_only_a_linked_fork_pr_confirmed_closed() {
+        let (target, task) = crate::connectors::fixture(router(), "test-only-token").await;
+        let bot = Bot::new(Arc::default(), config()).unwrap();
+        let c = connection();
+        // Fork pull requests tracked before, each linked from the board,
+        // and none open any more: closed (16), in a state GitHub doesn't
+        // say is closed or merged (18), and gone (19).
+        let stored = |n: u64| {
+            let mut remote = github_item(
+                &found_pr("https://github.com/", "jmarrero-forge/r", n, false),
+                "review",
+            )
+            .unwrap();
+            remote.bot = Some(BotFields {
+                kind: BotKind::ForkPr,
+                board_item: Some(format!("https://github.com/o/r/issues/{n}")),
+                ..BotFields::default()
+            });
+            connector::to_item(&c, "bot", remote).unwrap()
+        };
+        let old = [stored(16), stored(18), stored(19)];
+        let at = Timestamp::parse("2026-10-12T04:00:00Z").unwrap();
+        let (synced, _) = connector::sync_and_watch(&bot, &target, &c, &old, None, at)
+            .await
+            .unwrap();
+        task.abort();
+        assert_eq!(synced.dropped, [old[0].id.clone()]);
+        for kept in &old[1..] {
+            let item = synced
+                .items
+                .iter()
+                .find(|i| i.id == kept.id)
+                .unwrap_or_else(|| panic!("{} was not kept", kept.key));
+            assert_eq!(item.outcome, Outcome::Unknown, "{}", kept.key);
+        }
     }
 
     #[tokio::test]

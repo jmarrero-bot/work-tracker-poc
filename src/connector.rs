@@ -264,6 +264,10 @@ impl Listing {
 pub struct Tracked {
     pub remote_id: String,
     pub key: String,
+    /// What the bot connector read of it besides. Built-in connectors only,
+    /// so not part of the plugin protocol.
+    #[serde(skip)]
+    pub bot: Option<BotFields>,
 }
 
 /// The answer for one tracked item: the item, or why it can't be read.
@@ -275,6 +279,11 @@ pub struct Refreshed {
     pub item: Option<RemoteItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ConnectorError>,
+    /// The connector no longer tracks it, as another item carries what
+    /// became of it: it is removed. Built-in connectors only, so not part
+    /// of the plugin protocol.
+    #[serde(skip)]
+    pub dropped: bool,
 }
 
 impl Refreshed {
@@ -283,6 +292,7 @@ impl Refreshed {
             remote_id: remote_id.into(),
             item: Some(item),
             error: None,
+            dropped: false,
         }
     }
     pub fn inaccessible(remote_id: &str, message: impl Into<String>) -> Self {
@@ -290,8 +300,26 @@ impl Refreshed {
             remote_id: remote_id.into(),
             item: None,
             error: Some(ConnectorError::new(ErrorKind::Inaccessible, message)),
+            dropped: false,
         }
     }
+    /// It is no longer tracked, and is removed.
+    pub fn dropped(remote_id: &str) -> Self {
+        Self {
+            remote_id: remote_id.into(),
+            item: None,
+            error: None,
+            dropped: true,
+        }
+    }
+}
+
+/// What a sync found: its items, and the local IDs of tracked items its
+/// connector no longer tracks, to remove.
+#[derive(Debug, Clone, Default)]
+pub struct Synced {
+    pub items: Vec<Item>,
+    pub dropped: Vec<String>,
 }
 
 /// What a connector sent to its source, so a person can check that it only
@@ -606,8 +634,10 @@ pub async fn sync_and_watch(
     old: &[Item],
     last: Option<&WatchList>,
     at: Timestamp,
-) -> ConnectorResult<(Vec<Item>, Option<WatchList>)> {
-    let items = sync(connector, target, c, old).await?;
+) -> ConnectorResult<(Synced, Option<WatchList>)> {
+    let items = sync_checked(connector, target, c, old)
+        .await
+        .map_err(|e| e.redact(&target.credential))?;
     let Some(login) = &c.watch_user else {
         return Ok((items, None));
     };
@@ -637,7 +667,9 @@ pub async fn sync_and_watch(
 /// longer has, so a merge or a finished ticket can advance its effort. An
 /// item the source no longer shows becomes unknown, never done; any other
 /// failure fails the whole sync, so no partial result is saved. No error or
-/// item carries the credential.
+/// item carries the credential. The items alone, as tests check them;
+/// [`sync_and_watch`] is what the service runs.
+#[cfg(test)]
 pub async fn sync(
     connector: &dyn Connector,
     target: &Target,
@@ -646,6 +678,7 @@ pub async fn sync(
 ) -> ConnectorResult<Vec<Item>> {
     sync_checked(connector, target, c, old)
         .await
+        .map(|synced| synced.items)
         .map_err(|e| e.redact(&target.credential))
 }
 
@@ -654,7 +687,7 @@ async fn sync_checked(
     target: &Target,
     c: &Connection,
     old: &[Item],
-) -> ConnectorResult<Vec<Item>> {
+) -> ConnectorResult<Synced> {
     // Rotating a credential must not change the linked account.
     let account = verify(connector, target).await?;
     if account.id != c.account_id {
@@ -682,15 +715,20 @@ async fn sync_checked(
         })
         .collect();
     if missing.is_empty() {
-        return Ok(all.into_values().collect());
+        return Ok(Synced {
+            items: all.into_values().collect(),
+            dropped: vec![],
+        });
     }
     let tracked: Vec<_> = missing
         .iter()
         .map(|i| Tracked {
             remote_id: i.remote_id.clone(),
             key: i.key.clone(),
+            bot: i.bot.clone(),
         })
         .collect();
+    let mut dropped = Vec::new();
     let mut answers = BTreeMap::new();
     for answer in connector.refresh(target, &account, &tracked).await? {
         let remote_id = answer.remote_id.clone();
@@ -704,6 +742,15 @@ async fn sync_checked(
         let answer = answers.remove(&old.remote_id).ok_or_else(|| {
             ConnectorError::invalid("The connector did not answer for every tracked item")
         })?;
+        if answer.dropped {
+            if answer.item.is_some() || answer.error.is_some() {
+                return Err(ConnectorError::invalid(
+                    "The connector both dropped a tracked item and answered for it",
+                ));
+            }
+            dropped.push(old.id.clone());
+            continue;
+        }
         let next = match (answer.item, answer.error) {
             (Some(mut remote), None) => {
                 // Otherwise the tracked item would stay as it was, and the
@@ -740,7 +787,10 @@ async fn sync_checked(
             "The connector answered for an item that was not asked for",
         ));
     }
-    Ok(all.into_values().collect())
+    Ok(Synced {
+        items: all.into_values().collect(),
+        dropped,
+    })
 }
 
 #[cfg(test)]
@@ -902,6 +952,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_item_the_connector_drops_is_left_to_remove() {
+        let old = [stored("t", Outcome::Open)];
+        let fake = Fake::new(vec![], vec![Refreshed::dropped("t")]);
+        let at = Timestamp::from_unix(1_791_763_200);
+        let (synced, _) = sync_and_watch(&fake, &target(), &connection(), &old, None, at)
+            .await
+            .unwrap();
+        assert!(synced.items.is_empty());
+        assert_eq!(synced.dropped, ["c1:fake:t"]);
+        // Not a plugin's to say: the protocol never carries it.
+        let json = serde_json::to_value(Refreshed::dropped("t")).unwrap();
+        assert_eq!(json, serde_json::json!({"remote_id": "t"}));
+        // Dropping an item and answering for it at once is refused.
+        let both = Refreshed {
+            dropped: true,
+            ..Refreshed::found("t", remote("t", Outcome::Open, "next"))
+        };
+        let error = run(&Fake::new(vec![], vec![both]), &old).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Invalid, "{error}");
+    }
+
+    #[tokio::test]
     async fn sync_skips_refresh_when_nothing_is_missing() {
         let fake = Fake::new(vec![remote("a", Outcome::Open, "next")], vec![]);
         let items = run(&fake, &[stored("a", Outcome::Open)]).await.unwrap();
@@ -1007,9 +1079,8 @@ mod tests {
                 Fake::new(
                     vec![],
                     vec![Refreshed {
-                        remote_id: "t".into(),
-                        item: None,
                         error: Some(transient),
+                        ..Refreshed::inaccessible("t", "")
                     }],
                 ),
                 Transient,
@@ -1128,10 +1199,10 @@ mod tests {
             (Some(last("someone-else")), 0, None),
             (None, 0, None),
         ] {
-            let (items, watched) = sync_and_watch(&fake, &target(), &c, &[], last.as_ref(), now)
+            let (synced, watched) = sync_and_watch(&fake, &target(), &c, &[], last.as_ref(), now)
                 .await
                 .unwrap();
-            assert_eq!(items.len(), 1);
+            assert_eq!(synced.items.len(), 1);
             let watched = watched.unwrap();
             assert_eq!(
                 (watched.login.as_str(), watched.items.len()),
