@@ -1,9 +1,11 @@
 //! Workboard for GNOME: a native companion to the local Workboard service.
-//! It shows what the service has, through its HTTP API on loopback. It
-//! keeps no work of its own.
+//! It shows what the service has, through its HTTP API on loopback, and
+//! announces new Mine items as desktop notifications, also while its
+//! window is closed. It keeps no work of its own.
 
 mod api;
 mod model;
+mod notify;
 mod views;
 mod widgets;
 mod window;
@@ -25,6 +27,10 @@ use views::View;
 pub const APP_ID: &str = "io.github.jmarrero_bot.Workboard";
 /// How often the app asks the service again, as the web page does.
 const REFRESH_SECS: u32 = 30;
+/// Where, in the app's own state directory, the notified IDs are kept.
+const NOTIFIED: &str = "workboard-gnome/notified.json";
+/// How long quitting waits for that file to be saved.
+const NOTIFIED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// The links the app opens: web pages only.
 const WEB_SCHEMES: [&str; 2] = ["https://", "http://"];
 
@@ -41,6 +47,9 @@ struct Args {
     /// Port of the local Workboard service.
     #[arg(long, default_value_t = api::DEFAULT_PORT)]
     port: u16,
+    /// Start without a window, to keep notifying, as at login.
+    #[arg(long)]
+    background: bool,
     /// Read everything the app shows once, print how much there is, and
     /// exit. Needs no display.
     #[arg(long)]
@@ -56,6 +65,13 @@ struct State {
     /// Why the last request failed, if it did.
     offline: RefCell<Option<String>>,
     loading: Cell<bool>,
+    /// The Mine items already announced; None until the first answer
+    /// on a first run.
+    seen: RefCell<Option<notify::Seen>>,
+    /// Saves them, off the main thread.
+    notified: notify::Writer,
+    /// Start without a window.
+    background: Cell<bool>,
 }
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -108,6 +124,7 @@ fn reload(state: &Rc<State>) {
             state.loading.set(false);
             match result {
                 Ok(board) => {
+                    announce(state, &board);
                     *state.offline.borrow_mut() = None;
                     *state.board.borrow_mut() = Some(board);
                 }
@@ -128,6 +145,35 @@ fn render(state: &State) {
             now(),
         );
     }
+}
+
+/// Send a notification for each Mine item not seen before, and remember
+/// it, also across restarts.
+fn announce(state: &State, board: &api::Board) {
+    let Some(app) = gio::Application::default() else {
+        return;
+    };
+    let found = notify::update(state.seen.borrow().as_ref(), &board.mine.mine, now());
+    for note in notify::notes(&found.new) {
+        let notification = gio::Notification::new(&note.title);
+        notification.set_body(Some(&note.body));
+        notification.set_default_action_and_target_value(
+            "app.show-view",
+            Some(&View::Mine.id().to_variant()),
+        );
+        if let Some(url) = &note.url {
+            notification.add_button_with_target_value(
+                "Open",
+                widgets::OPEN_URI,
+                Some(&url.to_variant()),
+            );
+        }
+        app.send_notification(Some(&note.id), &notification);
+    }
+    if found.changed {
+        state.notified.save(found.seen.clone());
+    }
+    *state.seen.borrow_mut() = Some(found.seen);
 }
 
 /// The window, made the first time it is needed.
@@ -381,18 +427,36 @@ fn main() -> glib::ExitCode {
             }
         };
     }
+    let seen_path = glib::user_state_dir().join(NOTIFIED);
+    let seen = notify::Seen::load(&seen_path).unwrap_or_else(|e| {
+        eprintln!("{e:#}; starting over, without announcing what is there now");
+        None
+    });
     let state = Rc::new(State {
         client,
         window: RefCell::new(None),
         board: RefCell::new(None),
         offline: RefCell::new(None),
         loading: Cell::new(false),
+        seen: RefCell::new(seen),
+        notified: notify::Writer::spawn(seen_path),
+        background: Cell::new(args.background),
     });
     let app = adw::Application::builder().application_id(APP_ID).build();
     let s = state.clone();
     app.connect_startup(move |app| startup(app, &s));
     let s = state.clone();
-    app.connect_activate(move |app| window(app, &s).window.present());
+    app.connect_activate(move |app| {
+        let window = window(app, &s);
+        // Started in the background: the window exists, hidden, which
+        // keeps the app running until it is asked to quit.
+        if !s.background.replace(false) {
+            window.window.present();
+        }
+    });
     // The arguments were parsed above; GApplication gets none of them.
-    app.run_with_args::<&str>(&[])
+    let code = app.run_with_args::<&str>(&[]);
+    // The main loop is over: what was announced last is kept before exit.
+    state.notified.finish(NOTIFIED_TIMEOUT);
+    code
 }
