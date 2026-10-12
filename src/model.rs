@@ -1,4 +1,4 @@
-pub use crate::outcome::Outcome;
+pub use crate::outcome::{Outcome, Progress};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,11 +55,19 @@ pub struct Effort {
     pub note: String,
 }
 
+/// An effort with its progress, as the snapshot shows it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EffortView {
+    #[serde(flatten)]
+    pub effort: Effort,
+    pub progress: Progress,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Snapshot {
     pub connections: Vec<Connection>,
     pub items: Vec<Item>,
-    pub efforts: Vec<Effort>,
+    pub efforts: Vec<EffortView>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

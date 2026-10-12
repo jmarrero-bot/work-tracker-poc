@@ -52,12 +52,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show items that need action now.
+    /// Show items that need action now, including any closed without delivery
+    /// or unknown.
     Next {
         #[arg(long)]
         json: bool,
     },
-    /// Show efforts and remaining source items.
+    /// Show efforts, their delivery progress and their source items.
     Status {
         query: Option<String>,
         #[arg(long)]
@@ -105,6 +106,19 @@ enum Command {
         /// What the work came to. Unchanged when omitted.
         #[arg(long, value_enum)]
         outcome: Option<Outcome>,
+    },
+    /// Mark a synced item that was closed without delivery, or is unknown,
+    /// abandoned: a decision kept in Workboard. Manual items take
+    /// `update --outcome abandoned` instead.
+    Abandon {
+        item: String,
+        /// Withdraw the decision and show the source's outcome again.
+        #[arg(long)]
+        undo: bool,
+        /// Abandon an open or delivered item too. It is no longer refreshed,
+        /// so a later merge is missed.
+        #[arg(long, conflicts_with = "undo")]
+        force: bool,
     },
     /// Print a source URL, or open it with the system browser.
     Open {
@@ -255,19 +269,28 @@ async fn main() -> Result<()> {
                 .into_iter()
                 .filter(|i| {
                     !i.outcome.is_settled()
-                        && (!next || matches!(i.action.as_str(), "next" | "review"))
+                        && (!next
+                            || i.outcome.needs_attention()
+                            || matches!(i.action.as_str(), "next" | "review"))
                 })
                 .collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&items)?)
             } else {
                 for i in items {
+                    // Every listed item is open unless it needs attention.
+                    let outcome = if i.outcome == Outcome::Open {
+                        String::new()
+                    } else {
+                        format!("  {}: {}", i.outcome.label(), i.outcome_reason)
+                    };
                     println!(
-                        "{}  [{}] {}  {}{}",
+                        "{}  [{}] {}  {}{}{}",
                         i.id,
                         i.provider,
                         i.title,
                         i.status,
+                        outcome,
                         if i.demo { " (demo)" } else { "" }
                     );
                 }
@@ -288,32 +311,34 @@ async fn main() -> Result<()> {
                 .iter()
                 .filter(|e| {
                     query.as_ref().is_none_or(|q| {
-                        e.title.to_lowercase().contains(&q.to_lowercase()) || e.id == *q
+                        e.effort.title.to_lowercase().contains(&q.to_lowercase())
+                            || e.effort.id == *q
                     })
                 })
                 .collect();
-            let result:Vec<_>=efforts.iter().map(|e|serde_json::json!({"effort":e,"items":s.items.iter().filter(|i|i.effort_id.as_deref()==Some(&e.id)).collect::<Vec<_>>()})).collect();
             if json {
+                let result: Vec<_> = efforts
+                    .iter()
+                    .map(|e| serde_json::json!({"effort":e,"items":items_of(&s.items, e)}))
+                    .collect();
                 println!("{}", serde_json::to_string_pretty(&result)?)
             } else {
                 for e in efforts {
-                    let items: Vec<_> = s
-                        .items
-                        .iter()
-                        .filter(|i| i.effort_id.as_deref() == Some(&e.id))
-                        .collect();
                     println!(
-                        "{}  {}  {}/{} complete",
-                        e.id,
-                        e.title,
-                        items
-                            .iter()
-                            .filter(|i| i.outcome == Outcome::Delivered)
-                            .count(),
-                        items.len()
+                        "{}  {}  {}",
+                        e.effort.id,
+                        e.effort.title,
+                        e.progress.summary()
                     );
-                    for i in items {
-                        println!("  [{}] {}: {}", i.provider, i.key, i.status);
+                    for i in items_of(&s.items, e) {
+                        println!(
+                            "  [{}] {}: {} ({}: {})",
+                            i.provider,
+                            i.key,
+                            i.status,
+                            i.outcome.label(),
+                            i.outcome_reason
+                        );
                     }
                 }
             }
@@ -391,6 +416,18 @@ async fn main() -> Result<()> {
             .await?;
             println!("{}  {}", i.id, i.status)
         }
+        Command::Abandon { item, undo, force } => {
+            let i: Item = request(
+                &client,
+                &root,
+                args.port,
+                reqwest::Method::POST,
+                &format!("items/{item}/abandon"),
+                Some(serde_json::json!({"abandoned": !undo, "force": force})),
+            )
+            .await?;
+            println!("{}  {}: {}", i.id, i.outcome.label(), i.outcome_reason)
+        }
         Command::Open { item, print } => {
             let s: SnapshotClient = request(
                 &client,
@@ -437,9 +474,15 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+fn items_of<'a>(items: &'a [Item], e: &EffortView) -> Vec<&'a Item> {
+    items
+        .iter()
+        .filter(|i| i.effort_id.as_deref() == Some(&e.effort.id))
+        .collect()
+}
 #[derive(serde::Deserialize)]
 struct SnapshotClient {
     connections: Vec<Connection>,
     items: Vec<Item>,
-    efforts: Vec<Effort>,
+    efforts: Vec<EffortView>,
 }

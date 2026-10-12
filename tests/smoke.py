@@ -59,11 +59,32 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert call('/api/efforts', 'POST', {'title':'Missing origin'}, cookie=cookie)[0] == 403
         status, _, body = call('/api/snapshot', token=token)
         snapshot = json.loads(body)
-        assert len(snapshot['items']) == 6 and len(snapshot['efforts']) == 1
+        assert len(snapshot['items']) == 7 and len(snapshot['efforts']) == 1
         assert len({i['provider'] for i in snapshot['items']}) == 6
-        assert len(json.loads(subprocess.check_output(command + ['next','--json']))) == 4
+        # Three next actions, a review, and the closed unmerged change, which needs a decision.
+        assert len(json.loads(subprocess.check_output(command + ['next','--json']))) == 5
         without_home = {k:v for k,v in os.environ.items() if k != 'HOME'}
-        assert len(json.loads(subprocess.check_output(command + ['next','--json'], env=without_home))) == 4
+        assert len(json.loads(subprocess.check_output(command + ['next','--json'], env=without_home))) == 5
+        # Closed is not delivered: the demo effort has a merged and a closed unmerged change.
+        def demo_effort():
+            [status] = json.loads(subprocess.check_output(command + ['status','bootc','--json']))
+            return status['effort']['progress'], {i['id']: i for i in status['items']}
+        progress, items = demo_effort()
+        assert items['demo-1']['outcome'] == 'delivered'
+        assert items['demo-6']['outcome'] == 'closed_without_delivery' and items['demo-6']['outcome_reason']
+        assert items['demo-6']['status'] == 'Closed'
+        assert progress == {'delivered':1,'total':5,'open':3,'needs_attention':1,'abandoned':0}, progress
+        text = subprocess.check_output(command + ['status','bootc'], text=True)
+        assert '1/5 delivered, 1 needs attention' in text and 'Closed, not delivered' in text, text
+        assert 'Closed, not delivered' in subprocess.check_output(command + ['inbox'], text=True)
+        # Abandoning applies to synced items; a manual one takes its outcome from its status edit.
+        assert call('/api/items/demo-6/abandon', 'POST', {'abandoned':True}, token=token)[0] == 400
+        assert subprocess.run(command + ['abandon','demo-6'], capture_output=True).returncode != 0
+        subprocess.check_call(command + ['update','demo-6','--status','Closed','--outcome','abandoned'], stdout=subprocess.DEVNULL)
+        progress, items = demo_effort()
+        assert items['demo-6']['outcome'] == 'abandoned' and items['demo-6']['status'] == 'Closed'
+        assert progress == {'delivered':1,'total':4,'open':3,'needs_attention':0,'abandoned':1}, progress
+        assert len(json.loads(subprocess.check_output(command + ['next','--json']))) == 4
         status, _, body = call('/api/efforts', 'POST', {'title':'Cross-source follow-up','item_ids':['demo-4','demo-5']}, cookie=cookie, origin=base)
         assert status == 200
         effort = json.loads(body)
@@ -107,7 +128,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert call('/api/snapshot',token=token)[0] == 401
         snapshot = json.loads(call('/api/snapshot',token=fresh)[2])
         assert all(i['effort_id']==effort['id'] for i in snapshot['items'] if i['id'] in ['demo-4','demo-5'])
-        print('PASS: authentication, CSRF, host checks, CLI, grouping, rollback, source links, manual outcomes, permissions and restart persistence')
+        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, permissions and restart persistence')
     finally:
         if process.poll() is None:
             process.terminate()

@@ -147,10 +147,24 @@ impl Db {
         })
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
+        let items = self.items()?;
+        let efforts = self
+            .efforts()?
+            .into_iter()
+            .map(|effort| EffortView {
+                progress: Progress::of(
+                    items
+                        .iter()
+                        .filter(|i| i.effort_id.as_deref() == Some(&effort.id))
+                        .map(|i| i.outcome),
+                ),
+                effort,
+            })
+            .collect();
         Ok(Snapshot {
             connections: self.connections()?,
-            items: self.items()?,
-            efforts: self.efforts()?,
+            items,
+            efforts,
         })
     }
     pub fn connections(&self) -> Result<Vec<Connection>> {
@@ -213,6 +227,36 @@ impl Db {
             params![i.id, serde_json::to_string(i)?, i.effort_id],
         )?;
         Ok(())
+    }
+    /// Record, or with `abandoned` false withdraw, a person's decision that a
+    /// synced item will not deliver. Manual items take their outcome from their
+    /// status edit instead. An abandoned item is no longer refreshed, so
+    /// abandoning work that is open or delivered takes `force`.
+    pub fn set_abandoned(&self, id: &str, abandoned: bool, force: bool) -> Result<Item> {
+        let find = || -> Result<Item> {
+            self.items()?
+                .into_iter()
+                .find(|i| i.id == id)
+                .context("Item not found")
+        };
+        let item = find()?;
+        if item.connection_id.is_none() {
+            bail!("Set a manual item's outcome with its status edit instead")
+        }
+        if abandoned
+            && !force
+            && !(item.outcome.needs_attention() || item.outcome == Outcome::Abandoned)
+        {
+            bail!(
+                "This item is {}, not closed without delivery or unknown. Abandoned items are no longer refreshed, so a later merge would be missed; use --force to abandon it anyway",
+                item.outcome.label().to_lowercase()
+            )
+        }
+        self.sql.execute(
+            "UPDATE items SET abandoned_at=CASE WHEN ?2 THEN COALESCE(abandoned_at,strftime('%Y-%m-%dT%H:%M:%SZ','now')) END WHERE id=?1",
+            params![id, abandoned],
+        )?;
+        find()
     }
     pub fn sync_items(&mut self, items: &[Item]) -> Result<()> {
         let tx = self.sql.transaction()?;
@@ -357,6 +401,15 @@ impl Db {
                 "https://forge.fedoraproject.org",
                 Outcome::Open,
             ),
+            (
+                "github",
+                "first-attempt",
+                "First attempt at the storage fix",
+                "Closed",
+                "",
+                "https://github.com/bootc-dev/bootc",
+                Outcome::ClosedWithoutDelivery,
+            ),
         ];
         for (n, (provider, key, title, status, action, url, outcome)) in examples.iter().enumerate()
         {
@@ -378,7 +431,7 @@ impl Db {
                 demo: true,
             })?;
         }
-        self.create_effort(EffortInput {title:"Ship the bootc storage fix".into(),note:"Example effort linking upstream work, a RHEL backport and an advisory. All items are illustrative.".into(),item_ids:(0..4).map(|n|format!("demo-{n}")).collect()})?;
+        self.create_effort(EffortInput {title:"Ship the bootc storage fix".into(),note:"Example effort linking upstream work, a RHEL backport and an advisory. All items are illustrative.".into(),item_ids:[0,1,2,3,6].map(|n|format!("demo-{n}")).to_vec()})?;
         Ok(())
     }
 }
@@ -410,6 +463,70 @@ mod tests {
             .unwrap();
         assert_eq!(item.effort_id, effort);
         assert_eq!(item.outcome, Outcome::Delivered);
+    }
+
+    #[test]
+    fn abandoned_decision_survives_sync_and_can_be_undone() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&temp.path().join("db")).unwrap();
+        db.seed().unwrap();
+        let find = |db: &Db, id: &str| {
+            db.items()
+                .unwrap()
+                .into_iter()
+                .find(|i| i.id == id)
+                .unwrap()
+        };
+        // Demo items are manual; make one look synced.
+        let mut closed = find(&db, "demo-6");
+        closed.connection_id = Some("c0ffee00-0000-4000-8000-000000000000".into());
+        db.sync_items(&[closed.clone()]).unwrap();
+        assert!(
+            db.set_abandoned("demo-0", true, true).is_err(),
+            "manual items refuse"
+        );
+        // Open or delivered work needs force: it would no longer be refreshed.
+        for (id, outcome) in [("demo-0", Outcome::Open), ("demo-1", Outcome::Delivered)] {
+            let mut item = find(&db, id);
+            item.connection_id = closed.connection_id.clone();
+            db.sync_items(&[item]).unwrap();
+            let error = db.set_abandoned(id, true, false).err().unwrap().to_string();
+            assert!(error.contains("--force"), "{error}");
+            assert_eq!(
+                db.set_abandoned(id, true, true).unwrap().outcome,
+                Outcome::Abandoned
+            );
+            assert_eq!(db.set_abandoned(id, false, false).unwrap().outcome, outcome);
+        }
+
+        let item = db.set_abandoned("demo-6", true, false).unwrap();
+        assert_eq!(item.outcome, Outcome::Abandoned);
+        let at = item.abandoned_at.clone().unwrap();
+        assert!(item.outcome_reason.contains(&at));
+        // Marking it again keeps the first time.
+        assert_eq!(
+            db.set_abandoned("demo-6", true, false)
+                .unwrap()
+                .abandoned_at,
+            Some(at)
+        );
+        // A sync rewrites the source's view but keeps the decision.
+        db.sync_items(&[closed.clone()]).unwrap();
+        let progress = |db: &Db| db.snapshot().unwrap().efforts[0].progress.clone();
+        assert_eq!(find(&db, "demo-6").outcome, Outcome::Abandoned);
+        assert_eq!(
+            (progress(&db).abandoned, progress(&db).needs_attention),
+            (1, 0)
+        );
+
+        let item = db.set_abandoned("demo-6", false, false).unwrap();
+        assert_eq!(item.outcome, Outcome::ClosedWithoutDelivery);
+        assert_eq!(item.outcome_reason, closed.outcome_reason);
+        assert_eq!(item.abandoned_at, None);
+        assert_eq!(
+            (progress(&db).abandoned, progress(&db).needs_attention),
+            (0, 1)
+        );
     }
 
     /// An item row as the prototype (schema version 0) stored it.
