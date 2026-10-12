@@ -1,0 +1,20 @@
+# Workboard only reads from the sources it connects to, so a reqwest call
+# that can send any other method is refused here. Each use is an explicit
+# exception with a reason: the CLI's calls to its own local service, and the
+# one send of the read-only GitHub client, which checks every request first.
+#
+# A reqwest request goes out through `Client::execute`, the tower `Service`
+# that `Client` and `&Client` implement, or `RequestBuilder::send`. The first
+# two send a `Request` of any method, so both are refused. A builder only
+# comes from `get` and `head`, which can't write, or from the methods below.
+disallowed-methods = [
+  { path = "reqwest::Client::post", reason = "sources are read-only" },
+  { path = "reqwest::Client::put", reason = "sources are read-only" },
+  { path = "reqwest::Client::patch", reason = "sources are read-only" },
+  { path = "reqwest::Client::delete", reason = "sources are read-only" },
+  { path = "reqwest::Client::request", reason = "sources are read-only; it takes any method" },
+  { path = "reqwest::Client::execute", reason = "sources are read-only; it sends a request of any method" },
+  { path = "tower_service::Service::call", reason = "sources are read-only; reqwest's Client sends a request of any method through it" },
+  { path = "reqwest::RequestBuilder::from_parts", reason = "sources are read-only; it sends a request of any method" },
+  { path = "reqwest::Request::method_mut", reason = "sources are read-only" },
+]

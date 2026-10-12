@@ -164,6 +164,9 @@ fn default_root() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("Set --data-dir when HOME is unavailable")?;
     Ok(PathBuf::from(home).join(".local/share/workboard"))
 }
+/// Call the local Workboard service, which the CLI drives with any method.
+/// Sources are only read, by the service.
+#[allow(clippy::disallowed_methods)]
 async fn request<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     root: &std::path::Path,
