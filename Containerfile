@@ -40,7 +40,5 @@ EXPOSE 8421
 # from the data directory.
 HEALTHCHECK --interval=1m --timeout=10s --start-period=30s --retries=3 \
     CMD ["/usr/local/bin/workboard", "connections"]
-# The service shuts down gracefully on SIGINT; as PID 1 it ignores SIGTERM.
-STOPSIGNAL SIGINT
 ENTRYPOINT ["/usr/local/bin/workboard"]
 CMD ["serve", "--hub"]
