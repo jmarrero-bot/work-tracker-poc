@@ -78,6 +78,19 @@ enum Command {
         note: String,
         #[arg(long)]
         item: Vec<String>,
+        /// Let the title leave this machine with the effort's external
+        /// items. Otherwise the hub shows a neutral label.
+        #[arg(long)]
+        share_title: bool,
+    },
+    /// Let an effort's title leave this machine with its external items, for
+    /// the hub. Titles are not shared unless you do this, since they can
+    /// describe internal work; the note never leaves.
+    ShareTitle {
+        effort: String,
+        /// Stop sharing it.
+        #[arg(long)]
+        undo: bool,
     },
     /// Link an item to an effort. Omit --effort to ungroup it.
     Link {
@@ -126,6 +139,13 @@ enum Command {
         /// so a later merge is missed.
         #[arg(long, conflicts_with = "undo")]
         force: bool,
+    },
+    /// Print what may leave this machine as JSON: the external zone's
+    /// connections, items and efforts, and nothing of the internal zone.
+    Export {
+        /// The external zone, the only one that can be exported.
+        #[arg(long)]
+        external: bool,
     },
     /// Print a source URL, or open it with the system browser.
     Open {
@@ -363,7 +383,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Effort { title, note, item } => {
+        Command::Effort {
+            title,
+            note,
+            item,
+            share_title,
+        } => {
             let e: Effort = request(
                 &client,
                 &root,
@@ -374,10 +399,28 @@ async fn main() -> Result<()> {
                     title,
                     note,
                     item_ids: item,
+                    share_title,
                 })?),
             )
             .await?;
             println!("{}  {}", e.id, e.title)
+        }
+        Command::ShareTitle { effort, undo } => {
+            let e: Effort = request(
+                &client,
+                &root,
+                args.port,
+                reqwest::Method::PATCH,
+                &format!("efforts/{effort}"),
+                Some(serde_json::json!({"share_title": !undo})),
+            )
+            .await?;
+            let state = if e.share_title {
+                "shared"
+            } else {
+                "not shared"
+            };
+            println!("{}  {}: title {state}", e.id, e.title)
         }
         Command::Link { item, effort } => {
             let _: serde_json::Value = request(
@@ -447,6 +490,21 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("{}  {}: {}", i.id, i.outcome.label(), i.outcome_reason)
+        }
+        Command::Export { external } => {
+            if !external {
+                bail!("Only the external zone can be exported: use `workboard export --external`. Internal work never leaves this machine.")
+            }
+            let v: serde_json::Value = request(
+                &client,
+                &root,
+                args.port,
+                reqwest::Method::GET,
+                "export/external",
+                None,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Command::Open { item, print } => {
             let s: SnapshotClient = request(

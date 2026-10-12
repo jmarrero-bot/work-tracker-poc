@@ -3,6 +3,7 @@ use crate::{
     connectors,
     db::{self, Db},
     model::*,
+    zone,
 };
 use anyhow::{bail, Result};
 use axum::{
@@ -122,6 +123,11 @@ async fn session(State(app): State<App>) -> Response {
 async fn snapshot(State(app): State<App>) -> ApiResult<Snapshot> {
     Ok(Json(app.db.lock().unwrap().snapshot()?))
 }
+/// What may leave this machine, for the hub: the external zone only.
+async fn export_external(State(app): State<App>) -> ApiResult<zone::ExternalSnapshot> {
+    let snapshot = app.db.lock().unwrap().snapshot()?;
+    Ok(Json(zone::external_only(&snapshot)))
+}
 async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> ApiResult<Connection> {
     if input.label.trim().is_empty() || input.label.len() > 100 {
         bail_api("Enter a connection name of 1–100 characters")?
@@ -149,6 +155,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         last_sync: None,
         error: None,
         zone: input.zone,
+        error_kind: None,
     };
     let path = db.root.join("secrets").join(&c.id);
     db::write_secret(&path, target.credential.expose())?;
@@ -192,14 +199,18 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
                     |r| r.get(0),
                 )?);
                 c.error = None;
+                c.error_kind = None;
                 results.push(json!({"connection":c.id,"label":c.label,"items":items.len()}));
             }
             Err(e) => {
                 // Whether to fix a credential or retry later.
-                let kind = e.downcast_ref::<ConnectorError>().map(|e| e.kind);
+                c.error_kind = Some(
+                    e.downcast_ref::<ConnectorError>()
+                        .map_or(ErrorKind::Invalid, |e| e.kind),
+                );
                 c.error = Some(e.to_string());
                 results.push(
-                    json!({"connection":c.id,"label":c.label,"error":c.error,"error_kind":kind}),
+                    json!({"connection":c.id,"label":c.label,"error":c.error,"error_kind":c.error_kind}),
                 );
             }
         };
@@ -209,6 +220,20 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
 }
 async fn effort(State(app): State<App>, Json(input): Json<EffortInput>) -> ApiResult<Effort> {
     Ok(Json(app.db.lock().unwrap().create_effort(input)?))
+}
+#[derive(Deserialize)]
+struct ShareInput {
+    share_title: bool,
+}
+/// Let an effort's title leave this machine, or stop it.
+async fn share_effort(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(input): Json<ShareInput>,
+) -> ApiResult<Effort> {
+    Ok(Json(
+        app.db.lock().unwrap().share_title(&id, input.share_title)?,
+    ))
 }
 #[derive(Deserialize)]
 struct LinkInput {
@@ -393,11 +418,13 @@ pub async fn serve(root: PathBuf, port: u16, demo: bool) -> Result<()> {
     };
     let api = Router::new()
         .route("/snapshot", get(snapshot))
+        .route("/export/external", get(export_external))
         .route("/session", post(session))
         .route("/connections", post(connect))
         .route("/connections/{id}", axum::routing::delete(disconnect))
         .route("/sync", post(sync))
         .route("/efforts", post(effort))
+        .route("/efforts/{id}", axum::routing::patch(share_effort))
         .route("/links", post(link))
         .route("/items", post(manual))
         .route("/items/{id}", axum::routing::patch(update_manual))
