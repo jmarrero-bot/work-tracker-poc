@@ -286,6 +286,7 @@ pub fn to_item(c: &Connection, kind: &str, remote: RemoteItem) -> ConnectorResul
         effort_id: None,
         abandoned_at: None,
         demo: false,
+        zone: c.zone,
     };
     item.set_outcome((remote.outcome, remote.outcome_reason));
     Ok(item)
@@ -442,6 +443,7 @@ async fn sync_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Zone;
     use std::sync::Mutex;
 
     /// A connector answering from memory, recording what it was asked to
@@ -503,6 +505,7 @@ mod tests {
             account_name: "me".into(),
             last_sync: None,
             error: None,
+            zone: Zone::External,
         }
     }
     fn target() -> Target {
@@ -579,7 +582,10 @@ mod tests {
             gone.outcome_reason,
             "Fake returned HTTP 404 for this item; its last known status is shown"
         );
-        assert!(items.iter().all(|i| i.provider == "gitlab-public"));
+        // Items take their connection's provider and zone.
+        assert!(items
+            .iter()
+            .all(|i| i.provider == "gitlab-public" && i.zone == Zone::External));
     }
 
     #[tokio::test]

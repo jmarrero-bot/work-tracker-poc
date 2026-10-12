@@ -4,6 +4,7 @@ mod db;
 mod model;
 mod outcome;
 mod server;
+mod zone;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use model::*;
@@ -43,6 +44,11 @@ enum Command {
         token_env: Option<String>,
         #[arg(long)]
         token_stdin: bool,
+        /// Put this connection in the external zone, so its items may also
+        /// be shown away from this machine. Connections are internal unless
+        /// marked external here; this can't be changed later.
+        #[arg(long)]
+        external: bool,
     },
     /// List connection identities and sync health.
     Connections,
@@ -189,6 +195,7 @@ async fn main() -> Result<()> {
             label,
             token_env,
             token_stdin,
+            external,
         } => {
             let token = if let Some(name) = token_env {
                 std::env::var(name).context("Token environment variable is not set")?
@@ -204,6 +211,11 @@ async fn main() -> Result<()> {
                 provider,
                 base_url: url,
                 token,
+                zone: if external {
+                    Zone::External
+                } else {
+                    Zone::Internal
+                },
             };
             let c: Connection = request(
                 &client,
@@ -214,7 +226,13 @@ async fn main() -> Result<()> {
                 Some(serde_json::to_value(input)?),
             )
             .await?;
-            println!("Connected {} as {} ({})", c.label, c.account_name, c.id);
+            println!(
+                "Connected {} as {} ({}, {})",
+                c.label,
+                c.account_name,
+                c.id,
+                c.zone.label()
+            );
         }
         Command::Sync => {
             let v: serde_json::Value = request(
@@ -246,10 +264,11 @@ async fn main() -> Result<()> {
             .await?;
             for c in s.connections {
                 println!(
-                    "{}  {}  {}  {}",
+                    "{}  {}  {}  {}  {}",
                     c.id,
                     c.label,
                     c.account_name,
+                    c.zone.label(),
                     c.error.as_deref().unwrap_or("Ready")
                 );
             }
