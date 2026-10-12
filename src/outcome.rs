@@ -23,9 +23,22 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Delivered => "Delivered",
+            Self::ClosedWithoutDelivery => "Closed, not delivered",
+            Self::Abandoned => "Abandoned",
+            Self::Unknown => "Unknown",
+        }
+    }
     /// Finished: nothing more to do or decide.
     pub fn is_settled(self) -> bool {
         matches!(self, Self::Delivered | Self::Abandoned)
+    }
+    /// Not progress: someone has to look at it.
+    pub fn needs_attention(self) -> bool {
+        matches!(self, Self::ClosedWithoutDelivery | Self::Unknown)
     }
     /// The reason recorded when a person sets a manual item's outcome.
     pub fn manual_reason(self) -> &'static str {
@@ -38,6 +51,47 @@ impl Outcome {
             Self::Abandoned => "Set manually as abandoned",
             Self::Unknown => "Set manually as unknown",
         }
+    }
+}
+
+/// How far an effort is. Only delivered items are progress; closed without
+/// delivery and unknown items need attention instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    pub delivered: usize,
+    /// The linked items the effort still counts on: all but abandoned ones.
+    pub total: usize,
+    pub open: usize,
+    pub needs_attention: usize,
+    pub abandoned: usize,
+}
+
+impl Progress {
+    pub fn of(outcomes: impl IntoIterator<Item = Outcome>) -> Self {
+        let mut p = Self::default();
+        for outcome in outcomes {
+            match outcome {
+                Outcome::Delivered => p.delivered += 1,
+                Outcome::Open => p.open += 1,
+                Outcome::ClosedWithoutDelivery | Outcome::Unknown => p.needs_attention += 1,
+                Outcome::Abandoned => p.abandoned += 1,
+            }
+        }
+        p.total = p.delivered + p.open + p.needs_attention;
+        p
+    }
+    /// For example "1/3 delivered, 1 needs attention, 1 abandoned".
+    pub fn summary(&self) -> String {
+        let mut s = format!("{}/{} delivered", self.delivered, self.total);
+        match self.needs_attention {
+            0 => (),
+            1 => s.push_str(", 1 needs attention"),
+            n => s.push_str(&format!(", {n} need attention")),
+        }
+        if self.abandoned > 0 {
+            s.push_str(&format!(", {} abandoned", self.abandoned));
+        }
+        s
     }
 }
 
@@ -262,6 +316,50 @@ mod tests {
                 expected,
                 "{provider} {status}"
             );
+        }
+    }
+
+    #[test]
+    fn effort_progress_counts_only_delivered() {
+        for (outcomes, (delivered, total, open, attention, abandoned), summary) in [
+            (vec![], (0, 0, 0, 0, 0), "0/0 delivered"),
+            (vec![Delivered, Open], (1, 2, 1, 0, 0), "1/2 delivered"),
+            (
+                vec![Delivered, ClosedWithoutDelivery],
+                (1, 2, 0, 1, 0),
+                "1/2 delivered, 1 needs attention",
+            ),
+            (
+                vec![Unknown, ClosedWithoutDelivery, Open],
+                (0, 3, 1, 2, 0),
+                "0/3 delivered, 2 need attention",
+            ),
+            // Abandoned items are left out of the total.
+            (
+                vec![Delivered, Abandoned, ClosedWithoutDelivery],
+                (1, 2, 0, 1, 1),
+                "1/2 delivered, 1 needs attention, 1 abandoned",
+            ),
+            (
+                vec![Abandoned],
+                (0, 0, 0, 0, 1),
+                "0/0 delivered, 1 abandoned",
+            ),
+        ] {
+            let p = Progress::of(outcomes.iter().copied());
+            assert_eq!(
+                (p.delivered, p.total, p.open, p.needs_attention, p.abandoned),
+                (delivered, total, open, attention, abandoned),
+                "{outcomes:?}"
+            );
+            assert_eq!(p.summary(), summary);
+        }
+    }
+
+    #[test]
+    fn attention_and_settled_are_disjoint() {
+        for outcome in [Open, Delivered, ClosedWithoutDelivery, Abandoned, Unknown] {
+            assert!(!(outcome.is_settled() && outcome.needs_attention()));
         }
     }
 }

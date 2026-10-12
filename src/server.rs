@@ -304,6 +304,24 @@ async fn update_manual(
     db.upsert_item(&item)?;
     Ok(Json(item))
 }
+#[derive(Deserialize)]
+struct AbandonInput {
+    abandoned: bool,
+    /// Abandon an item that is open or delivered.
+    #[serde(default)]
+    force: bool,
+}
+async fn abandon(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(input): Json<AbandonInput>,
+) -> ApiResult<Item> {
+    Ok(Json(app.db.lock().unwrap().set_abandoned(
+        &id,
+        input.abandoned,
+        input.force,
+    )?))
+}
 async fn assets(req: Request) -> Response {
     let path = req.uri().path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -373,6 +391,7 @@ pub async fn serve(root: PathBuf, port: u16, demo: bool) -> Result<()> {
         .route("/links", post(link))
         .route("/items", post(manual))
         .route("/items/{id}", axum::routing::patch(update_manual))
+        .route("/items/{id}/abandon", post(abandon))
         .layer(middleware::from_fn_with_state(app.clone(), protect));
     let router = Router::new()
         .nest("/api", api)
