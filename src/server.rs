@@ -4,7 +4,7 @@ use crate::{
     connector::{self, Target},
     connectors,
     db::{self, Db, Mode},
-    hub,
+    hub::{self, DevicePoll},
     login::{self, AppConfig, Callback, LoginError, Logins},
     model::*,
     oauth::Site,
@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex, PoisonError, RwLock},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use uuid::Uuid;
 
@@ -40,6 +40,17 @@ struct App {
     access: Arc<Access>,
     scheduler: Arc<Scheduler>,
     mode: Mode,
+    /// On a companion, its sign-in to a hub while it waits for GitHub.
+    hub_login: Arc<Mutex<Option<HubLogin>>>,
+}
+/// A companion's sign-in to a hub, waiting for its person to enter the code
+/// on GitHub.
+struct HubLogin {
+    url: url::Url,
+    handle: crate::connector::Credential,
+    expires: SystemTime,
+    /// Seconds between polls, as the hub last said.
+    interval: u64,
 }
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 struct ApiError(anyhow::Error);
@@ -167,9 +178,15 @@ impl Access {
                 .is_some_and(|v| logins.session(v, renew).is_some())
         });
         if !bearer_ok && !paired && !signed_in {
-            let companion = self.companion.as_ref().is_some_and(|token| {
-                let token = token.read().unwrap_or_else(PoisonError::into_inner);
-                bearer.is_some_and(|v| matches_token(v, &token))
+            let companion = bearer.is_some_and(|v| {
+                let shared = self.companion.as_ref().is_some_and(|token| {
+                    matches_token(v, &token.read().unwrap_or_else(PoisonError::into_inner))
+                });
+                shared
+                    || self
+                        .logins
+                        .as_ref()
+                        .is_some_and(|logins| logins.companion(v))
             });
             return match companion {
                 true if method == Method::GET && path == EXPORT_PATH => Ok(()),
@@ -267,12 +284,19 @@ async fn companion_token(State(app): State<App>) -> ApiResult<Value> {
     let token = token.read().unwrap_or_else(PoisonError::into_inner).clone();
     Ok(Json(json!({ "token": token })))
 }
-/// Replace a hub's companion token: the old one stops working at once.
+/// Replace a hub's companion token: the old one stops working at once, and
+/// so does every companion credential its GitHub App's sign-ins gave.
 async fn rotate_companion_token(State(app): State<App>) -> ApiResult<Value> {
     let current = app.access.companion.as_ref().ok_or_else(only_hubs)?;
     let token = new_token();
-    replace_secret(&app.db.lock().unwrap().root.join(COMPANION_TOKEN), &token)?;
+    let root = app.db.lock().unwrap().root.clone();
+    replace_secret(&root.join(COMPANION_TOKEN), &token)?;
     *current.write().unwrap_or_else(PoisonError::into_inner) = token.clone();
+    // Also those a hub's sign-ins gave while it had its App.
+    match &app.access.logins {
+        Some(logins) => logins.revoke_companions()?,
+        None => login::forget_companions(&root)?,
+    }
     Ok(Json(json!({ "token": token })))
 }
 fn only_hubs() -> anyhow::Error {
@@ -409,6 +433,82 @@ async fn set_hub(State(app): State<App>, Json(input): Json<HubInput>) -> ApiResu
 async fn unset_hub(State(app): State<App>) -> ApiResult<Value> {
     app.scheduler.unset_hub().await?;
     Ok(Json(json!({"ok":true})))
+}
+#[derive(Deserialize)]
+struct HubLoginInput {
+    url: String,
+}
+/// Start signing this companion in to a hub with GitHub's device flow: the
+/// code for its person to enter on GitHub, and where. The hub runs the flow
+/// with GitHub; nothing is sent to it but the request.
+async fn hub_login(State(app): State<App>, Json(input): Json<HubLoginInput>) -> ApiResult<Value> {
+    if app.mode == Mode::Hub {
+        bail_api("This is a hub; only a companion signs in to one")?
+    }
+    let url = hub::hub_url(&input.url)?;
+    let start = hub::HubClient::new()?.start_login(&url).await?;
+    let handle = crate::connector::Credential::new(&start.handle)?;
+    *app.hub_login.lock().unwrap() = Some(HubLogin {
+        url,
+        handle,
+        expires: SystemTime::now() + Duration::from_secs(start.expires_in),
+        interval: start.interval,
+    });
+    Ok(Json(json!({
+        "user_code": start.user_code,
+        "verification_uri": start.verification_uri,
+        "expires_in": start.expires_in,
+        "interval": start.interval,
+    })))
+}
+/// Ask the hub whether this companion's sign-in is done. Once it is, pull
+/// from the hub with the credential it gave, as `hub set` does.
+async fn hub_login_poll(State(app): State<App>) -> ApiResult<Value> {
+    let waiting = app
+        .hub_login
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|l| (l.url.clone(), l.handle.clone(), l.expires, l.interval));
+    let Some((url, handle, expires, interval)) = waiting else {
+        return Err(anyhow::anyhow!(
+            "No sign-in to a hub is waiting; run `workboard hub login URL`"
+        )
+        .into());
+    };
+    let forget = || app.hub_login.lock().unwrap().take();
+    if SystemTime::now() >= expires {
+        forget();
+        bail_api(
+            "The sign-in expired before the code was entered; run `workboard hub login URL` again",
+        )?
+    }
+    let polled = hub::HubClient::new()?.poll_login(&url, &handle).await;
+    match polled {
+        Ok(DevicePoll::Pending { interval }) => {
+            if let Some(waiting) = app.hub_login.lock().unwrap().as_mut() {
+                waiting.interval = interval;
+            }
+            Ok(Json(json!({ "status": "pending", "interval": interval })))
+        }
+        Ok(DevicePoll::Done { token, login }) => {
+            forget();
+            let status = app.scheduler.set_hub(url.as_str(), &token).await.map_err(|e| {
+                anyhow::anyhow!("Signed in to the hub as {login}, but the first pull failed: {e}. Run `workboard hub login URL` again")
+            })?;
+            Ok(Json(
+                json!({ "status": "done", "login": login, "hub": status }),
+            ))
+        }
+        // A failure that may pass leaves the sign-in waiting.
+        Err(e) if e.kind == crate::connector::ErrorKind::Transient => Ok(Json(
+            json!({ "status": "pending", "interval": interval, "error": e.message }),
+        )),
+        Err(e) => {
+            forget();
+            Err(e.into())
+        }
+    }
 }
 /// What waits on each connection's account, and apart from it what watching
 /// other users found. A local view: internal work shows here, and never
@@ -819,6 +919,24 @@ fn off_sign_in_name(logins: &Logins, headers: &HeaderMap, change: bool) -> Optio
     }
     None
 }
+/// The refusal of a companion's sign-in step that didn't come by one of the
+/// service's names, or came from a browser, which always says its origin
+/// when it posts.
+fn not_from_companion(app: &App, headers: &HeaderMap) -> Option<Response> {
+    if text(headers, header::HOST)
+        .and_then(|h| app.access.origin(h))
+        .is_none()
+    {
+        return Some(Denied::Host.response());
+    }
+    if headers.contains_key(header::ORIGIN) {
+        return Some(refused(
+            StatusCode::FORBIDDEN,
+            "A companion signs in with `workboard hub login`, never from a browser",
+        ));
+    }
+    None
+}
 /// A `Set-Cookie` value for a cookie of the hub's sign-in: kept to the
 /// hub's exact name over HTTPS, and out of the page's scripts.
 fn sign_in_cookie(name: &str, value: &str, same_site: &str, max_age: Duration) -> HeaderValue {
@@ -949,6 +1067,37 @@ async fn logout(State(app): State<App>, headers: HeaderMap) -> Response {
     );
     response
 }
+/// Start a companion's sign-in with GitHub's device flow.
+async fn device_start(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some(logins) = app.access.logins.as_ref() else {
+        return no_app();
+    };
+    if let Some(response) = not_from_companion(&app, &headers) {
+        return response;
+    }
+    match logins.device_start(&login::peer(&headers)).await {
+        Ok(start) => Json(start).into_response(),
+        Err(e) => refusal(e),
+    }
+}
+/// Poll a companion's sign-in, by the handle its start gave.
+async fn device_poll(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some(logins) = app.access.logins.as_ref() else {
+        return no_app();
+    };
+    if let Some(response) = not_from_companion(&app, &headers) {
+        return response;
+    }
+    let Some(handle) =
+        text(&headers, header::AUTHORIZATION).and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return Denied::Unauthorized.response();
+    };
+    match logins.device_poll(&login::peer(&headers), handle).await {
+        Ok(poll) => Json(poll).into_response(),
+        Err(e) => refusal(e),
+    }
+}
 async fn assets(req: Request) -> Response {
     let path = req.uri().path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -1066,6 +1215,8 @@ fn router(app: App) -> Router {
         .route("/export/external", get(export_external))
         .route("/session", post(session))
         .route("/hub", get(get_hub).put(set_hub).delete(unset_hub))
+        .route("/hub/login", post(hub_login))
+        .route("/hub/login/poll", post(hub_login_poll))
         .route(
             "/companion-token",
             get(companion_token).post(rotate_companion_token),
@@ -1088,7 +1239,9 @@ fn router(app: App) -> Router {
         .route("/status", get(auth_status))
         .route("/github/login", post(login_start))
         .route("/github/callback", get(login_callback))
-        .route("/logout", post(logout));
+        .route("/logout", post(logout))
+        .route("/device", post(device_start))
+        .route("/device/poll", post(device_poll));
     Router::new()
         .nest("/api", api)
         .nest("/auth", auth)
@@ -1193,6 +1346,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         }),
         scheduler,
         mode,
+        hub_login: Arc::default(),
     };
     println!("{}", welcome(&app.access, mode));
     let stop = stop_requested()?;
@@ -1489,6 +1643,7 @@ mod tests {
             }),
             scheduler,
             mode,
+            hub_login: Arc::default(),
         }
     }
 
@@ -1754,6 +1909,25 @@ mod tests {
                 vec![(HOST, TAILNET)],
                 StatusCode::FORBIDDEN,
             ),
+            // A browser never starts a companion's sign-in.
+            (
+                &post,
+                "/auth/device",
+                vec![(HOST, TAILNET), (ORIGIN, origin.as_str())],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &post,
+                "/auth/device",
+                vec![(HOST, "attacker.example")],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &post,
+                "/auth/device/poll",
+                vec![(HOST, TAILNET)],
+                StatusCode::UNAUTHORIZED,
+            ),
             // No pairing, and the CLI's token on loopback only.
             (
                 &post,
@@ -1855,6 +2029,130 @@ mod tests {
             (status["github_app"].as_bool(), status["pairing"].as_bool()),
             (Some(false), Some(true))
         );
+    }
+
+    #[tokio::test]
+    async fn a_companion_signs_in_with_the_device_flow_and_pulls_with_what_it_gave() {
+        use crate::oauth::tests::{token_answer, USER_CODE};
+        let hub_root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = login::tests::logins(hub_root.path()).await;
+        fake.lock().unwrap().polls = [
+            serde_json::json!({"error": "authorization_pending"}),
+            token_answer("ghu_allowed"),
+        ]
+        .into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let hub = test_app(hub_root.path(), Mode::Hub, &address, Some(logins.clone()));
+        let served = router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+        let companion_root = tempfile::tempdir().unwrap();
+        let companion = test_app(companion_root.path(), Mode::Local, LOCAL, None);
+        let url = format!("http://{address}/");
+        let Json(start) = hub_login(
+            State(companion.clone()),
+            Json(HubLoginInput { url: url.clone() }),
+        )
+        .await
+        .ok()
+        .unwrap();
+        assert_eq!(start["user_code"], USER_CODE);
+        assert!(
+            start.get("handle").is_none(),
+            "the handle stays in the service"
+        );
+        let poll = || hub_login_poll(State(companion.clone()));
+        // Too soon for the hub to ask GitHub; then GitHub says not yet.
+        let Json(early) = poll().await.ok().unwrap();
+        assert_eq!(early["status"], "pending");
+        clock.advance(Duration::from_secs(5));
+        let Json(pending) = poll().await.ok().unwrap();
+        assert_eq!(pending["status"], "pending");
+        clock.advance(Duration::from_secs(5));
+        let Json(done) = poll().await.ok().unwrap();
+        assert_eq!(
+            (done["status"].as_str(), done["login"].as_str()),
+            (Some("done"), Some("jmarrero"))
+        );
+        assert_eq!(done["hub"]["url"], url);
+        assert!(poll().await.is_err(), "nothing waits any more");
+        // It pulls with that credential, which reads the export and nothing
+        // else, and which the hub's rotation revokes.
+        let pulls = companion
+            .scheduler
+            .sync_all(Trigger::Explicit)
+            .await
+            .unwrap();
+        let [pulled] = &pulls[..] else {
+            panic!("{pulls:?}")
+        };
+        assert!(pulled.error.is_none(), "{pulled:?}");
+        let sent: Vec<_> = pulled.requests.clone().unwrap().sent.into_iter().collect();
+        assert_eq!(sent, [("GET".to_string(), 1)]);
+        let token = hub_token(&companion);
+        let mut bearer = HeaderMap::new();
+        bearer.insert(header::HOST, HeaderValue::from_str(&address).unwrap());
+        bearer.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        assert_eq!(hub.access.check(&Method::GET, EXPORT_PATH, &bearer), Ok(()));
+        assert_eq!(
+            hub.access.check(&Method::GET, "/api/snapshot", &bearer),
+            Err(Denied::Scope)
+        );
+        let rotated = rotate_companion_token(State(hub.clone())).await;
+        assert!(rotated.is_ok());
+        let pulls = companion
+            .scheduler
+            .sync_all(Trigger::Explicit)
+            .await
+            .unwrap();
+        assert_eq!(
+            pulls[0].error_kind,
+            Some(crate::connector::ErrorKind::Auth),
+            "{pulls:?}"
+        );
+        // GitHub saw the device flow's POSTs, and only the hub sent them.
+        let seen = fake.lock().unwrap().seen.clone();
+        let paths: Vec<_> = seen.iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+        assert_eq!(
+            paths,
+            [
+                "POST /login/device/code",
+                "POST /login/oauth/access_token",
+                "POST /login/oauth/access_token",
+                "GET /api/v3/user"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_the_companion_token_revokes_sign_ins_without_the_app_too() {
+        use crate::oauth::tests::token_answer;
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = login::tests::logins(root.path()).await;
+        let start = logins.device_start(login::tests::PEER).await.unwrap();
+        fake.lock().unwrap().polls = [token_answer("ghu_allowed")].into();
+        clock.advance(Duration::from_secs(5));
+        let Ok(DevicePoll::Done { token, .. }) =
+            logins.device_poll(login::tests::PEER, &start.handle).await
+        else {
+            panic!("not done")
+        };
+        drop(logins);
+        // The hub restarted without its App, then rotated.
+        let hub = test_app(root.path(), Mode::Hub, LOCAL, None);
+        assert!(rotate_companion_token(State(hub)).await.is_ok());
+        let (again, _, _) = login::tests::logins(root.path()).await;
+        assert!(!again.companion(&token));
+    }
+
+    /// The hub credential a companion keeps, from its data directory.
+    fn hub_token(companion: &App) -> String {
+        let db = companion.db.lock().unwrap();
+        let link = db.hub().unwrap().unwrap();
+        std::fs::read_to_string(db.root.join("secrets").join(&link.id)).unwrap()
     }
 
     #[test]

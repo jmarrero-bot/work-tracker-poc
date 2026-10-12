@@ -2,11 +2,12 @@
 //! export and nothing else, the checks that what it read is external and
 //! well formed, and how fresh the hub's work is on the companion.
 //!
-//! Nothing ever goes from the companion to the hub but that one read: the
-//! client sends `GET` to the hub's export, exactly, and refuses everything
-//! else before it is sent. Its one send is the only place it talks to the
-//! hub, and clippy refuses the reqwest calls that could send anything else
-//! anywhere in the crate.
+//! Nothing of the companion's ever goes to the hub. The client sends `GET`
+//! to the hub's export, exactly, and to sign in, two `POST`s without a body
+//! that start and poll GitHub's device flow on the hub; it refuses
+//! everything else before it is sent. Its one send is the only place it
+//! talks to the hub, and clippy refuses the reqwest calls that could send
+//! anything else anywhere in the crate.
 
 use crate::{
     connector::{
@@ -38,6 +39,16 @@ pub const LABEL: &str = "Hub";
 pub const PREFIX: &str = "hub:";
 /// Where a hub serves its external export, under its address.
 const EXPORT: &str = "api/export/external";
+/// Where a hub starts a companion's sign-in with GitHub's device flow, and
+/// where the companion polls it, under its address.
+const DEVICE: &str = "auth/device";
+const DEVICE_POLL: &str = "auth/device/poll";
+/// Longest message of a hub's refusal shown.
+const MAX_MESSAGE: usize = 300;
+/// Most seconds a hub may ask a companion to wait between polls, or give
+/// it to sign in.
+const MAX_POLL_INTERVAL: u64 = 60;
+const MAX_SIGN_IN: u64 = 1800;
 const ACCEPT: &str = "application/json";
 const USER_AGENT: &str = concat!("workboard/", env!("CARGO_PKG_VERSION"));
 /// Longest text field accepted from a hub, in bytes, as from a connector.
@@ -80,16 +91,87 @@ fn export_of(base: &Url) -> ConnectorResult<Url> {
     base.join(EXPORT).map_err(ConnectorError::invalid)
 }
 
-/// Whether `request`, exactly as it would be sent, is the one read a
-/// companion makes of its hub.
+/// Whether `request`, exactly as it would be sent, is the read of the
+/// export, or a start or poll of the device flow, all without a body.
 fn check(base: &Url, request: &Request) -> Result<(), String> {
-    let export = export_of(base).map_err(|e| e.message)?;
+    let under = |path| base.join(path).map_err(|e| e.to_string());
     let url = request.url();
     match *request.method() {
-        Method::GET if request.body().is_some() => Err("a read with a body".into()),
-        Method::GET if *url == export => Ok(()),
+        _ if request.body().is_some() => Err("a request with a body".into()),
+        Method::GET if *url == under(EXPORT)? => Ok(()),
         Method::GET => Err(format!("a read of anything but the export: {url}")),
+        Method::POST if *url == under(DEVICE)? || *url == under(DEVICE_POLL)? => Ok(()),
         ref method => Err(format!("{method} {}", url.path())),
+    }
+}
+
+/// A companion's sign-in with GitHub's device flow, as its hub started it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStart {
+    /// What the companion polls with. Never shown.
+    pub handle: String,
+    /// The code its person enters at `verification_uri`.
+    pub user_code: String,
+    pub verification_uri: String,
+    /// Seconds left to enter it.
+    pub expires_in: u64,
+    /// Seconds to wait between polls.
+    pub interval: u64,
+}
+
+/// What a poll of the device flow found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DevicePoll {
+    /// Not yet: poll again after `interval` seconds.
+    Pending { interval: u64 },
+    /// Signed in: a credential that reads the hub's export, bound to the
+    /// GitHub user `login` names.
+    Done { token: String, login: String },
+}
+
+/// `text` if it is a code of letters, digits and hyphens a person can type.
+fn user_code(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 32
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// The only page a companion tells its person to enter a code on:
+/// GitHub's own, whatever a hub says.
+const DEVICE_PAGE: &str = "https://github.com/login/device";
+
+/// What a hub started, if it is fit to show and use.
+fn checked_start(start: DeviceStart) -> ConnectorResult<DeviceStart> {
+    let invalid = || ConnectorError::invalid("The hub's sign-in isn't usable");
+    Credential::new(&start.handle).map_err(|_| invalid())?;
+    if !user_code(&start.user_code)
+        || start.verification_uri != DEVICE_PAGE
+        || !(1..=MAX_POLL_INTERVAL).contains(&start.interval)
+        || !(1..=MAX_SIGN_IN).contains(&start.expires_in)
+    {
+        return Err(invalid());
+    }
+    Ok(start)
+}
+
+/// What a poll found, if it is fit to use.
+fn checked_poll(poll: DevicePoll) -> ConnectorResult<DevicePoll> {
+    let invalid = || ConnectorError::invalid("The hub's answer to the sign-in isn't usable");
+    match poll {
+        DevicePoll::Pending { interval } if (1..=MAX_POLL_INTERVAL).contains(&interval) => {
+            Ok(DevicePoll::Pending { interval })
+        }
+        DevicePoll::Pending { .. } => Err(invalid()),
+        DevicePoll::Done { token, mut login } => {
+            let token = Credential::new(&token)
+                .map_err(|_| invalid())?
+                .expose()
+                .to_string();
+            printable(&mut login);
+            login.truncate(MAX_ID);
+            Ok(DevicePoll::Done { token, login })
+        }
     }
 }
 
@@ -128,7 +210,7 @@ impl HubClient {
         if let Err(why) = check(base, &request) {
             self.count(|c| c.refused += 1);
             return Err(ConnectorError::invalid(format!(
-                "Refused to send the hub anything but a read of its export: {why}"
+                "Refused to send the hub anything but a read of its export or a sign-in: {why}"
             )));
         }
         self.count(|c| *c.sent.entry(request.method().to_string()).or_default() += 1);
@@ -142,17 +224,73 @@ impl HubClient {
             )
         })
     }
-    async fn read(&self, base: &Url, token: &Credential) -> ConnectorResult<ExternalSnapshot> {
-        let mut request = Request::new(Method::GET, export_of(base)?);
+    /// A request without a body, carrying `token` if there is one.
+    fn request(method: Method, url: Url, token: Option<&Credential>) -> Request {
+        let mut request = Request::new(method, url);
         let headers = request.headers_mut();
         headers.insert(header::ACCEPT, HeaderValue::from_static(ACCEPT));
         headers.insert(header::USER_AGENT, HeaderValue::from_static(USER_AGENT));
         // A credential has no control characters, so this only fails for
         // one that can't be a header at all.
-        if let Ok(mut auth) = HeaderValue::from_str(&format!("Bearer {}", token.expose())) {
+        if let Some(Ok(mut auth)) =
+            token.map(|token| HeaderValue::from_str(&format!("Bearer {}", token.expose())))
+        {
             auth.set_sensitive(true);
             headers.insert(header::AUTHORIZATION, auth);
         }
+        request
+    }
+    /// Ask the hub at `base` to start a sign-in with GitHub's device flow.
+    /// Nothing is sent but the request itself.
+    pub async fn start_login(&self, base: &Url) -> ConnectorResult<DeviceStart> {
+        let url = base.join(DEVICE).map_err(ConnectorError::invalid)?;
+        let response = self
+            .send(base, Self::request(Method::POST, url, None))
+            .await?;
+        checked_start(Self::sign_in_answer(response).await?)
+    }
+    /// Ask the hub at `base` whether the sign-in `handle` names is done.
+    pub async fn poll_login(&self, base: &Url, handle: &Credential) -> ConnectorResult<DevicePoll> {
+        let url = base.join(DEVICE_POLL).map_err(ConnectorError::invalid)?;
+        let request = Self::request(Method::POST, url, Some(handle));
+        let response = self.send(base, request).await?;
+        checked_poll(Self::sign_in_answer(response).await?)
+    }
+    /// A hub's answer to a sign-in request, or its refusal, whose message
+    /// is shown, without control characters and bounded.
+    async fn sign_in_answer<T: serde::de::DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> ConnectorResult<T> {
+        let status = response.status();
+        if status.is_redirection() {
+            return Err(ConnectorError::invalid(
+                "The hub redirected the sign-in, which is never followed; check its address",
+            ));
+        }
+        let body = read_body(LABEL, response).await?;
+        if status.is_success() {
+            return serde_json::from_value(parse_json(LABEL, &body)?).map_err(|_| {
+                ConnectorError::invalid("The hub's answer to the sign-in isn't usable")
+            });
+        }
+        let mut message = parse_json(LABEL, &body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+        printable(&mut message);
+        let message: String = message.chars().take(MAX_MESSAGE).collect();
+        let kind = match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ErrorKind::Auth,
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => ErrorKind::Transient,
+            _ => ErrorKind::Invalid,
+        };
+        Err(ConnectorError::new(
+            kind,
+            format!("The hub refused the sign-in: {message}"),
+        ))
+    }
+    async fn read(&self, base: &Url, token: &Credential) -> ConnectorResult<ExternalSnapshot> {
+        let request = Self::request(Method::GET, export_of(base)?, Some(token));
         let response = self.send(base, request).await?;
         match response.status() {
             s if s.is_success() => {
@@ -713,7 +851,7 @@ pub mod tests {
     }
 
     #[test]
-    fn only_the_read_of_the_export_passes() {
+    fn only_the_read_of_the_export_and_the_sign_in_pass() {
         let base = hub_url("https://hub.example.ts.net/").unwrap();
         let request = |method: Method, url: &str, body: Option<&str>| {
             let mut request = Request::new(method, Url::parse(url).unwrap());
@@ -726,6 +864,61 @@ pub mod tests {
             (Method::GET, EXPORT_URL, Some("{}"), false),
             (Method::HEAD, EXPORT_URL, None, false),
             (Method::POST, EXPORT_URL, Some("{}"), false),
+            (Method::POST, EXPORT_URL, None, false),
+            (
+                Method::POST,
+                "https://hub.example.ts.net/auth/device",
+                None,
+                true,
+            ),
+            (
+                Method::POST,
+                "https://hub.example.ts.net/auth/device/poll",
+                None,
+                true,
+            ),
+            (
+                Method::POST,
+                "https://hub.example.ts.net/auth/device",
+                Some("{}"),
+                false,
+            ),
+            (
+                Method::POST,
+                "https://hub.example.ts.net/auth/device/poll",
+                Some("x"),
+                false,
+            ),
+            (
+                Method::GET,
+                "https://hub.example.ts.net/auth/device",
+                None,
+                false,
+            ),
+            (
+                Method::PUT,
+                "https://hub.example.ts.net/auth/device",
+                None,
+                false,
+            ),
+            (
+                Method::POST,
+                "https://hub.example.ts.net/auth/github/login",
+                None,
+                false,
+            ),
+            (
+                Method::POST,
+                "https://elsewhere.example/auth/device",
+                None,
+                false,
+            ),
+            (
+                Method::POST,
+                "https://hub.example.ts.net/auth/device?x=1",
+                None,
+                false,
+            ),
             (Method::PUT, EXPORT_URL, None, false),
             (Method::DELETE, EXPORT_URL, None, false),
             (
@@ -884,6 +1077,88 @@ pub mod tests {
             // One request, and a redirect never followed.
             assert_eq!(seen.lock().unwrap().len(), 1, "case {n}");
         }
+    }
+
+    #[tokio::test]
+    async fn sign_ins_are_two_posts_without_a_body_and_their_answers_are_checked() {
+        let start = serde_json::json!({
+            "handle": "test-only-handle",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 5,
+        });
+        let answers = Arc::new(Mutex::new(vec![
+            axum::Json(serde_json::json!({"status": "done", "token": "test-only-credential", "login": "jm\u{1b}arrero"})).into_response(),
+            axum::Json(serde_json::json!({"status": "pending", "interval": 10})).into_response(),
+            axum::Json(start.clone()).into_response(),
+        ]));
+        let (base, seen) = fixture(move |_| answers.lock().unwrap().pop().unwrap()).await;
+        let client = HubClient::new().unwrap();
+        let started = client.start_login(&base).await.unwrap();
+        assert_eq!(started.user_code, "ABCD-1234");
+        let handle = Credential::new(&started.handle).unwrap();
+        let pending = client.poll_login(&base, &handle).await.unwrap();
+        assert_eq!(pending, DevicePoll::Pending { interval: 10 });
+        let done = client.poll_login(&base, &handle).await.unwrap();
+        assert_eq!(
+            done,
+            DevicePoll::Done {
+                token: "test-only-credential".into(),
+                login: "jmarrero".into()
+            }
+        );
+        let seen = seen.lock().unwrap().clone();
+        let sent: Vec<_> = seen
+            .iter()
+            .map(|(method, path, auth, body)| {
+                (method.as_str(), path.as_str(), auth.as_str(), body.len())
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                ("POST", "/auth/device", "", 0),
+                ("POST", "/auth/device/poll", "Bearer test-only-handle", 0),
+                ("POST", "/auth/device/poll", "Bearer test-only-handle", 0),
+            ]
+        );
+        // What a hub may not start a sign-in with.
+        for (key, value) in [
+            ("verification_uri", serde_json::json!("javascript:alert(1)")),
+            (
+                "verification_uri",
+                serde_json::json!("http://github.com/login/device"),
+            ),
+            (
+                "verification_uri",
+                serde_json::json!("https://github.com.example/login/device"),
+            ),
+            (
+                "verification_uri",
+                serde_json::json!("https://github.com/login/device?x=1"),
+            ),
+            ("user_code", serde_json::json!("<b>")),
+            ("interval", serde_json::json!(0)),
+            ("expires_in", serde_json::json!(86400)),
+            ("handle", serde_json::json!("")),
+        ] {
+            let mut bad = start.clone();
+            bad[key] = value.clone();
+            let (base, _) = fixture(move |_| axum::Json(bad.clone()).into_response()).await;
+            assert!(client.start_login(&base).await.is_err(), "{key}: {value}");
+        }
+        // A refusal says why, in the hub's words, without control characters.
+        let (base, _) = fixture(|_| {
+            (Code::FORBIDDEN, axum::Json(serde_json::json!({"error": "That GitHub account isn't allowed\u{7} on this hub"}))).into_response()
+        })
+        .await;
+        let refused = client.poll_login(&base, &handle).await.unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::Auth);
+        assert_eq!(
+            refused.message,
+            "The hub refused the sign-in: That GitHub account isn't allowed on this hub"
+        );
     }
 
     #[test]

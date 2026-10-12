@@ -356,6 +356,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         page = dict(token=None, host=TAILNET, origin=f'https://{TAILNET}')
         assert app.call('/auth/github/login', 'POST', token=None, host=TAILNET)[0] == 403, 'no origin'
         assert app.call('/auth/github/login', 'POST', token=None, origin=f'http://127.0.0.1:{app.port}')[0] == 403, 'not on its name'
+        assert app.call('/auth/device', 'POST', **page)[0] == 403, 'a browser'
         status, headers, body = app.call('/auth/github/login', 'POST', **page)
         assert status == 200, body
         started = headers['Set-Cookie']

@@ -1,21 +1,24 @@
 //! Signing in to a hub with a GitHub App: GitHub's web flow for a browser,
-//! which gives it a session.
+//! which gives it a session, and GitHub's device flow for a companion,
+//! which gives it a credential that reads the hub's external export.
 //!
 //! Who signed in is the numeric GitHub user ID that `GET /user` answers
 //! with the new user token, read through the read-only client. Only IDs on
 //! the hub's allowlist get in; a login is never compared, since logins can
 //! be renamed and then taken by someone else.
 //!
-//! Secrets are never kept as given where a hash will do: sessions and
-//! pending sign-ins are looked up by the SHA-256 of what the client
-//! presents, so a lookup's timing gives none away. The user token the web flow gets is kept
+//! Secrets are never kept as given where a hash will do: sessions, pending
+//! sign-ins, device flows and companion credentials are looked up by the
+//! SHA-256 of what the client presents, so neither a lookup's timing nor
+//! the hub's files give one away. The user token the web flow gets is kept
 //! in a private file for posting commands as the user later (#13).
 
 use crate::{
     clock::{Clock, Timestamp},
-    connector::{Credential, Target},
+    connector::{Credential, ErrorKind, Target},
     connectors, db,
-    oauth::{OAuthError, Refused, Site, TokenClient, UserToken},
+    hub::{DevicePoll, DeviceStart},
+    oauth::{self, OAuthError, Refused, Site, TokenClient, UserToken},
     server::{matches_token, new_token, replace_secret},
 };
 use anyhow::{bail, Context, Result};
@@ -43,7 +46,7 @@ pub const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 pub const SESSION_IDLE: Duration = Duration::from_secs(12 * 60 * 60);
 /// A session ends this long after sign-in, however much it is used.
 pub const SESSION_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Most sign-ins waiting for their browser, and sessions.
+/// Most sign-ins waiting for their browser, sessions, and device flows.
 const MAX_PENDING: usize = 16;
 const MAX_SESSIONS: usize = 64;
 /// Most sign-in attempts in [`ATTEMPT_WINDOW`] from one peer, and from all
@@ -61,10 +64,17 @@ const MAX_PEER: usize = 64;
 const DIRECT: &str = "this machine";
 /// How often expired sessions and sign-ins are swept away.
 pub const SWEEP: Duration = Duration::from_secs(60);
+const MAX_DEVICES: usize = 4;
+/// Most companion credentials one user keeps; a new one drops the oldest.
+const MAX_COMPANIONS: usize = 4;
+/// What GitHub adds to the poll interval when it says to slow down.
+const SLOW_DOWN: Duration = Duration::from_secs(5);
 /// The App's client secret, in the data directory.
 pub const SECRET_FILE: &str = "github-app.secret";
 /// Where the user tokens are kept, one private file per user ID.
 const USERS_DIR: &str = "github-users";
+/// The companion credentials the device flow gave, by their hashes.
+const COMPANIONS_FILE: &str = "companions.json";
 /// Longest client ID accepted.
 const MAX_CLIENT_ID: usize = 64;
 /// Longest authorization code accepted from a callback.
@@ -335,18 +345,42 @@ struct Session {
     seen: SystemTime,
 }
 
+/// A companion's device flow, waiting for the person to enter the code.
+struct Device {
+    code: Credential,
+    interval: Duration,
+    next_poll: SystemTime,
+    expires: SystemTime,
+}
+
+/// A companion credential, kept by its hash, and whose it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Companion {
+    user: u64,
+    login: String,
+    token_hash: String,
+    created: Timestamp,
+}
+
 #[derive(Default)]
 struct State {
     /// By the hash of the browser's login cookie.
     pending: HashMap<String, Pending>,
     /// By the hash of the session cookie.
     sessions: HashMap<String, Session>,
+    /// By the hash of the companion's handle.
+    devices: HashMap<String, Device>,
     /// The browsers' attempts: sign-in starts, and callbacks without a
     /// sign-in to finish.
     web: Limiter,
+    /// The companions' attempts: device-flow starts, and polls with a
+    /// handle the hub doesn't know.
+    device: Limiter,
+    companions: Vec<Companion>,
 }
 
-/// A hub's sign-ins: its GitHub App and its sessions.
+/// A hub's sign-ins: its GitHub App, its sessions and its companion
+/// credentials.
 pub struct Logins {
     config: AppConfig,
     secret: Credential,
@@ -365,13 +399,34 @@ impl Logins {
         root: &Path,
     ) -> Result<Self> {
         forget_user_tokens(root)?;
+        let path = root.join(COMPANIONS_FILE);
+        let kept: Vec<Companion> = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).with_context(|| {
+                format!("{} isn't a list of companion credentials", path.display())
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(e).with_context(|| format!("Cannot read {}", path.display())),
+        };
+        // A user taken off the allowlist loses their credentials for good,
+        // so adding them back doesn't bring those back.
+        let companions: Vec<Companion> = kept
+            .iter()
+            .filter(|c| config.users.contains(&c.user))
+            .cloned()
+            .collect();
+        if companions.len() != kept.len() {
+            replace_secret(&path, &serde_json::to_string(&companions)?)?;
+        }
         Ok(Self {
             config,
             secret,
             oauth: TokenClient::new(site)?,
             clock,
             root: root.to_path_buf(),
-            state: Mutex::default(),
+            state: Mutex::new(State {
+                companions,
+                ..State::default()
+            }),
         })
     }
     pub fn config(&self) -> &AppConfig {
@@ -607,6 +662,7 @@ impl Logins {
         state
             .pending
             .retain(|_, p| elapsed(now, p.started) < LOGIN_TTL);
+        state.devices.retain(|_, d| now < d.expires);
     }
 
     /// End the session with cookie value `id`, and forget its user's token
@@ -621,6 +677,173 @@ impl Logins {
         }
         Ok(())
     }
+
+    /// Start a companion's device flow: the code its person enters on
+    /// GitHub, and the handle the companion polls with.
+    pub async fn device_start(&self, peer: &str) -> Result<DeviceStart, LoginError> {
+        {
+            let mut state = self.state();
+            let now = self.now();
+            state.device.attempt(now, peer)?;
+            state.devices.retain(|_, d| now < d.expires);
+        }
+        let code = self
+            .oauth
+            .device_code(&self.config.client_id)
+            .await
+            .map_err(LoginError::from_oauth)?;
+        let handle = new_token();
+        let now = self.now();
+        let mut state = self.state();
+        // The oldest waiting one makes way.
+        while state.devices.len() >= MAX_DEVICES {
+            let oldest = state
+                .devices
+                .iter()
+                .min_by_key(|(_, d)| d.expires)
+                .map(|(k, _)| k.clone());
+            state.devices.retain(|k, _| Some(k) != oldest.as_ref());
+        }
+        state.devices.insert(
+            hashed(&handle),
+            Device {
+                code: code.device_code,
+                interval: code.interval,
+                next_poll: now + code.interval,
+                expires: now + code.expires_in,
+            },
+        );
+        Ok(DeviceStart {
+            handle,
+            user_code: code.user_code,
+            verification_uri: code.verification_uri,
+            expires_in: code.expires_in.as_secs(),
+            interval: code.interval.as_secs(),
+        })
+    }
+
+    /// Poll a companion's device flow by its handle: not yet, or, once its
+    /// person entered the code and is allowed, a companion credential bound
+    /// to their user ID. GitHub is asked at most once per interval.
+    pub async fn device_poll(&self, peer: &str, handle: &str) -> Result<DevicePoll, LoginError> {
+        let key = hashed(handle);
+        let now = self.now();
+        let (code, interval) = {
+            let mut state = self.state();
+            if !state.devices.contains_key(&key) {
+                // Guessing handles counts as attempts.
+                state.device.attempt(now, peer)?;
+                return Err(LoginError::expired());
+            }
+            let device = state
+                .devices
+                .get_mut(&key)
+                .expect("invariant: checked above");
+            if now >= device.expires {
+                state.devices.remove(&key);
+                return Err(LoginError::expired());
+            }
+            if now < device.next_poll {
+                return Ok(DevicePoll::Pending {
+                    interval: device.interval.as_secs(),
+                });
+            }
+            device.next_poll = now + device.interval;
+            (device.code.clone(), device.interval)
+        };
+        let polled = self.oauth.poll_device(&self.config.client_id, &code).await;
+        let token = match polled {
+            Err(OAuthError::Refused(Refused::Pending)) => {
+                return Ok(DevicePoll::Pending {
+                    interval: interval.as_secs(),
+                })
+            }
+            Err(OAuthError::Refused(Refused::SlowDown(seconds))) => {
+                let slower = seconds.map_or_else(
+                    || oauth::poll_interval((interval + SLOW_DOWN).as_secs()),
+                    oauth::poll_interval,
+                );
+                if let Some(device) = self.state().devices.get_mut(&key) {
+                    device.interval = slower;
+                    device.next_poll = now + slower;
+                }
+                return Ok(DevicePoll::Pending {
+                    interval: slower.as_secs(),
+                });
+            }
+            // A network failure can pass; the companion polls again.
+            Err(OAuthError::Failed(e)) if e.kind == ErrorKind::Transient => {
+                return Err(LoginError::from_oauth(OAuthError::Failed(e)))
+            }
+            Err(e) => {
+                self.state().devices.remove(&key);
+                return Err(LoginError::from_oauth(e));
+            }
+            Ok(token) => token,
+        };
+        self.state().devices.remove(&key);
+        let user = self.identify(&token.access).await?;
+        let credential = self.issue_companion(&user)?;
+        Ok(DevicePoll::Done {
+            token: credential,
+            login: user.login,
+        })
+    }
+
+    fn save_companions(&self, companions: &[Companion]) -> Result<()> {
+        let text = serde_json::to_string(companions)?;
+        replace_secret(&self.root.join(COMPANIONS_FILE), &text)
+    }
+
+    /// A new companion credential for `user`. Each user keeps at most
+    /// [`MAX_COMPANIONS`], the oldest dropped first.
+    fn issue_companion(&self, user: &Identity) -> Result<String, LoginError> {
+        let token = new_token();
+        let mut state = self.state();
+        let mut companions = state.companions.clone();
+        while companions.iter().filter(|c| c.user == user.id).count() >= MAX_COMPANIONS {
+            let oldest = companions
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.user == user.id)
+                .min_by_key(|(_, c)| c.created)
+                .map(|(n, _)| n)
+                .expect("invariant: the user has some");
+            companions.remove(oldest);
+        }
+        companions.push(Companion {
+            user: user.id,
+            login: user.login.clone(),
+            token_hash: hashed(&token),
+            created: Timestamp::of(self.now()),
+        });
+        self.save_companions(&companions)
+            .map_err(|_| LoginError::internal("keep the companion credential"))?;
+        state.companions = companions;
+        Ok(token)
+    }
+
+    /// Whether `token` is a companion credential of a user still allowed.
+    pub fn companion(&self, token: &str) -> bool {
+        let presented = hashed(token);
+        self.state().companions.iter().any(|c| {
+            matches_token(&c.token_hash, &presented) && self.config.users.contains(&c.user)
+        })
+    }
+
+    /// Revoke every companion credential the device flow gave.
+    pub fn revoke_companions(&self) -> Result<()> {
+        let mut state = self.state();
+        forget_companions(&self.root)?;
+        state.companions.clear();
+        Ok(())
+    }
+}
+
+/// Revoke every companion credential a hub's device flow gave, from its
+/// data directory at `root`: with its GitHub App configured or not.
+pub fn forget_companions(root: &Path) -> Result<()> {
+    db::remove_if_there(&root.join(COMPANIONS_FILE))
 }
 
 /// What GitHub sends a browser back with.
@@ -636,8 +859,9 @@ pub mod tests {
     use super::*;
     use crate::{
         clock::ManualClock,
-        oauth::tests::{fake_github, Shared, CLIENT_ID, CODE, SECRET},
+        oauth::tests::{fake_github, token_answer, Shared, CLIENT_ID, CODE, SECRET, USER_CODE},
     };
+    use serde_json::json;
 
     pub const TAILNET: &str = "hub.example.ts.net";
     /// The tailnet address sign-ins come from.
@@ -988,8 +1212,20 @@ pub mod tests {
         }
         let backstop = logins.start("100.64.0.3").unwrap_err();
         assert_eq!(backstop.status, StatusCode::TOO_MANY_REQUESTS);
+        // Companions have limits of their own, which guessed handles use.
+        for _ in 0..PEER_ATTEMPTS {
+            assert_eq!(
+                logins.device_poll(PEER, "guessed").await.unwrap_err(),
+                LoginError::expired()
+            );
+        }
+        let guessed = logins.device_poll(PEER, "guessed").await;
+        assert_eq!(guessed.unwrap_err().status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(logins.device_start(PEER).await.is_err());
+        logins.device_start("100.64.0.2").await.unwrap();
         clock.advance(ATTEMPT_WINDOW);
         logins.start(PEER).unwrap();
+        logins.device_start(PEER).await.unwrap();
     }
 
     #[tokio::test]
@@ -1038,5 +1274,136 @@ pub mod tests {
             assert_eq!(peer(&headers(values)), expected, "{values:?}");
         }
         assert_eq!(peer(&headers(&[&"9".repeat(500)])).len(), MAX_PEER);
+    }
+
+    #[tokio::test]
+    async fn the_device_flow_gives_an_allowed_user_a_companion_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = logins(root.path()).await;
+        let start = logins.device_start(PEER).await.unwrap();
+        assert_eq!((start.user_code.as_str(), start.interval), (USER_CODE, 5));
+        fake.lock().unwrap().polls = [
+            json!({"error": "authorization_pending"}),
+            json!({"error": "slow_down", "interval": 10}),
+            token_answer("ghu_allowed"),
+        ]
+        .into();
+        // Polled too soon: GitHub isn't asked.
+        let early = logins.device_poll(PEER, &start.handle).await.unwrap();
+        assert_eq!(early, DevicePoll::Pending { interval: 5 });
+        let polls = |fake: &Shared| {
+            fake.lock()
+                .unwrap()
+                .seen
+                .iter()
+                .filter(|s| s.1 == "/login/oauth/access_token")
+                .count()
+        };
+        assert_eq!(polls(&fake), 0);
+        clock.advance(Duration::from_secs(5));
+        // Polls at once: only one asks GitHub.
+        let (one, two) = tokio::join!(
+            logins.device_poll(PEER, &start.handle),
+            logins.device_poll(PEER, &start.handle)
+        );
+        assert_eq!(
+            (one.unwrap(), two.unwrap()),
+            (
+                DevicePoll::Pending { interval: 5 },
+                DevicePoll::Pending { interval: 5 }
+            )
+        );
+        assert_eq!(polls(&fake), 1);
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(
+            logins.device_poll(PEER, &start.handle).await.unwrap(),
+            DevicePoll::Pending { interval: 10 }
+        );
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(
+            logins.device_poll(PEER, &start.handle).await.unwrap(),
+            DevicePoll::Pending { interval: 10 }
+        );
+        assert_eq!(polls(&fake), 2, "slowed down");
+        clock.advance(Duration::from_secs(5));
+        let DevicePoll::Done { token, login } =
+            logins.device_poll(PEER, &start.handle).await.unwrap()
+        else {
+            panic!("not done")
+        };
+        assert_eq!(login, "jmarrero");
+        assert!(logins.companion(&token));
+        assert!(!logins.companion("anything-else"));
+        // Kept by its hash only, and the handle is used up.
+        let kept = std::fs::read_to_string(root.path().join(COMPANIONS_FILE)).unwrap();
+        assert!(!kept.contains(&token) && kept.contains(&hashed(&token)));
+        assert_eq!(
+            logins.device_poll(PEER, &start.handle).await.unwrap_err(),
+            LoginError::expired()
+        );
+        // Across a restart, until revoked.
+        let (again, _, _) = self::logins(root.path()).await;
+        assert!(again.companion(&token));
+        logins.revoke_companions().unwrap();
+        assert!(!logins.companion(&token));
+        assert!(!root.path().join(COMPANIONS_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn a_user_taken_off_the_allowlist_loses_their_companion_credentials_for_good() {
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = logins(root.path()).await;
+        let start = logins.device_start(PEER).await.unwrap();
+        fake.lock().unwrap().polls = [token_answer("ghu_allowed")].into();
+        clock.advance(Duration::from_secs(5));
+        let DevicePoll::Done { token, .. } = logins.device_poll(PEER, &start.handle).await.unwrap()
+        else {
+            panic!("not done")
+        };
+        let config = AppConfig {
+            users: [OTHER].into(),
+            ..config()
+        };
+        let secret = Credential::new(SECRET).unwrap();
+        let without =
+            Logins::new(config, secret, Site::github(), clock.clone(), root.path()).unwrap();
+        assert!(!without.companion(&token));
+        // Allowed again, the old credential stays gone.
+        let (back, _, _) = self::logins(root.path()).await;
+        assert!(!back.companion(&token));
+        let kept = std::fs::read_to_string(root.path().join(COMPANIONS_FILE)).unwrap();
+        assert_eq!(kept, "[]");
+    }
+
+    #[tokio::test]
+    async fn device_flows_that_are_refused_give_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = logins(root.path()).await;
+        // (GitHub's answer, the status the companion gets)
+        for (answer, status) in [
+            (json!({"error": "access_denied"}), StatusCode::FORBIDDEN),
+            (json!({"error": "expired_token"}), StatusCode::BAD_REQUEST),
+            (token_answer("ghu_other"), StatusCode::FORBIDDEN),
+        ] {
+            clock.advance(ATTEMPT_WINDOW);
+            let start = logins.device_start(PEER).await.unwrap();
+            fake.lock().unwrap().polls = [answer.clone()].into();
+            clock.advance(Duration::from_secs(5));
+            let refused = logins.device_poll(PEER, &start.handle).await.unwrap_err();
+            assert_eq!(refused.status, status, "{answer}");
+            assert_eq!(
+                logins.device_poll(PEER, &start.handle).await.unwrap_err(),
+                LoginError::expired()
+            );
+        }
+        // A device code that runs out.
+        let start = logins.device_start(PEER).await.unwrap();
+        clock.advance(Duration::from_secs(start.expires_in));
+        assert_eq!(
+            logins.device_poll(PEER, &start.handle).await.unwrap_err(),
+            LoginError::expired()
+        );
+        assert!(logins.state().companions.is_empty());
+        assert!(!root.path().join(COMPANIONS_FILE).exists());
     }
 }
