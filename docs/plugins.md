@@ -13,7 +13,7 @@ Why not just one of them:
 
 - A plugin interface that only takes Rust code compiled into the service isn't one others can extend without forking. Rust has no stable ABI for loading libraries at run time, and code loaded into the service would share its memory, where every connection's credential passes.
 - Running the built-ins out of process would cost a process start per call and give up what they share in process: one HTTP client that keeps TLS verification, refuses redirects and has a timeout, and type-checked tests against recorded fixtures.
-- Because both kinds answer with the same types, everything Workboard checks happens in one place, on the host side (`connector::sync`), whichever connector answered: that the credential still belongs to the connection's account, which items get fetched again, that links are HTTP(S), that an inaccessible item becomes unknown and never done, and that no connector can mark work abandoned. A built-in connector could move out of process without any change there.
+- Because both kinds answer with the same types, everything Workboard checks happens in one place, on the host side (`connector::sync_and_watch`), whichever connector answered: that the credential still belongs to the connection's account, which items get fetched again, that links are HTTP(S), that an inaccessible item becomes unknown and never done, and that no connector can mark work abandoned. A built-in connector could move out of process without any change there.
 - WebAssembly would isolate plugins better than a process does, but needs a runtime and host functions for HTTP. The protocol can be carried over to it later if that's needed.
 
 A separate process is isolation from crashes, hangs and the service's memory, not a sandbox: a plugin runs as the same user as the service and can read what that user can. Install only plugins you trust.
@@ -93,7 +93,7 @@ An item:
 | `outcome_reason` | A short explanation of the outcome, shown next to it. |
 | `action` | While open, why it needs attention: `next`, `review`, `waiting` or `follow-up`. Ignored for items that aren't open. Workboard sets `follow-up` on refreshed items. |
 | `updated_at` | When the source last changed the item. |
-| `reasons` | Optional. Why the item waits on the account, as a list of `review_requested`, `team_review_requested`, `assigned`, `mentioned`, `changes_requested` (on the account's own change), `checks_failing` (on the account's own change), `authored` or `todo` (on its to-do list for another reason). The Mine view lists open items that have one. Workboard clears them on items fetched again by `refresh`, since the listing no longer has them. |
+| `reasons` | Optional. Why the item waits on the account, as a list of `review_requested`, `team_review_requested`, `assigned`, `mentioned`, `changes_requested` (on the account's own change), `checks_failing` (on the account's own change), `authored`, `todo` (on its to-do list for another reason) or `bot_waiting` (a bot waits on the account's decision or review). The Mine view lists open items that have one. Workboard clears them on items fetched again by `refresh`, since the listing no longer has them. |
 
 Text fields are limited to 8192 bytes. Unknown fields are ignored, so a later minor addition doesn't break older plugins or hosts.
 
