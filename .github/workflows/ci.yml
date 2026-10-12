@@ -58,10 +58,12 @@ jobs:
       - name: cargo build
         run: cargo build --locked
       # The unit tests' own binary, for the ignored live tests, such as the
-      # anonymous read of a public repository on Fedora Forge.
+      # anonymous read of a public repository on Fedora Forge. Picked by
+      # its kind, so a library or integration tests added later don't
+      # change which one it is.
       - name: Keep the test binary
         run: |
-          TESTS=$(cargo test --locked --no-run --message-format=json | jq -rs 'map(select(.profile.test? and .executable)) | .[0].executable')
+          TESTS=$(cargo test --locked --no-run --message-format=json | jq -rs '[.[] | select(.profile.test? and .executable and .target.kind == ["bin"])] | if length == 1 then .[0].executable else error("expected one bin test executable, found \(length)") end')
           cp "${TESTS}" target/debug/workboard-tests
       # For live tests on a machine that only runs what CI built.
       - name: Upload the debug binaries
