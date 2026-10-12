@@ -11,7 +11,7 @@
 
 use crate::{
     connector::{ConnectorError, ConnectorResult, ErrorKind, Requests, Target},
-    connectors::{client, http_error, parse_json, read_body},
+    connectors::{client, http_error, parse_json, read_body, wait_until, MAX_WAIT},
 };
 use graphql_parser::query::{parse_query, Definition, OperationDefinition};
 use reqwest::{
@@ -278,16 +278,23 @@ const SECONDARY: &str = "secondary";
 /// Which rate limit an answer says is used up, and until when: no requests
 /// remaining in the primary limit of the request's resource until it
 /// resets; or a secondary limit, from its `retry-after`, or from a refusal
-/// that says it hit one without saying for how long.
+/// that says it hit one without saying for how long. Never more than
+/// [`MAX_WAIT`] away, whatever the answer says.
 fn used_up(answer: &Answer, resource: &'static str) -> Option<(&'static str, SystemTime)> {
     let headers = &answer.headers;
     let number = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<u64>().ok();
+    let now = SystemTime::now();
     if let Some(seconds) = number("retry-after") {
-        return Some((SECONDARY, SystemTime::now() + Duration::from_secs(seconds)));
+        return Some((SECONDARY, wait_until(now, Duration::from_secs(seconds))));
     }
     if number("x-ratelimit-remaining") == Some(0) {
         let reset = number("x-ratelimit-reset")?;
-        return Some((resource, UNIX_EPOCH + Duration::from_secs(reset)));
+        let wait = UNIX_EPOCH
+            .checked_add(Duration::from_secs(reset))
+            .map_or(MAX_WAIT, |reset| {
+                reset.duration_since(now).unwrap_or_default()
+            });
+        return Some((resource, wait_until(now, wait)));
     }
     let refused = matches!(
         answer.status,
@@ -296,7 +303,7 @@ fn used_up(answer: &Answer, resource: &'static str) -> Option<(&'static str, Sys
     let says_so = String::from_utf8_lossy(&answer.body)
         .to_lowercase()
         .contains("rate limit");
-    (refused && says_so).then(|| (SECONDARY, SystemTime::now() + SECONDARY_WAIT))
+    (refused && says_so).then(|| (SECONDARY, wait_until(now, SECONDARY_WAIT)))
 }
 
 fn rate_limited(resource: &str, until: SystemTime) -> ConnectorError {
@@ -891,6 +898,40 @@ mod tests {
             _ => panic!("followed"),
         }
         assert_eq!(client.requests().refused, 0);
+    }
+
+    #[test]
+    fn absurd_waits_are_capped() {
+        let answer = |headers: &[(&'static str, &str)]| Answer {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            headers: headers
+                .iter()
+                .map(|&(k, v)| (header::HeaderName::from_static(k), v.parse().unwrap()))
+                .collect(),
+            body: vec![],
+        };
+        let max = u64::MAX.to_string();
+        for (headers, limit) in [
+            (vec![("retry-after", max.as_str())], SECONDARY),
+            (vec![("retry-after", "7200")], SECONDARY),
+            (
+                vec![
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", max.as_str()),
+                ],
+                "core",
+            ),
+        ] {
+            let before = SystemTime::now();
+            let (hit, until) = used_up(&answer(&headers), "core").unwrap();
+            assert_eq!(hit, limit, "{headers:?}");
+            let wait = until.duration_since(before).unwrap();
+            assert!(
+                wait <= MAX_WAIT + Duration::from_secs(1)
+                    && wait >= MAX_WAIT - Duration::from_secs(1),
+                "{headers:?}: {wait:?}"
+            );
+        }
     }
 
     #[test]
