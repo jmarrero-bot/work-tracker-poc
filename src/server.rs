@@ -290,6 +290,7 @@ async fn manual(State(app): State<App>, Json(input): Json<ManualInput>) -> ApiRe
         abandoned_at: None,
         demo: false,
         zone: Zone::Internal,
+        reasons: vec![],
     };
     // Manual outcomes are explicit; the status text never implies one.
     item.set_outcome((input.outcome, input.outcome.manual_reason().into()));

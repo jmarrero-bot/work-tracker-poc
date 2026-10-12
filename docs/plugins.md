@@ -93,6 +93,7 @@ An item:
 | `outcome_reason` | A short explanation of the outcome, shown next to it. |
 | `action` | While open, why it needs attention: `next`, `review`, `waiting` or `follow-up`. Ignored for items that aren't open. Workboard sets `follow-up` on refreshed items. |
 | `updated_at` | When the source last changed the item. |
+| `reasons` | Optional. Why the item waits on the account, as a list of `review_requested`, `team_review_requested`, `assigned`, `mentioned`, `changes_requested` (on the account's own change), `checks_failing` (on the account's own change), `authored` or `todo` (on its to-do list for another reason). The Mine view lists open items that have one. Workboard clears them on items fetched again by `refresh`, since the listing no longer has them. |
 
 Text fields are limited to 8192 bytes. Unknown fields are ignored, so a later minor addition doesn't break older plugins or hosts.
 

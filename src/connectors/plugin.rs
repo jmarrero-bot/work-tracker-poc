@@ -475,6 +475,7 @@ mod tests {
             outcome_reason: "Fake forge says open".into(),
             action: "next".into(),
             updated_at: "2026-10-12T00:00:00Z".into(),
+            reasons: vec![],
         }
     }
 

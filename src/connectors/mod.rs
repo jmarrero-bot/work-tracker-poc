@@ -239,6 +239,20 @@ fn test_connection() -> crate::model::Connection {
     }
 }
 
+/// Serve an API fixture over plain HTTP, which production constructors
+/// refuse, and the target that points a connector at it.
+#[cfg(test)]
+async fn fixture(router: axum::Router, token: &str) -> (Target, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let target = Target {
+        base_url: Url::parse(&base).unwrap(),
+        credential: crate::connector::Credential::new(token).unwrap(),
+    };
+    (target, task)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
