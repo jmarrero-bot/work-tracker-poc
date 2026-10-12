@@ -13,12 +13,13 @@
 
 use crate::{
     clock::{Clock, Timestamp},
-    connector::{self, Connector, Requests, Target},
+    connector::{self, Connector, Credential, Requests, Target},
     connectors,
     db::Db,
+    hub::{self, Pull},
     model::{Connection, ErrorKind, Item, Schedule, Snapshot, SyncState, WatchList},
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -157,9 +158,11 @@ pub fn freshness(connections: &[Connection], items: &mut [Item]) {
     }
 }
 
-/// Where the scheduler gets a connector for a provider.
+/// Where the scheduler gets a connector for a provider, and the client it
+/// reads a hub with.
 pub trait Sources: Send + Sync {
     fn connector(&self, provider: &str) -> Result<Box<dyn Connector>>;
+    fn hub(&self) -> Result<Box<dyn Pull>>;
 }
 
 /// The built-in connectors and the data directory's plugins, sharing what
@@ -172,6 +175,9 @@ pub struct Builtin {
 impl Sources for Builtin {
     fn connector(&self, provider: &str) -> Result<Box<dyn Connector>> {
         connectors::for_provider(provider, &self.plugins, &self.shared)
+    }
+    fn hub(&self) -> Result<Box<dyn Pull>> {
+        Ok(Box::new(hub::HubClient::new()?))
     }
 }
 
@@ -421,11 +427,19 @@ impl Scheduler {
             .filter(|at| c.sync.last_attempt.is_none_or(|saved| saved < *at));
         Some(unsaved.map_or(due, |at| due.max(at.after(FIRST_BACKOFF))))
     }
-    /// The connections due to sync on schedule now.
+    /// What the schedule runs: every connection's syncs, and the pulls from
+    /// the hub, if one is set, which are scheduled the same way.
+    fn jobs(&self) -> Result<Vec<Connection>> {
+        let db = self.db();
+        let mut jobs = db.connections()?;
+        jobs.extend(db.hub()?.map(|link| link.as_job()));
+        Ok(jobs)
+    }
+    /// The connections, and the hub, due to sync on schedule now.
     pub fn due(&self) -> Result<Vec<String>> {
         let now = self.now();
-        let connections = self.db().connections()?;
-        Ok(connections
+        Ok(self
+            .jobs()?
             .into_iter()
             .filter(|c| self.due_at(c, now).is_some_and(|due| due <= now))
             .map(|c| c.id)
@@ -442,8 +456,8 @@ impl Scheduler {
     /// How long to sleep before the next sync is due, within bounds.
     fn sleep(&self) -> Duration {
         let now = self.now();
-        let soonest = match self.db().connections() {
-            Ok(connections) => connections.iter().filter_map(|c| self.due_at(c, now)).min(),
+        let soonest = match self.jobs() {
+            Ok(jobs) => jobs.iter().filter_map(|c| self.due_at(c, now)).min(),
             Err(_) => None,
         };
         soonest
@@ -467,9 +481,10 @@ impl Scheduler {
     pub fn start(self: &Arc<Self>, id: &str, trigger: Trigger) -> Pending {
         // For a report of a sync that never reports itself.
         let label = self
-            .db()
-            .connection(id)
-            .map_or_else(|_| id.to_string(), |c| c.label);
+            .jobs()
+            .ok()
+            .and_then(|jobs| jobs.into_iter().find(|c| c.id == id))
+            .map_or_else(|| id.to_string(), |c| c.label);
         let (send, done) = {
             let mut running = lock(&self.running);
             if let Some(done) = running.get(id) {
@@ -513,8 +528,8 @@ impl Scheduler {
     }
     /// Sync every connection now, side by side, joining those running.
     pub async fn sync_all(self: &Arc<Self>, trigger: Trigger) -> Result<Vec<Report>> {
-        let connections = self.db().connections()?;
-        let pending: Vec<_> = connections
+        let pending: Vec<_> = self
+            .jobs()?
             .iter()
             .map(|c| self.start(&c.id, trigger))
             .collect();
@@ -524,10 +539,128 @@ impl Scheduler {
         }
         Ok(reports)
     }
+    /// One sync of connection or hub `id`, start to end.
+    async fn run(&self, id: &str, trigger: Trigger) -> Report {
+        let hub = self.db().hub();
+        match hub {
+            Ok(Some(link)) if link.id == id => self.pull(link, trigger).await,
+            _ => self.sync_connection(id, trigger).await,
+        }
+    }
+    /// One pull from the hub, start to end: what it read and the state of
+    /// the pulls are saved together, or, if it failed, only the state. The
+    /// last export read stays, and shows as stale.
+    async fn pull(&self, link: hub::Link, trigger: Trigger) -> Report {
+        let _held = self.hold(&link.id).await;
+        let started = self.now();
+        lock(&self.attempts).insert(link.id.clone(), started);
+        let job = link.as_job();
+        let mut report = Report::new(&link.id, hub::LABEL, trigger);
+        let source = self.sources.hub();
+        let result = async {
+            let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let token = self.db().secret(&link.id)?;
+            let token = Credential::new(&token)?;
+            let url = hub::hub_url(&link.url)?;
+            Ok::<_, anyhow::Error>(source.pull(&url, &token).await?)
+        }
+        .await;
+        report.requests = source.ok().and_then(|s| s.requests());
+        let finished = self.now();
+        let sample = (self.sample)();
+        let mut db = self.db();
+        let (state, snapshot) = match result {
+            Ok(snapshot) => {
+                report.items = Some(snapshot.items.len());
+                (link.sync.succeeded(started), Some(snapshot))
+            }
+            Err(e) => {
+                let state = link.sync.failed(started, &e);
+                report.error = state.error.clone();
+                report.error_kind = state.error_kind;
+                (state, None)
+            }
+        };
+        let state = SyncState {
+            next_due: self.policy.next_due(&job, &state, finished, sample),
+            ..state
+        };
+        match db.save_hub_pull(&link.id, snapshot.as_ref(), &state) {
+            Ok(()) => report.next_due = state.next_due,
+            Err(e) => {
+                report.items = None;
+                report = report.failed(&anyhow::anyhow!("Cannot save what the pull read: {e:#}"));
+            }
+        }
+        report
+    }
+    /// Pull from the hub at `url` with `token` from now on, in place of any
+    /// hub before, once a first pull shows the address and the token work.
+    /// That pull is kept, and the next is due an interval later.
+    pub async fn set_hub(&self, url: &str, token: &str) -> Result<hub::Status> {
+        let url = hub::hub_url(url)?;
+        let token = Credential::new(token)?;
+        let started = self.now();
+        let client = self.sources.hub()?;
+        let snapshot = client.pull(&url, &token).await?;
+        let mut db = self.db();
+        let old = db.hub()?.map(|link| link.id);
+        let link = db.set_hub(url.as_str(), token.expose())?;
+        let state = link.sync.succeeded(started);
+        let state = SyncState {
+            next_due: self
+                .policy
+                .next_due(&link.as_job(), &state, self.now(), (self.sample)()),
+            ..state
+        };
+        db.save_hub_pull(&link.id, Some(&snapshot), &state)?;
+        drop(db);
+        if let Some(old) = old {
+            self.forget(&old);
+        }
+        self.wake();
+        self.hub_status()?.context("The hub was not saved")
+    }
+    /// Stop pulling from the hub, and forget its token and its work.
+    pub async fn unset_hub(&self) -> Result<()> {
+        let id = self.db().hub()?.map(|link| link.id);
+        // Not while it pulls, which would save what it read afterwards.
+        let _held = match &id {
+            Some(id) => Some(self.hold(id).await),
+            None => None,
+        };
+        self.db().unset_hub()?;
+        if let Some(id) = id {
+            self.forget(&id);
+        }
+        Ok(())
+    }
+    /// How the pulls from the hub are going, if one is set. Its work is
+    /// stale when the last pull is too old, as a connection's, and also as
+    /// soon as a pull fails: the hub's work is never shown as current while
+    /// the hub can't be reached.
+    pub fn hub_status(&self) -> Result<Option<hub::Status>> {
+        let Some(link) = self.db().hub()? else {
+            return Ok(None);
+        };
+        let mut job = link.as_job();
+        self.annotate(std::slice::from_mut(&mut job));
+        let snapshot = link.snapshot.as_ref();
+        Ok(Some(hub::Status {
+            url: link.url.clone(),
+            schedule: Schedule {
+                stale: job.schedule.stale || link.sync.error.is_some(),
+                ..job.schedule
+            },
+            sync: link.sync,
+            connections: snapshot.map_or(0, |s| s.connections.len()),
+            items: snapshot.map_or(0, |s| s.items.len()),
+        }))
+    }
     /// One sync of connection `id`, start to end: what it found and its
     /// state are saved together once it is processed, or, if it failed,
     /// only its state.
-    async fn run(&self, id: &str, trigger: Trigger) -> Report {
+    async fn sync_connection(&self, id: &str, trigger: Trigger) -> Report {
         let _held = self.hold(id).await;
         let started = self.now();
         lock(&self.attempts).insert(id.into(), started);
@@ -844,10 +977,39 @@ mod tests {
         }
     }
 
+    /// A hub answers as many items as queued under its host, two unless
+    /// something is queued, and refuses any token but [`TOKEN`].
+    impl Pull for Fake {
+        fn pull<'a>(
+            &'a self,
+            base: &'a url::Url,
+            token: &'a Credential,
+        ) -> BoxFuture<'a, ConnectorResult<crate::zone::ExternalSnapshot>> {
+            Box::pin(async move {
+                let host = base.host_str().unwrap_or_default().to_string();
+                *lock(&self.0.lists).entry(host.clone()).or_default() += 1;
+                if token.expose() != TOKEN {
+                    return Err(ConnectorError::new(ErrorKind::Auth, "Refused"));
+                }
+                let answer = lock(&self.0.answers)
+                    .get_mut(&host)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(Ok(2));
+                Ok(hub::tests::export(answer?))
+            })
+        }
+        fn requests(&self) -> Option<Requests> {
+            None
+        }
+    }
+
     struct FakeSources(Arc<World>);
 
     impl Sources for FakeSources {
         fn connector(&self, _: &str) -> Result<Box<dyn Connector>> {
+            Ok(Box::new(Fake(self.0.clone())))
+        }
+        fn hub(&self) -> Result<Box<dyn Pull>> {
             Ok(Box::new(Fake(self.0.clone())))
         }
     }
@@ -1490,6 +1652,70 @@ mod tests {
         h.set(at(25));
         h.tick().await;
         assert_eq!(watched(&h), (Some(at(25)), false, Some(at(25)), false));
+    }
+
+    #[tokio::test]
+    async fn the_hub_is_pulled_on_schedule_and_is_stale_once_unreachable() {
+        const HUB: &str = "hub.example";
+        let url = format!("https://{HUB}/");
+        let h = Harness::new(&[("a.example", None)]);
+        // A token the hub refuses is never kept.
+        assert!(h.scheduler.set_hub(&url, "wrong-token").await.is_err());
+        assert_eq!(h.scheduler.hub_status().unwrap(), None);
+        let status = h.scheduler.set_hub(&url, TOKEN).await.unwrap();
+        let summary = |status: &hub::Status| {
+            (
+                status.items,
+                status.sync.last_success,
+                status.schedule.stale,
+                status.sync.next_due,
+            )
+        };
+        assert_eq!(summary(&status), (2, Some(t0()), false, Some(at(5))));
+        let hub_id = lock(&h.db).hub().unwrap().unwrap().id;
+        let status = || h.scheduler.hub_status().unwrap().unwrap();
+        let pulls = || h.world.lists(HUB);
+        assert_eq!(pulls(), 2);
+        // Not due again until an interval later, then pulled on schedule.
+        assert!(!h.scheduler.due().unwrap().contains(&hub_id));
+        h.set(at(5));
+        assert!(h.scheduler.due().unwrap().contains(&hub_id));
+        h.tick().await;
+        assert_eq!(pulls(), 3);
+        // A failed pull keeps the last export, which is stale at once, and
+        // backs off.
+        h.world.answer(HUB, Err(transient()));
+        h.set(at(10));
+        h.tick().await;
+        assert_eq!(summary(&status()), (2, Some(at(5)), true, Some(at(11))));
+        assert!(status().sync.error.is_some());
+        // It comes back current once a pull works again.
+        h.world.answer(HUB, Ok(3));
+        h.set(at(11));
+        h.tick().await;
+        assert_eq!(summary(&status()), (3, Some(at(11)), false, Some(at(16))));
+        // An explicit sync of everything pulls it too.
+        let reports = h.scheduler.sync_all(Trigger::Explicit).await.unwrap();
+        assert!(reports
+            .iter()
+            .any(|r| r.label == hub::LABEL && r.items == Some(2)));
+        // Without a token the hub takes, the pulls stop until it is set
+        // again.
+        h.world
+            .answer(HUB, Err(ConnectorError::new(ErrorKind::Auth, "Refused")));
+        h.set(at(20));
+        h.tick().await;
+        assert!(status().schedule.needs_user && status().schedule.stale);
+        let before = pulls();
+        h.set(at(120));
+        h.tick().await;
+        assert_eq!(pulls(), before);
+        // Unset, nothing of it is left, and nothing more is pulled.
+        h.scheduler.unset_hub().await.unwrap();
+        assert_eq!(h.scheduler.hub_status().unwrap(), None);
+        h.set(at(240));
+        h.tick().await;
+        assert_eq!(pulls(), before);
     }
 
     #[tokio::test]

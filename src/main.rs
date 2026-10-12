@@ -2,6 +2,7 @@ mod clock;
 mod connector;
 mod connectors;
 mod db;
+mod hub;
 mod mine;
 mod model;
 mod outcome;
@@ -237,6 +238,12 @@ enum Command {
     },
     /// Remove a connection, its locally cached items and its stored credential.
     Disconnect { connection: String },
+    /// Pull the external work of a hub, to show it with this machine's own,
+    /// as its companion. Nothing is ever sent to the hub.
+    Hub {
+        #[command(subcommand)]
+        command: HubCommand,
+    },
     /// Print a hub's companion token, with which a companion reads the
     /// hub's external export and nothing else. Run it on the hub.
     CompanionToken {
@@ -244,6 +251,25 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
+}
+#[derive(Subcommand)]
+enum HubCommand {
+    /// Pull from the hub at URL, with its companion token: the hub's
+    /// HTTPS address, such as https://hub.example.ts.net/. A first pull
+    /// checks both before they are kept; then it pulls on schedule.
+    Set {
+        url: String,
+        /// Read the companion token from this environment variable.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token_env: Option<String>,
+        /// Read the companion token from standard input.
+        #[arg(long)]
+        token_stdin: bool,
+    },
+    /// Show the hub this machine pulls from, and how fresh its work is.
+    Show,
+    /// Stop pulling from the hub, and forget its token and its work.
+    Unset,
 }
 /// A sync interval given on the command line.
 fn interval(text: &str) -> Result<Duration, String> {
@@ -487,6 +513,9 @@ async fn main() -> Result<()> {
             )
             .await?;
             let now = Timestamp::of(SystemTime::now());
+            if let Some(status) = &s.hub {
+                print_hub(status, now);
+            }
             for c in s.connections {
                 let watching = c
                     .watch_user
@@ -785,6 +814,50 @@ async fn main() -> Result<()> {
             .await?;
             println!("Disconnected")
         }
+        Command::Hub { command } => match command {
+            HubCommand::Set {
+                url,
+                token_env,
+                token_stdin,
+            } => {
+                let token = read_token(token_env, token_stdin)?.ok_or_else(|| {
+                    anyhow!("Use --token-stdin or --token-env NAME. Tokens are never command-line arguments.")
+                })?;
+                let status: hub::Status = request(
+                    &client,
+                    &root,
+                    args.port,
+                    reqwest::Method::PUT,
+                    "hub",
+                    Some(serde_json::json!({ "url": url, "token": token })),
+                )
+                .await?;
+                println!(
+                    "Pulling from {}: {} items of {} connections, and on schedule",
+                    status.url, status.items, status.connections
+                );
+            }
+            HubCommand::Show => {
+                let status: Option<hub::Status> =
+                    request(&client, &root, args.port, reqwest::Method::GET, "hub", None).await?;
+                match status {
+                    Some(status) => print_hub(&status, Timestamp::of(SystemTime::now())),
+                    None => println!("No hub is set; `workboard hub set URL` sets one"),
+                }
+            }
+            HubCommand::Unset => {
+                let _: serde_json::Value = request(
+                    &client,
+                    &root,
+                    args.port,
+                    reqwest::Method::DELETE,
+                    "hub",
+                    None,
+                )
+                .await?;
+                println!("No longer pulling from the hub; its work and token are gone from here");
+            }
+        },
         Command::CompanionToken { rotate } => {
             let method = if rotate {
                 reqwest::Method::POST
@@ -806,6 +879,26 @@ async fn main() -> Result<()> {
         Command::Serve { .. } => unreachable!(),
     }
     Ok(())
+}
+/// The hub this machine pulls from, and how its pulls are going.
+fn print_hub(status: &hub::Status, now: Timestamp) {
+    println!(
+        "Hub  {}  {} items of {} connections",
+        status.url, status.items, status.connections
+    );
+    let job = Connection {
+        id: "hub".into(),
+        sync: status.sync.clone(),
+        schedule: status.schedule.clone(),
+        ..Connection::default()
+    };
+    let line = if status.schedule.needs_user {
+        let error = status.sync.error.as_deref().unwrap_or("token refused");
+        format!("Needs you: {error}. Pulls stopped until the hub takes the token: run `workboard hub set URL` with its current companion token")
+    } else {
+        sync_status(&job, now)
+    };
+    println!("    {line}");
 }
 /// How a connection's syncs are going, as of `now`: when it last synced and
 /// syncs next, how it fails, or that it needs the person.
@@ -906,4 +999,6 @@ struct SnapshotClient {
     connections: Vec<Connection>,
     items: Vec<Item>,
     efforts: Vec<EffortView>,
+    #[serde(default)]
+    hub: Option<hub::Status>,
 }
