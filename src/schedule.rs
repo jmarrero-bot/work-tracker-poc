@@ -1289,7 +1289,7 @@ mod tests {
         assert_eq!(h.due(), ["a.example"]);
         // One disconnected from under it says so, and isn't left running.
         lock(&h.db)
-            .sql
+            .sql()
             .execute("DELETE FROM connections", [])
             .unwrap();
         let report = h.scheduler.sync(h.id("a.example"), Trigger::Explicit).await;

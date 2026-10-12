@@ -359,12 +359,8 @@ async fn manual(State(app): State<App>, Json(input): Json<ManualInput>) -> ApiRe
         bail_api("Invalid attention category")?
     }
     let url = connectors::source_url(&input.url)?;
+    let updated = app.scheduler.now().to_string();
     let db = app.db.lock().unwrap();
-    let updated: String =
-        db.sql
-            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| {
-                r.get(0)
-            })?;
     let mut item = Item {
         id: Uuid::new_v4().to_string(),
         connection_id: None,
@@ -428,11 +424,7 @@ async fn update_manual(
         _ => (item.outcome, std::mem::take(&mut item.outcome_reason)),
     };
     item.set_outcome(derived);
-    item.updated_at = db
-        .sql
-        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| {
-            r.get(0)
-        })?;
+    item.updated_at = app.scheduler.now().to_string();
     db.upsert_item(&item)?;
     Ok(Json(item))
 }

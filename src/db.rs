@@ -306,11 +306,18 @@ fn upsert_synced(tx: &Transaction, items: &[Item]) -> Result<()> {
     Ok(())
 }
 
+/// The data directory's database. Its SQL connection is private, so every
+/// write goes through a method here.
 pub struct Db {
-    pub sql: Sqlite,
+    sql: Sqlite,
     pub root: PathBuf,
 }
 impl Db {
+    /// The SQL connection, for tests that set up or break what they need.
+    #[cfg(test)]
+    pub fn sql(&self) -> &Sqlite {
+        &self.sql
+    }
     pub fn open(root: &Path) -> Result<Self> {
         private_dir(root)?;
         private_dir(&root.join("secrets"))?;
