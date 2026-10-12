@@ -61,6 +61,9 @@ type Connection = {
   last_sync: string | null;
   error: string | null;
   zone: Zone;
+  // Another GitHub user whose activity, as far as this connection's token
+  // can see it, the connection watches.
+  watch_user: string | null;
 };
 type Progress = {
   delivered: number;
@@ -367,6 +370,10 @@ function App() {
           base_url: form.url,
           token: form.token,
           zone: form.zone === "external" ? "external" : "internal",
+          watch_user:
+            connectProvider === "github" && form.watch?.trim()
+              ? form.watch.trim()
+              : null,
         });
       if (modal === "manual")
         await api("items", {
@@ -1012,6 +1019,14 @@ function App() {
                               <em className={`zone-tag ${c.zone}`}>
                                 {c.zone === "external" ? "External" : "Internal"}
                               </em>
+                              {c.watch_user && (
+                                <em
+                                  className="zone-tag watching"
+                                  title={`Also watching ${c.watch_user}'s activity visible to this token, listed as theirs, not yours`}
+                                >
+                                  Watching {c.watch_user}
+                                </em>
+                              )}
                             </strong>
                             <span>{c.base_url}</span>
                             <p>
@@ -1338,6 +1353,23 @@ function App() {
                         : "https://gitlab.example.com/",
                   )}
                   {field("token", "Personal access token", "password", true)}
+                  {connectProvider === "github" && (
+                    <>
+                      {field(
+                        "watch",
+                        "Also watch a GitHub user (optional)",
+                        "text",
+                        false,
+                        "login",
+                      )}
+                      <p className="token-note">
+                        Their review requests, assignments and pull requests
+                        that this token can see, private ones included, are
+                        listed under Watching, as theirs. They are never
+                        shown as yours.
+                      </p>
+                    </>
+                  )}
                   <label className="zone-choice">
                     <input
                       type="checkbox"

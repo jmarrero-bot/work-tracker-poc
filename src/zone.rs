@@ -286,6 +286,7 @@ mod tests {
             error: Some(format!("{INTERNAL} error message {n}")),
             zone,
             error_kind: Some(ErrorKind::Transient),
+            watch_user: Some(format!("{INTERNAL}-watched")),
         }
     }
     /// An item of `connection`, or a manual one, whose row says `zone`.

@@ -134,11 +134,18 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         bail_api("Enter a connection name of 1–100 characters")?
     }
     let base = connectors::base_url(&input.base_url)?;
+    let watch_user = input.watch_user.as_deref().map(str::trim);
+    if let Some(login) = watch_user {
+        check_watch_user(&input.provider, login)?;
+    }
     let plugins = app.db.lock().unwrap().root.join(connectors::PLUGINS_DIR);
     let source = connectors::for_provider(&input.provider, &plugins, &app.connectors)?;
     let target = Target::new(&base, &input.token)?;
     let account = connector::verify(source.as_ref(), &target).await?;
     let (id, name) = (account.id, account.name);
+    if watch_user.is_some_and(|login| login.eq_ignore_ascii_case(&name)) {
+        bail_api(OWN_ACCOUNT)?
+    }
     let db = app.db.lock().unwrap();
     if db
         .connections()?
@@ -158,6 +165,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         error: None,
         zone: input.zone,
         error_kind: None,
+        watch_user: watch_user.map(str::to_string),
     };
     let path = db.root.join("secrets").join(&c.id);
     db::write_secret(&path, target.credential.expose())?;
@@ -170,6 +178,44 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
 fn bail_api(message: &str) -> Result<()> {
     bail!("{message}")
 }
+const OWN_ACCOUNT: &str =
+    "That is this connection's own account, whose work is already yours; watch another user";
+/// Whether a connection of `provider` may watch `login`.
+fn check_watch_user(provider: &str, login: &str) -> Result<()> {
+    if provider != "github" {
+        bail!("Only a GitHub connection can watch another user")
+    }
+    if !valid_github_login(login) {
+        bail!("Enter a GitHub login: letters, digits and hyphens")
+    }
+    Ok(())
+}
+#[derive(Deserialize)]
+struct WatchInput {
+    /// Who to watch, or nobody.
+    watch_user: Option<String>,
+}
+/// Watch another user's activity visible to a GitHub connection's token, or
+/// stop.
+/// What it finds shows as theirs, never as the connection's account's.
+async fn watch(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(input): Json<WatchInput>,
+) -> ApiResult<Connection> {
+    // Not while a sync is saving what it found for the old setting.
+    let _guard = app.sync_gate.lock().await;
+    let mut db = app.db.lock().unwrap();
+    let c = db.connection(&id)?;
+    let login = input.watch_user.as_deref().map(str::trim);
+    if let Some(login) = login {
+        check_watch_user(&c.provider, login)?;
+        if login.eq_ignore_ascii_case(&c.account_name) {
+            bail_api(OWN_ACCOUNT)?
+        }
+    }
+    Ok(Json(db.set_watch_user(&id, login)?))
+}
 async fn disconnect(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Value> {
     let _guard = app.sync_gate.lock().await;
     app.db.lock().unwrap().delete_connection(&id)?;
@@ -180,16 +226,20 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
     let connections = app.db.lock().unwrap().connections()?;
     let mut results = Vec::new();
     for mut c in connections {
-        let (token, old, plugins) = {
+        let (token, old, last, plugins) = {
             let db = app.db.lock().unwrap();
             let plugins = db.root.join(connectors::PLUGINS_DIR);
-            (db.secret(&c.id), db.items()?, plugins)
+            let last = db.watched()?.into_iter().find(|w| w.connection_id == c.id);
+            (db.secret(&c.id), db.items()?, last, plugins)
         };
         let source = connectors::for_provider(&c.provider, &plugins, &app.connectors);
         let result = async {
             let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
             let target = Target::new(&c.base_url, &token?)?;
-            Ok::<_, anyhow::Error>(connector::sync(source.as_ref(), &target, &c, &old).await?)
+            Ok::<_, anyhow::Error>(
+                connector::sync_and_watch(source.as_ref(), &target, &c, &old, last.as_ref())
+                    .await?,
+            )
         }
         .await;
         // What the connector sent, for those that count, so a person can
@@ -197,8 +247,8 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
         let requests = source.ok().and_then(|s| s.requests());
         let mut db = app.db.lock().unwrap();
         match result {
-            Ok(items) => {
-                db.sync_items(&items)?;
+            Ok((items, watched)) => {
+                db.save_sync(&c.id, &items, watched.as_ref())?;
                 c.last_sync = Some(db.sql.query_row(
                     "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')",
                     [],
@@ -206,7 +256,9 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
                 )?);
                 c.error = None;
                 c.error_kind = None;
-                results.push(json!({"connection":c.id,"label":c.label,"items":items.len(),"requests":requests}));
+                let watched =
+                    watched.map(|w| json!({"login":w.login,"items":w.items.len(),"error":w.error}));
+                results.push(json!({"connection":c.id,"label":c.label,"items":items.len(),"watched":watched,"requests":requests}));
             }
             Err(e) => {
                 // Whether to fix a credential or retry later.
@@ -429,7 +481,10 @@ pub async fn serve(root: PathBuf, port: u16, demo: bool) -> Result<()> {
         .route("/export/external", get(export_external))
         .route("/session", post(session))
         .route("/connections", post(connect))
-        .route("/connections/{id}", axum::routing::delete(disconnect))
+        .route(
+            "/connections/{id}",
+            axum::routing::delete(disconnect).patch(watch),
+        )
         .route("/sync", post(sync))
         .route("/efforts", post(effort))
         .route("/efforts/{id}", axum::routing::patch(share_effort))

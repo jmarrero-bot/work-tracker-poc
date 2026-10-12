@@ -1,7 +1,9 @@
 //! GitHub and GitHub Enterprise Server, read only: a token as a bearer
-//! token; the open issues and pull requests that wait on the account, and
-//! its own open pull requests. Every request goes through the read-only
-//! client in `readonly`, which refuses anything that could write.
+//! token; the open issues and pull requests that wait on the account, its
+//! own open pull requests, and, when asked, another user's activity that the
+//! token can see.
+//! Every request goes through the read-only client in `readonly`, which
+//! refuses anything that could write.
 
 mod readonly;
 
@@ -14,6 +16,7 @@ use crate::{
         Refreshed, RemoteItem, Requests, Target, Tracked,
     },
     connectors::source_url,
+    model::valid_github_login,
     outcome,
 };
 use anyhow::{bail, Context, Result};
@@ -74,6 +77,16 @@ const MINE: &[Search] = &[
         reason: Some(Reason::ChecksFailing),
         action: "next",
     },
+];
+
+/// What waits on a watched user, by search qualifier, and the reason. As
+/// for the account, `review-requested:` also matches the user's teams, so
+/// only `user-review-requested:` makes a request direct.
+const WATCHED: &[(&str, Reason)] = &[
+    ("is:pr review-requested:", Reason::TeamReviewRequested),
+    ("is:pr user-review-requested:", Reason::ReviewRequested),
+    ("assignee:", Reason::Assigned),
+    ("author:", Reason::Authored),
 ];
 
 pub struct GitHub {
@@ -170,6 +183,26 @@ impl GitHub {
         direct_over_team(&mut items);
         Ok(items)
     }
+    async fn watched(&self, target: &Target, login: &str) -> ConnectorResult<Vec<RemoteItem>> {
+        // It goes into search queries, where a space or a colon would change
+        // what they find.
+        if !valid_github_login(login) {
+            return Err(ConnectorError::invalid(format!(
+                "'{login}' is not a GitHub login"
+            )));
+        }
+        let mut all = Listing::default();
+        for (qualifier, reason) in WATCHED {
+            for row in self.search(target, &format!("{qualifier}{login}")).await? {
+                let mut item = github_item(&row, "").map_err(ConnectorError::invalid)?;
+                item.reasons.push(*reason);
+                all.add(item);
+            }
+        }
+        let mut items = all.into_items();
+        direct_over_team(&mut items);
+        Ok(items)
+    }
     async fn tracked(
         &self,
         target: &Target,
@@ -228,6 +261,13 @@ impl Connector for GitHub {
         tracked: &'a [Tracked],
     ) -> BoxFuture<'a, ConnectorResult<Vec<Refreshed>>> {
         Box::pin(self.tracked(target, tracked))
+    }
+    fn watch<'a>(
+        &'a self,
+        target: &'a Target,
+        login: &'a str,
+    ) -> BoxFuture<'a, ConnectorResult<Vec<RemoteItem>>> {
+        Box::pin(self.watched(target, login))
     }
     fn requests(&self) -> Option<Requests> {
         Some(self.client.requests())
@@ -466,6 +506,16 @@ mod tests {
                 vec![pr(4, "open", false, false), pr(6, "open", false, false)],
                 2,
             ),
+            // Through a team for 1, directly for 21.
+            "is:pr review-requested:someone" => found(
+                vec![pr(1, "open", false, false), pr(21, "open", false, false)],
+                2,
+            ),
+            "is:pr user-review-requested:someone" => found(vec![pr(21, "open", false, false)], 1),
+            "assignee:someone" => {
+                found(vec![pr(1, "open", false, false), issue(2, "open", None)], 2)
+            }
+            "author:someone" => found(vec![pr(20, "open", false, true)], 1),
             other => panic!("unexpected search {other}"),
         }
         .into_response()
@@ -561,6 +611,38 @@ mod tests {
             refused: 0,
         };
         assert_eq!(requests, expected);
+    }
+
+    #[tokio::test]
+    async fn watching_finds_what_waits_on_someone_else() {
+        use Reason::*;
+        let (target, task) = crate::connectors::fixture(router(), "test-only-token").await;
+        let github = GitHub::new(Arc::default()).unwrap();
+        let found = connector::watch(&github, &target, &connection(), "someone")
+            .await
+            .unwrap();
+        let found: Vec<_> = found
+            .iter()
+            .map(|i| (i.key.as_str(), i.action.as_str(), i.reasons.clone()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("o/r#1", "", vec![TeamReviewRequested, Assigned]),
+                ("o/r#2", "", vec![Assigned]),
+                ("o/r#20", "", vec![Authored]),
+                ("o/r#21", "", vec![ReviewRequested]),
+            ]
+        );
+        // A login that would change the searches is refused unsent.
+        for login in ["someone is:closed", "a:b", "@me", ""] {
+            let error = connector::watch(&github, &target, &connection(), login)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Invalid, "{login}");
+        }
+        assert_eq!(github.requests().unwrap().sent["GET"], 4);
+        task.abort();
     }
 
     #[tokio::test]

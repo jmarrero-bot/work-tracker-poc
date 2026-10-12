@@ -875,6 +875,10 @@ h1 {
   color: #afcbb8;
   background: #26392e;
 }
+.zone-tag.watching {
+  color: #d6c08f;
+  background: #3a3322;
+}
 .zone-choice {
   display: flex;
   gap: 10px;

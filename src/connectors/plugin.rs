@@ -416,6 +416,7 @@ mod tests {
             error: None,
             zone: Zone::Internal,
             error_kind: None,
+            watch_user: None,
         }
     }
 

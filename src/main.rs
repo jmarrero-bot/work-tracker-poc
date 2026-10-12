@@ -54,9 +54,26 @@ enum Command {
         /// marked external here; this can't be changed later.
         #[arg(long)]
         external: bool,
+        /// For GitHub: also watch this user's activity, as far as this
+        /// connection's token can see it. What it finds
+        /// is listed as theirs under Watching, never as yours.
+        #[arg(long, value_name = "LOGIN")]
+        watch_user: Option<String>,
     },
     /// List connection identities and sync health.
     Connections,
+    /// Watch another user's activity visible to a GitHub connection's token, or
+    /// stop. What it finds is listed as theirs under Watching, never as
+    /// yours, and replaces what an earlier watch found.
+    Watch {
+        connection: String,
+        /// The GitHub login to watch.
+        #[arg(required_unless_present = "stop")]
+        login: Option<String>,
+        /// Stop watching.
+        #[arg(long, conflicts_with = "login")]
+        stop: bool,
+    },
     /// Fetch all connected sources. No writes to upstream services.
     Sync,
     /// Show active work. Add --json for agent/script consumption.
@@ -224,6 +241,7 @@ async fn main() -> Result<()> {
             token_env,
             token_stdin,
             external,
+            watch_user,
         } => {
             let token = if let Some(name) = token_env {
                 std::env::var(name).context("Token environment variable is not set")?
@@ -244,6 +262,7 @@ async fn main() -> Result<()> {
                 } else {
                     Zone::Internal
                 },
+                watch_user,
             };
             let c: Connection = request(
                 &client,
@@ -261,6 +280,33 @@ async fn main() -> Result<()> {
                 c.id,
                 c.zone.label()
             );
+            if let Some(login) = &c.watch_user {
+                println!(
+                    "Also watching {login}'s activity visible to this token; it is listed as theirs, not yours"
+                );
+            }
+        }
+        Command::Watch {
+            connection,
+            login,
+            stop: _,
+        } => {
+            let c: Connection = request(
+                &client,
+                &root,
+                args.port,
+                reqwest::Method::PATCH,
+                &format!("connections/{connection}"),
+                Some(serde_json::json!({ "watch_user": login })),
+            )
+            .await?;
+            match &c.watch_user {
+                Some(login) => println!(
+                    "{} is watching {login}'s activity visible to its token; `workboard mine` lists it as theirs, not yours",
+                    c.label
+                ),
+                None => println!("{} is not watching anyone", c.label),
+            }
         }
         Command::Sync => {
             let v: serde_json::Value = request(
@@ -279,6 +325,12 @@ async fn main() -> Result<()> {
             {
                 bail!("One or more sources could not sync; existing cached data was retained")
             }
+            if v["results"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|x| x["watched"]["error"].is_string()))
+            {
+                bail!("Watching another user could not be updated; the accounts' own work was synced, and the last watch list kept")
+            }
         }
         Command::Connections => {
             let s: SnapshotClient = request(
@@ -291,12 +343,18 @@ async fn main() -> Result<()> {
             )
             .await?;
             for c in s.connections {
+                let watching = c
+                    .watch_user
+                    .as_ref()
+                    .map(|login| format!("  watching {login}"))
+                    .unwrap_or_default();
                 println!(
-                    "{}  {}  {}  {}  {}",
+                    "{}  {}  {}  {}{}  {}",
                     c.id,
                     c.label,
                     c.account_name,
                     c.zone.label(),
+                    watching,
                     c.error.as_deref().unwrap_or("Ready")
                 );
             }

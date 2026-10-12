@@ -30,7 +30,7 @@ pub fn write_secret(path: &Path, value: &str) -> Result<()> {
 
 /// The schema version this build writes, kept in SQLite's `user_version`.
 /// Version 0 is the prototype's schema, whose items only had a `terminal` flag.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 fn schema_version(sql: &Sqlite) -> Result<i32> {
     let version = sql.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -65,6 +65,14 @@ fn migrate(sql: &mut Sqlite, root: &Path) -> Result<()> {
         // title was shared before.
         tx.execute_batch("ALTER TABLE efforts ADD COLUMN share_title INTEGER NOT NULL DEFAULT 0")
             .context("Cannot add title sharing to stored efforts")?;
+    }
+    if version < 4 {
+        // Version 4: what each connection found watching another user, kept
+        // apart from the account's own items.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS watched(connection_id TEXT PRIMARY KEY, login TEXT NOT NULL, body TEXT NOT NULL, error TEXT)",
+        )
+        .context("Cannot add watched users")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -156,6 +164,15 @@ fn migrate_zones(tx: &Transaction) -> Result<()> {
     Ok(())
 }
 
+/// Insert or update synced items, keeping their effort links and abandoned
+/// marks, which live in their own columns.
+fn upsert_synced(tx: &Transaction, items: &[Item]) -> Result<()> {
+    for i in items {
+        tx.execute("INSERT INTO items(id,body) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![i.id,serde_json::to_string(i)?])?;
+    }
+    Ok(())
+}
+
 pub struct Db {
     pub sql: Sqlite,
     pub root: PathBuf,
@@ -225,14 +242,18 @@ impl Db {
         }
         Ok(value)
     }
-    pub fn items(&self) -> Result<Vec<Item>> {
-        // An item's zone is always its connection's, never what its row
-        // says; anything without a known connection is internal.
-        let zones: HashMap<String, Zone> = self
+    /// Each connection's zone. An item's zone is always its connection's,
+    /// never what its row says; anything without a known connection is
+    /// internal.
+    fn zones(&self) -> Result<HashMap<String, Zone>> {
+        Ok(self
             .connections()?
             .into_iter()
             .map(|c| (c.id, c.zone))
-            .collect();
+            .collect())
+    }
+    pub fn items(&self) -> Result<Vec<Item>> {
+        let zones = self.zones()?;
         let mut s = self
             .sql
             .prepare("SELECT body,effort_id,abandoned_at FROM items ORDER BY id")?;
@@ -302,13 +323,85 @@ impl Db {
         )?;
         find()
     }
+    /// Save synced items without touching watch lists, as tests set up.
+    #[cfg(test)]
     pub fn sync_items(&mut self, items: &[Item]) -> Result<()> {
         let tx = self.sql.transaction()?;
-        for i in items {
-            tx.execute("INSERT INTO items(id,body) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![i.id,serde_json::to_string(i)?])?;
+        upsert_synced(&tx, items)?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Save what a sync of connection `id` found, all or nothing: its items,
+    /// and what it found watching another user, which replaces the last
+    /// such list.
+    pub fn save_sync(
+        &mut self,
+        id: &str,
+        items: &[Item],
+        watched: Option<&WatchList>,
+    ) -> Result<()> {
+        let tx = self.sql.transaction()?;
+        upsert_synced(&tx, items)?;
+        tx.execute("DELETE FROM watched WHERE connection_id=?1", [id])?;
+        if let Some(w) = watched {
+            if w.connection_id != id {
+                bail!("A watch list was saved for another connection")
+            }
+            tx.execute(
+                "INSERT INTO watched(connection_id,login,body,error) VALUES(?1,?2,?3,?4)",
+                params![id, w.login, serde_json::to_string(&w.items)?, w.error],
+            )?;
         }
         tx.commit()?;
         Ok(())
+    }
+    /// What each connection found by watching another user, and why its
+    /// last sync couldn't update that, if it couldn't.
+    pub fn watched(&self) -> Result<Vec<WatchList>> {
+        let zones = self.zones()?;
+        let mut s = self
+            .sql
+            .prepare("SELECT connection_id,login,body,error FROM watched ORDER BY connection_id")?;
+        let rows = s.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut lists = Vec::new();
+        for row in rows {
+            let (connection_id, login, body, error) = row?;
+            let Some(zone) = zones.get(&connection_id).copied() else {
+                continue;
+            };
+            let mut items: Vec<Item> = serde_json::from_str(&body)?;
+            for i in &mut items {
+                i.zone = zone;
+            }
+            lists.push(WatchList {
+                connection_id,
+                login,
+                items,
+                error,
+            });
+        }
+        Ok(lists)
+    }
+    /// Watch another user from connection `id`, or stop. What was found for
+    /// whoever it watched before is dropped.
+    pub fn set_watch_user(&mut self, id: &str, login: Option<&str>) -> Result<Connection> {
+        let mut c = self.connection(id)?;
+        c.watch_user = login.map(str::to_string);
+        let tx = self.sql.transaction()?;
+        tx.execute(
+            "UPDATE connections SET body=?1 WHERE id=?2",
+            params![serde_json::to_string(&c)?, id],
+        )?;
+        tx.execute("DELETE FROM watched WHERE connection_id=?1", [id])?;
+        tx.commit()?;
+        Ok(c)
     }
     pub fn efforts(&self) -> Result<Vec<Effort>> {
         let mut s = self
@@ -394,6 +487,7 @@ impl Db {
         for item in ids {
             tx.execute("DELETE FROM items WHERE id=?1", [item])?;
         }
+        tx.execute("DELETE FROM watched WHERE connection_id=?1", [id])?;
         tx.execute("DELETE FROM connections WHERE id=?1", [id])?;
         tx.commit()?;
         match fs::remove_file(self.root.join("secrets").join(id)) {
@@ -751,6 +845,7 @@ mod tests {
             error: None,
             zone,
             error_kind: None,
+            watch_user: None,
         }
     }
 
@@ -877,6 +972,71 @@ mod tests {
         let efforts = db.efforts().unwrap();
         assert!(efforts.iter().all(|e| e.share_title));
         assert!(!db.share_title(&id, false).unwrap().share_title);
+    }
+
+    #[test]
+    fn watch_lists_are_kept_apart_and_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("db");
+        let mut db = Db::open(&root).unwrap();
+        db.seed().unwrap();
+        let c = connection("c0ffee00-0000-4000-8000-00000000000e", Zone::External);
+        db.save_connection(&c).unwrap();
+        let mut theirs = db.items().unwrap().remove(0);
+        theirs.id = format!("{}:github:1", c.id);
+        theirs.connection_id = Some(c.id.clone());
+        theirs.zone = Zone::Internal;
+        let list = |login: &str| WatchList {
+            connection_id: c.id.clone(),
+            login: login.into(),
+            items: vec![theirs.clone()],
+            error: None,
+        };
+        // Whom each stored list watches.
+        let logins = |db: &Db| -> Vec<String> {
+            db.sql
+                .prepare("SELECT login FROM watched")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        db.save_sync(&c.id, &[], Some(&list("someone"))).unwrap();
+        let other = WatchList {
+            connection_id: "another".into(),
+            ..list("someone")
+        };
+        assert!(db.save_sync(&c.id, &[], Some(&other)).is_err());
+        assert_eq!(logins(&db), ["someone"]);
+        let found = db.watched().unwrap();
+        assert_eq!((found.len(), found[0].login.as_str()), (1, "someone"));
+        // Its connection's zone, like any item; and never one of the
+        // account's own items.
+        assert_eq!(found[0].items[0].zone, Zone::External);
+        assert!(db.items().unwrap().iter().all(|i| i.id != theirs.id));
+        // A sync without watching drops the list; so does changing whom
+        // it watches, and disconnecting.
+        // A failed watch is kept with its error.
+        let failed = WatchList {
+            error: Some("Watching someone: refused".into()),
+            ..list("someone")
+        };
+        db.save_sync(&c.id, &[], Some(&failed)).unwrap();
+        let found = db.watched().unwrap();
+        assert_eq!(found[0].error, failed.error);
+        assert_eq!(found[0].items.len(), 1);
+        db.save_sync(&c.id, &[], None).unwrap();
+        assert!(logins(&db).is_empty());
+        db.save_sync(&c.id, &[], Some(&list("someone"))).unwrap();
+        let changed = db.set_watch_user(&c.id, Some("someone-else")).unwrap();
+        assert_eq!(changed.watch_user.as_deref(), Some("someone-else"));
+        assert_eq!(db.connection(&c.id).unwrap().watch_user, changed.watch_user);
+        assert!(logins(&db).is_empty());
+        db.save_sync(&c.id, &[], Some(&list("someone-else")))
+            .unwrap();
+        db.delete_connection(&c.id).unwrap();
+        assert!(logins(&db).is_empty());
     }
 
     #[test]
