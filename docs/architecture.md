@@ -9,6 +9,7 @@ flowchart TD
   API --> Jira["Jira connector"]
   API --> GitLab["GitLab connector"]
   API --> GitHub["GitHub connector (read only)"]
+  API --> Fedora["Fedora Forge connector (Forgejo, read only)"]
   API --> Plugins["Connector plugins"]
 ```
 
@@ -20,7 +21,7 @@ Both clients operate on the same API. The CLI is not a second database writer. T
 - **Item:** local ID namespaced by connection, remote identity, source URL, unmodified source status, derived outcome and the reason for it, attention category, the reasons it waits on the account (if it does), source update time, optional effort, and its connection's zone. Manually added items have no connection and are internal.
 - **Watch list:** what a GitHub connection found by watching another user, as of its last sync. It is stored apart from items, in its own table, so it never reaches the inbox, efforts or the external export.
 - **Effort:** a manually named outcome with notes and linked items spanning services and hosts. It persists independently of agent sessions. Progress counts only delivered linked items. Closed-without-delivery and unknown items need attention, and abandoned items leave the total.
-- **Outcome:** open, delivered, closed without delivery, abandoned or unknown, derived per connector in `src/outcome.rs`: GitLab from the merge request or issue state, Jira from the status category and the resolution, GitHub from whether a pull request merged and an issue's `state_reason` (completed is delivered; not planned, duplicate or no reason is closed without delivery), manual items from an explicit choice. Abandoned is a person's decision; for synced items it is kept in its own column, so syncs preserve it like effort links.
+- **Outcome:** open, delivered, closed without delivery, abandoned or unknown, derived per connector in `src/outcome.rs`: GitLab from the merge request or issue state, Jira from the status category and the resolution, GitHub from whether a pull request merged and an issue's `state_reason` (completed is delivered; not planned, duplicate or no reason is closed without delivery), Fedora Forge (Forgejo) from whether a pull request merged, with every closed issue closed without delivery since Forgejo records no reason, manual items from an explicit choice. Abandoned is a person's decision; for synced items it is kept in its own column, so syncs preserve it like effort links.
 
 The SQLite schema version is kept in `user_version`. Opening an older database copies it to `work.vN.sqlite`, then migrates it in one transaction; a newer one is refused.
 
@@ -36,7 +37,7 @@ An item's zone is always read from its connection, never from what its own row s
 
 ## Connectors
 
-Connectors implement one interface, `Connector` in `src/connector.rs`: verify the account a credential belongs to, list the items relevant to it, and refresh tracked items, with typed errors (auth, transient, inaccessible item, invalid). Listed items carry the reasons they wait on the account; a connector that lists an item from several queries reports it once, with every reason. Jira, GitLab and GitHub are built in, in `src/connectors/`; the other sources can be served by a connector plugin, an executable in the data directory's `plugins` directory run out of process (`src/connectors/plugin.rs`). `connectors::for_provider` picks the connector. The service passes the credential with each call. `connector::sync` runs a sync the same way for every connector and checks what it returns before anything is stored. The interface's types are also a versioned JSON protocol for third-party plugins; see `docs/plugins.md` for the protocol and why built-in connectors run in process.
+Connectors implement one interface, `Connector` in `src/connector.rs`: verify the account a credential belongs to, list the items relevant to it, and refresh tracked items, with typed errors (auth, transient, inaccessible item, invalid). Listed items carry the reasons they wait on the account; a connector that lists an item from several queries reports it once, with every reason. Jira, GitLab, GitHub and Fedora Forge (Forgejo) are built in, in `src/connectors/`; the other sources can be served by a connector plugin, an executable in the data directory's `plugins` directory run out of process (`src/connectors/plugin.rs`). `connectors::for_provider` picks the connector. The service passes the credential with each call. `connector::sync` runs a sync the same way for every connector and checks what it returns before anything is stored. The interface's types are also a versioned JSON protocol for third-party plugins; see `docs/plugins.md` for the protocol and why built-in connectors run in process.
 
 ## GitHub is read only
 
@@ -46,7 +47,7 @@ The GitHub connector holds a token that may be able to write: for testing it is 
 - `POST` to the GraphQL endpoint passes only with a JSON body of a `query` document and optional `variables`, when the document parses and every operation in it is a query. A mutation or subscription anywhere in it, even next to queries, an `operationName`, or anything else in the body refuses it. The document sent is printed from what was parsed, so GitHub reads what was checked;
 - everything else is refused before it is sent, and counted.
 
-Its HTTP client is private to that module, and clippy (`clippy.toml`, run with warnings denied) refuses the calls that could send another method anywhere in the crate unless marked as an exception. There are two exceptions: the read-only client's one send, after its check, and the CLI's calls to its own local service. reqwest sends a request through one of three paths, and each is covered:
+Its HTTP client is private to that module, and clippy (`clippy.toml`, run with warnings denied) refuses the calls that could send another method anywhere in the crate unless marked as an exception. There are three exceptions: the one send of each read-only client, GitHub's and Fedora Forge's (below), after its check, and the CLI's calls to its own local service. reqwest sends a request through one of three paths, and each is covered:
 
 - `Client::execute`, on a client or a reference to one: refused, since it sends a `Request` of any method;
 - tower's `Service::call`, which `Client` and `&Client` implement, also when reached generically through `axum::ServiceExt`: refused, for the same reason;
@@ -55,6 +56,12 @@ Its HTTP client is private to that module, and clippy (`clippy.toml`, run with w
 An HTTP client other than reqwest would need a new dependency, which review would see. Each sync result says what was sent, by method, how many answers came back unchanged, and how many requests were refused.
 
 The connector reads with REST search, whose quota is separate from GraphQL's. Searches are capped at GitHub's 1000 results, page on while GitHub counts more results than it returned, and fail rather than return part of them. Answers with an ETag are kept while the service runs, bounded in number and bytes and keyed by a hash of the token, so later requests ask conditionally, which doesn't count against the rate limit when nothing changed. A used-up rate limit fails the sync as transient and stops further requests until it frees up: for a primary limit (`x-ratelimit-remaining: 0`), only the requests of that resource (core, search or GraphQL); for a secondary limit (`retry-after`, or a refusal whose body says it hit one, then waited out for a minute), every request with that token. A tracked issue whose repository was transferred redirects; it is fetched at its new place once, if that is under the same API root, and is otherwise unknown. Scheduled syncs come later.
+
+## Fedora Forge is read only
+
+Fedora Forge is forge.fedoraproject.org, a Forgejo instance; [connectors/fedora-forge.md](connectors/fedora-forge.md) records how that was found, and why Fedora's Pagure dist-git has no connector. Its connector (`src/connectors/forgejo/`) is read-only the same way as GitHub's: `readonly.rs` is the only way to the instance, and its single send passes `GET` and `HEAD` requests without a body under the instance's `api/v1/`, on the same origin and without credentials in the URL, and refuses everything else before it is sent, counting it. The token goes in `Authorization: token ...`; a token with only the `read:user`, `read:issue` and `read:repository` scopes is enough, and can't write anyway.
+
+Listings page with `limit` and `page` up to Forgejo's `x-total-count`, at most 1000 results, and fail rather than return part of them: past the cap, on an empty page short of the count, or when the count changes between pages, since a result could have moved from one page to another. Forgejo sends no ETags, so its requests are never conditional. It has no rate limit of its own; if it, or a proxy in front of it, answers 429 (or 503 with `retry-after`), the sync fails as transient and no request with that token goes to that instance until the wait is over (`retry-after`, or a minute). A renamed repository redirects, and is followed once if the new address is in the same API, as on GitHub.
 
 ## Mine
 
@@ -65,6 +72,7 @@ Where the reasons come from:
 - GitHub: searches for `review-requested:@me` and `user-review-requested:@me` (GitHub refuses `team-review-requested:@me`, so team requests are those the first finds beyond the second), `assignee:@me`, and the account's open pull requests with `review:changes_requested` or `status:failure`. Its other open pull requests are in the inbox, waiting, without a reason.
 - GitLab: open merge requests assigned to the account or asking its review, and its pending To-Do items (`/todos`) on merge requests and issues. To-dos on commits, epics and designs aren't items yet.
 - Jira: the unresolved issues assigned to the account.
+- Fedora Forge: Forgejo's issue search (`/repos/issues/search`) with `review_requested` (pull requests), `assigned` and `mentioned`. The review filter matches requests to the account's teams too, so each pull request's `requested_reviewers` tells a direct request from a team one. The account's own open pull requests (`created`) are in the inbox, waiting, without a reason; Forgejo's search can't tell which have changes requested or failing checks. Notifications aren't read: they cover every repository the account watches.
 
 A GitHub connection can also watch another login's activity (`connect --watch-user`, `workboard watch`, `PATCH /api/connections/:id`), a setting of its own, for when the token isn't that person's: `review-requested:LOGIN` (a team request unless `user-review-requested:LOGIN` also finds it), `assignee:LOGIN` and `author:LOGIN`. The searches run with the connection's token, so they find what that token can see, private repositories included. What they find is listed under Watching, with the watched login, and never as the account's. A watch that fails, such as for a renamed login, doesn't fail the account's own sync: the last list found for that login stays, with the error, in `mine` and the sync result.
 
@@ -95,7 +103,7 @@ Live source requests only read: GET, and for GitHub, GraphQL queries checked as 
 
 1. Validate Jira Data Center and internal GitLab connectors against the user's actual instances. Use dedicated test credentials in the local application, never chat.
 2. Specify Errata's exact API and authentication. Model advisory readiness independently of individual PR completion.
-3. Implement the Fedora Forge adapter, preserving instance/account identity and explicit credential selection.
+3. Decide whether Fedora's package dist-git, still Pagure on src.fedoraproject.org while it moves to Forgejo, gets a connector of its own first (see `docs/connectors/fedora-forge.md`).
 4. Add credential backends for OS keychain, mounted Podman secret files and existing CLI logins. Define credential renewal and revocation explicitly.
 5. Add configurable prioritization, persisted source refresh schedules and bounded retries.
 6. For hosted use, add user ownership to every connection, item and effort before exposing a listener. Add OIDC login and per-user encrypted credentials with a separate deployment key.
@@ -109,3 +117,5 @@ Live source requests only read: GET, and for GitHub, GraphQL queries checked as 
 - https://developer.atlassian.com/server/jira/platform/personal-access-token/
 - https://developer.atlassian.com/server/jira/platform/rest/v10000/api-group-search/
 - https://github.com/pingdotgg/t3code/blob/main/docs/user/source-control.md
+- https://forgejo.org/docs/v15.0/user/api-usage/
+- https://forgejo.org/docs/v15.0/user/token-scope/

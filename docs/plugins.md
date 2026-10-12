@@ -6,7 +6,7 @@ A connector reads one kind of source (Jira, GitLab, GitHub, ...) for one account
 
 The contract is a versioned JSON protocol, described below. Two kinds of connectors implement it:
 
-- **Built-in connectors** (Jira Data Center, GitLab and GitHub today) are Rust code in the service, behind the `Connector` trait in `src/connector.rs`. The trait's types are the protocol's messages, so a built-in connector answers exactly what a plugin would.
+- **Built-in connectors** (Jira Data Center, GitLab, GitHub and Fedora Forge today) are Rust code in the service, behind the `Connector` trait in `src/connector.rs`. The trait's types are the protocol's messages, so a built-in connector answers exactly what a plugin would.
 - **Third-party plugins** are executables that speak the protocol as JSON over standard input and output. They can be written in any language and run in their own process.
 
 Why not just one of them:
@@ -20,13 +20,13 @@ A separate process is isolation from crashes, hangs and the service's memory, no
 
 ## Installing a plugin
 
-A plugin serves one of the sources that has no built-in connector yet (`fedora` or `errata`). Put an executable named after the source in the `plugins` directory of the data directory, such as `~/.local/share/workboard/plugins/errata`, then connect as with any other source:
+A plugin serves a source that has no built-in connector yet, which today is `errata`. Put an executable named after the source in the `plugins` directory of the data directory, such as `~/.local/share/workboard/plugins/errata`, then connect as with any other source:
 
 ```sh
 workboard connect errata --url https://errata.example.com/ --label Errata --token-env WORKBOARD_ERRATA_TOKEN
 ```
 
-Jira, GitLab and GitHub always use their built-in connectors. `tests/plugins/fake-forge` is a small plugin in Python, used by the tests.
+Jira, GitLab, GitHub and Fedora Forge always use their built-in connectors. `tests/plugins/fake-forge` is a small plugin in Python, used by the tests.
 
 Workboard runs a plugin:
 
