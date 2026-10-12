@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -128,6 +129,44 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert item['status'] == 'Released' and item['outcome'] == 'delivered' and item['outcome_reason']
         assert token.encode() not in json.dumps(snapshot).encode()
         assert call('/api/connections','POST',{'provider':'jira','base_url':'https://jira.example.invalid','label':'Jira','token':''},token=token)[0] == 400
+        # A connector plugin with an internal and an external connection:
+        # only the external one's work leaves, even from an effort that mixes them.
+        plugins = root / 'plugins'
+        plugins.mkdir(mode=0o700)
+        shutil.copy(Path(__file__).resolve().parent / 'plugins' / 'fake-forge', plugins / 'errata')
+        plugin_env = dict(os.environ, WORKBOARD_SMOKE_TOKEN='test-only-token')
+        def connect(url, *extra):
+            return subprocess.check_output(command + ['connect','errata','--url',url,'--label',url,'--token-env','WORKBOARD_SMOKE_TOKEN',*extra], env=plugin_env, text=True)
+        assert 'internal' in connect('https://errata.example.invalid/')
+        assert 'external' in connect('https://forge.example/', '--external')
+        # A plugin that echoes the credential as the account name isn't connected.
+        echo = subprocess.run(command + ['connect','errata','--url','https://echo-account.example/','--token-env','WORKBOARD_SMOKE_TOKEN'], env=plugin_env, capture_output=True, text=True)
+        assert echo.returncode != 0 and 'test-only-token' not in echo.stdout + echo.stderr, echo
+        subprocess.check_call(command + ['sync'], stdout=subprocess.DEVNULL)
+        body = call('/api/snapshot', token=token)[2]
+        assert b'test-only-token' not in body
+        synced = [i for i in json.loads(body)['items'] if i['connection_id']]
+        assert len(synced) == 4 and {i['zone'] for i in synced} == {'internal','external'}, synced
+        internal_item = next(i['id'] for i in synced if i['zone'] == 'internal')
+        external_items = sorted(i['id'] for i in synced if i['zone'] == 'external')
+        mixed = {'title':'Mixed zones','note':'internal-only note','item_ids':[internal_item, external_items[0]]}
+        status, _, body = call('/api/efforts', 'POST', mixed, token=token)
+        assert status == 200
+        mixed_id = json.loads(body)['id']
+        exported = subprocess.check_output(command + ['export','--external'], text=True)
+        assert 'errata.example.invalid' not in exported and internal_item not in exported, exported
+        assert 'internal-only note' not in exported and 'test-only-token' not in exported, exported
+        assert 'Mixed zones' not in exported, exported
+        exported = json.loads(exported)
+        assert [c['base_url'] for c in exported['connections']] == ['https://forge.example/'], exported
+        assert sorted(i['id'] for i in exported['items']) == external_items, exported
+        [effort_out] = exported['efforts']
+        assert effort_out['title'] == 'Effort ' + mixed_id.replace('-', '')[:8], effort_out
+        assert effort_out['progress']['total'] == 1, effort_out
+        # Once shared, the title goes too.
+        subprocess.check_call(command + ['share-title', mixed_id], stdout=subprocess.DEVNULL)
+        [effort_out] = json.loads(subprocess.check_output(command + ['export','--external']))['efforts']
+        assert effort_out['title'] == 'Mixed zones', effort_out
         if os.name == 'posix':
             assert (root.stat().st_mode & 0o777) == 0o700
             assert ((root / 'service.token').stat().st_mode & 0o777) == 0o600
@@ -145,7 +184,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert call('/api/snapshot',token=token)[0] == 401
         snapshot = json.loads(call('/api/snapshot',token=fresh)[2])
         assert all(i['effort_id']==effort['id'] for i in snapshot['items'] if i['id'] in ['demo-4','demo-5'])
-        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, permissions and restart persistence')
+        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin, the external export, permissions and restart persistence')
     finally:
         if process.poll() is None:
             process.terminate()

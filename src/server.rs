@@ -133,7 +133,8 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         bail_api("Enter a connection name of 1–100 characters")?
     }
     let base = connectors::base_url(&input.base_url)?;
-    let source = connectors::builtin(&input.provider)?;
+    let plugins = app.db.lock().unwrap().root.join(connectors::PLUGINS_DIR);
+    let source = connectors::for_provider(&input.provider, &plugins)?;
     let target = Target::new(&base, &input.token)?;
     let account = connector::verify(source.as_ref(), &target).await?;
     let (id, name) = (account.id, account.name);
@@ -178,13 +179,14 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
     let connections = app.db.lock().unwrap().connections()?;
     let mut results = Vec::new();
     for mut c in connections {
-        let (token, old) = {
+        let (token, old, plugins) = {
             let db = app.db.lock().unwrap();
-            (db.secret(&c.id), db.items()?)
+            let plugins = db.root.join(connectors::PLUGINS_DIR);
+            (db.secret(&c.id), db.items()?, plugins)
         };
         let result = async {
             let token = token?;
-            let source = connectors::builtin(&c.provider)?;
+            let source = connectors::for_provider(&c.provider, &plugins)?;
             let target = Target::new(&c.base_url, &token)?;
             Ok::<_, anyhow::Error>(connector::sync(source.as_ref(), &target, &c, &old).await?)
         }

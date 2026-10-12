@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""A connector plugin for tests. It answers the plugin protocol in
+docs/plugins.md from canned data, and refuses to work unless Workboard runs it
+as promised: no arguments, nothing in the environment but PATH and LANG, and
+the credential on standard input only. Some instance hosts make it misbehave
+on purpose."""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+
+TOKEN = 'test-only-token'
+# Python may add LC_CTYPE itself when it coerces a C locale.
+ALLOWED_ENV = {'PATH', 'LANG', 'LC_CTYPE'}
+
+
+def answer(body):
+    json.dump({'protocol': 1, **body}, sys.stdout)
+    sys.exit(0)
+
+
+def error(kind, message):
+    answer({'error': {'kind': kind, 'message': message}})
+
+
+def helper():
+    """A long-running process in the plugin's process group."""
+    return subprocess.Popen(['sleep', '300'], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def item(remote_id, outcome, action='next'):
+    return {
+        'remote_id': remote_id,
+        'key': f'FF-{remote_id}',
+        'title': f'Fake change {remote_id}',
+        'url': f'https://forge.example/changes/{remote_id}',
+        'status': outcome,
+        'outcome': outcome,
+        'outcome_reason': f'Fake forge says {outcome}',
+        'action': action,
+        'updated_at': '2026-10-12T00:00:00Z',
+    }
+
+
+request = json.load(sys.stdin)
+if len(sys.argv) != 1:
+    error('invalid', 'Unexpected arguments')
+leaked = sorted(set(os.environ) - ALLOWED_ENV)
+if leaked:
+    error('invalid', 'Unexpected environment: ' + ', '.join(leaked))
+if request['protocol'] != 1:
+    error('invalid', 'Unknown protocol version')
+
+base_url = urllib.parse.urlsplit(request['instance']['base_url'])
+host = base_url.hostname
+if host == 'slow.example':
+    time.sleep(30)
+elif host == 'garbage.example':
+    print('not a protocol response')
+    sys.exit(0)
+elif host == 'future.example':
+    json.dump({'protocol': 2, 'account': {'id': '42', 'name': 'fixture'}}, sys.stdout)
+    sys.exit(0)
+elif host == 'crash.example':
+    sys.exit(3)
+elif host == 'silent.example':
+    answer({})
+elif host == 'denied.example':
+    error('auth', 'No access')
+elif host == 'flaky.example':
+    error('transient', 'Try later')
+elif host == 'gone.example':
+    error('inaccessible', 'Gone')
+elif host == 'echo.example':
+    error('transient', f"Rejected {request['credential']}")
+elif host == 'echo-account.example':
+    answer({'account': {'id': '42', 'name': f"Signed in with {request['credential']}"}})
+elif host == 'spawner.example':
+    # Answers, leaving a helper running.
+    answer({'account': {'id': '42', 'name': str(helper().pid)}})
+elif host == 'hang.example':
+    # Starts a helper, says where, and never answers.
+    with open(os.path.join(base_url.path, 'helper.pid'), 'w') as f:
+        f.write(str(helper().pid))
+    time.sleep(30)
+
+if request['credential'] != TOKEN:
+    error('auth', 'Credential rejected')
+method = request['method']
+if method == 'verify':
+    answer({'account': {'id': '42', 'name': 'fixture'}})
+if request['account']['id'] != '42':
+    error('invalid', 'Unexpected account')
+if method == 'list':
+    answer({'items': [item('1', 'open', 'review'), item('2', 'open')]})
+if method == 'refresh':
+    results = []
+    for tracked in request['items']:
+        remote_id = tracked['remote_id']
+        if remote_id.startswith('echo'):
+            results.append({'remote_id': remote_id, 'error': {
+                'kind': 'inaccessible',
+                'message': f"Not found with {request['credential']}"}})
+        elif remote_id.startswith('gone'):
+            results.append({'remote_id': remote_id, 'error': {
+                'kind': 'inaccessible',
+                'message': 'Fake forge returned HTTP 404 for this item'}})
+        else:
+            results.append({'remote_id': remote_id, 'item': item(remote_id, 'delivered')})
+    answer({'results': results})
+error('invalid', f'Unknown method {method}')

@@ -1,20 +1,22 @@
-//! The built-in connectors, and what they share: URL rules and an HTTP
+//! The connectors: Jira and GitLab built in, sharing URL rules and an HTTP
 //! client that keeps TLS verification, refuses redirects and never surfaces
-//! a remote response body.
+//! a remote response body; and third-party plugins run out of process.
 
 mod gitlab;
 mod jira;
+#[cfg(unix)]
+mod plugin;
 
 use crate::{
     connector::{
         Account, Connector, ConnectorError, ConnectorResult, ErrorKind, Refreshed, Target,
     },
-    model::is_gitlab,
+    model::{is_gitlab, valid_provider},
 };
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 use url::Url;
 
 pub fn base_url(raw: &str) -> Result<String> {
@@ -53,13 +55,42 @@ pub fn client() -> Result<Client> {
         .build()?)
 }
 
-/// The built-in connector for a provider.
-pub fn builtin(provider: &str) -> Result<Box<dyn Connector>> {
+/// Where a data directory keeps connector plugins: one executable per
+/// provider, named after it.
+pub const PLUGINS_DIR: &str = "plugins";
+
+/// The connector for a provider: built in for Jira and GitLab, otherwise the
+/// plugin named after the provider in `plugins`, if there is one.
+pub fn for_provider(provider: &str, plugins: &Path) -> Result<Box<dyn Connector>> {
     Ok(match provider {
         "jira" => Box::new(jira::Jira::new()?),
         p if is_gitlab(p) => Box::new(gitlab::GitLab::new()?),
-        _ => bail!("Live connection currently supports Jira Data Center and GitLab"),
+        p if valid_provider(p) => {
+            let program = std::path::absolute(plugins.join(p))?;
+            if !program.exists() {
+                bail!(
+                    "Live connection currently supports Jira Data Center and GitLab, and connector plugins such as {}",
+                    program.display()
+                )
+            }
+            plugin(p, &program)?
+        }
+        _ => bail!("Choose a supported source"),
     })
+}
+
+#[cfg(unix)]
+fn plugin(provider: &str, program: &Path) -> Result<Box<dyn Connector>> {
+    Ok(Box::new(plugin::Plugin::new(
+        provider,
+        program,
+        plugin::DEFAULT_TIMEOUT,
+    )?))
+}
+
+#[cfg(not(unix))]
+fn plugin(_: &str, _: &Path) -> Result<Box<dyn Connector>> {
+    bail!("Connector plugins need Linux or macOS")
 }
 
 /// What a request found.
@@ -222,16 +253,24 @@ mod tests {
         assert!(source_url("javascript:alert(1)").is_err());
     }
     #[test]
-    fn only_jira_and_gitlab_are_built_in() {
+    fn connectors_by_provider() {
+        let plugins = tempfile::tempdir().unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
+        // A plugin can serve a known source without a built-in connector,
+        // but neither replace a built-in one nor add an unknown source.
+        for name in ["errata", "jira", "bugzilla"] {
+            std::fs::copy(&script, plugins.path().join(name)).unwrap();
+        }
         for (provider, kind) in [
             ("jira", Some("jira")),
             ("gitlab-internal", Some("gitlab")),
             ("gitlab-public", Some("gitlab")),
+            ("errata", Some("errata")),
             ("github", None),
-            ("errata", None),
+            ("bugzilla", None),
         ] {
             assert_eq!(
-                builtin(provider)
+                for_provider(provider, plugins.path())
                     .ok()
                     .map(|c| c.kind().to_string())
                     .as_deref(),
