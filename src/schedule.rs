@@ -1,0 +1,1268 @@
+//! Scheduled sync: the service keeps every connection fresh on its own, with
+//! no model involved.
+//!
+//! Each connection syncs on its own interval, with jitter, in a task of its
+//! own, so a slow or failing source never holds up another; and never
+//! alongside itself: an explicit sync joins one already running instead of
+//! starting a second. A failure backs off exponentially, up to a cap; a
+//! source's rate-limit hold defers the next sync until it ends; a rejected
+//! credential stops scheduled syncs until the person verifies it again or
+//! reconnects. What a sync found is saved with the connection's sync state,
+//! in one transaction, only once the sync processed it ([`Db::save_sync`]),
+//! so a sync that stops halfway leaves the last good data and is due again.
+
+use crate::{
+    clock::{Clock, Timestamp},
+    connector::{self, Connector, Requests, Target},
+    connectors,
+    db::Db,
+    model::{Connection, ErrorKind, Schedule, SyncState},
+};
+use anyhow::{bail, Result};
+use serde::Serialize;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Duration,
+};
+use tokio::sync::{watch, Notify, OwnedMutexGuard};
+
+/// How often a connection syncs unless it, or the service, says otherwise.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The shortest sync interval accepted, to spare the sources.
+pub const MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// The longest sync interval accepted.
+pub const MAX_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How far a wait moves at random, as a share of it, so connections that
+/// started together drift apart and no source sees a fixed beat.
+const JITTER: f64 = 0.1;
+/// The wait after a first failure, doubled after each next one.
+const FIRST_BACKOFF: Duration = Duration::from_secs(60);
+/// The longest wait after failures.
+const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60);
+/// The longest the scheduler sleeps before it looks again, so it soon
+/// notices a clock that jumped, as when a laptop wakes.
+const MAX_SLEEP: Duration = Duration::from_secs(30);
+/// The shortest it sleeps, so nothing it can't start makes it spin.
+const MIN_SLEEP: Duration = Duration::from_secs(1);
+
+/// When connections sync.
+#[derive(Debug, Clone, Copy)]
+pub struct Policy {
+    /// The interval of a connection that has none of its own.
+    pub interval: Duration,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_INTERVAL,
+        }
+    }
+}
+
+impl Policy {
+    /// How often `c` syncs.
+    pub fn interval(&self, c: &Connection) -> Duration {
+        c.sync_interval.map_or(self.interval, Duration::from_secs)
+    }
+    /// When the next scheduled sync of `c` is due, after one that finished
+    /// at `now` and left `state`: an interval after a success, a backoff
+    /// after a failure, and not before a hold the source asked for ends.
+    /// None after a rejected credential, which needs the person. `sample`,
+    /// from 0 to 1, picks the jitter.
+    pub fn next_due(
+        &self,
+        c: &Connection,
+        state: &SyncState,
+        now: Timestamp,
+        sample: f64,
+    ) -> Option<Timestamp> {
+        let wait = match state.error_kind {
+            None => jitter(self.interval(c), sample),
+            Some(ErrorKind::Auth) => return None,
+            // Capped after the jitter, so no backoff is longer than the cap.
+            Some(_) => jitter(backoff(state.failures), sample).min(MAX_BACKOFF),
+        };
+        let due = now.after(wait);
+        Some(state.held_until.map_or(due, |held| due.max(held)))
+    }
+}
+
+/// Whether `interval` may be a sync interval.
+pub fn check_interval(interval: Duration) -> Result<()> {
+    if !(MIN_INTERVAL..=MAX_INTERVAL).contains(&interval) {
+        bail!("Choose a sync interval from 1m to 7d")
+    }
+    Ok(())
+}
+
+/// The wait after `failures` failures in a row: [`FIRST_BACKOFF`], doubled
+/// for each further one, up to [`MAX_BACKOFF`].
+pub fn backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    FIRST_BACKOFF
+        .saturating_mul(1 << doublings)
+        .min(MAX_BACKOFF)
+}
+
+/// `wait`, moved by up to [`JITTER`] of it either way: a `sample` of 0 is
+/// the shortest, 0.5 leaves it, and one near 1 is the longest.
+pub fn jitter(wait: Duration, sample: f64) -> Duration {
+    let sample = if sample.is_finite() {
+        sample.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    wait.mul_f64(1.0 + JITTER * (2.0 * sample - 1.0))
+}
+
+/// A random sample from 0 up to 1, for the jitter.
+fn random_sample() -> f64 {
+    // The low 53 bits of a random UUID, which its version and variant bits
+    // leave alone: as many as an f64 holds exactly.
+    const BITS: u32 = 53;
+    let bits = uuid::Uuid::new_v4().as_u128() & ((1 << BITS) - 1);
+    bits as f64 / (1u64 << BITS) as f64
+}
+
+/// Where the scheduler gets a connector for a provider.
+pub trait Sources: Send + Sync {
+    fn connector(&self, provider: &str) -> Result<Box<dyn Connector>>;
+}
+
+/// The built-in connectors and the data directory's plugins, sharing what
+/// GitHub and Forgejo remember between syncs.
+pub struct Builtin {
+    pub plugins: PathBuf,
+    pub shared: connectors::Shared,
+}
+
+impl Sources for Builtin {
+    fn connector(&self, provider: &str) -> Result<Box<dyn Connector>> {
+        connectors::for_provider(provider, &self.plugins, &self.shared)
+    }
+}
+
+/// What started a sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+    /// The schedule.
+    Scheduled,
+    /// A person, from the CLI, the API or the page.
+    Explicit,
+}
+
+/// What watching another user found in a sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Watched {
+    pub login: String,
+    pub items: usize,
+    pub error: Option<String>,
+}
+
+/// What one sync of one connection did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Report {
+    pub connection: String,
+    pub label: String,
+    /// What started it.
+    pub trigger: Trigger,
+    /// This asked for a sync while one was running, and got that one's
+    /// result instead of starting a second.
+    pub coalesced: bool,
+    /// How many items it saved, if it succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watched: Option<Watched>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<ErrorKind>,
+    /// What the connector sent, for those that count, so a person can check
+    /// that a sync only read.
+    pub requests: Option<Requests>,
+    /// When the next scheduled sync is due.
+    pub next_due: Option<Timestamp>,
+}
+
+impl Report {
+    fn new(connection: &str, label: &str, trigger: Trigger) -> Self {
+        Self {
+            connection: connection.into(),
+            label: label.into(),
+            trigger,
+            coalesced: false,
+            items: None,
+            watched: None,
+            error: None,
+            error_kind: None,
+            requests: None,
+            next_due: None,
+        }
+    }
+    fn failed(mut self, error: &anyhow::Error) -> Self {
+        let state = SyncState::default().failed(Timestamp::from_unix(0), error);
+        self.error = state.error;
+        self.error_kind = state.error_kind;
+        self
+    }
+}
+
+/// A sync started or joined, to wait for.
+pub struct Pending {
+    connection: String,
+    label: String,
+    trigger: Trigger,
+    coalesced: bool,
+    done: watch::Receiver<Option<Report>>,
+}
+
+impl Pending {
+    /// What the sync did.
+    pub async fn report(mut self) -> Report {
+        let report = match self.done.wait_for(Option::is_some).await {
+            Ok(report) => report.clone(),
+            Err(_) => None,
+        };
+        match report {
+            Some(report) => Report {
+                coalesced: self.coalesced,
+                ..report
+            },
+            // Its task ended without a report, as when the service stops.
+            None => {
+                Report::new(&self.connection, &self.label, self.trigger).failed(&anyhow::anyhow!(
+                    "The sync was interrupted; nothing was saved, and it is due again"
+                ))
+            }
+        }
+    }
+}
+
+/// Keeps a connection marked running until its sync's task ends, however it
+/// ends.
+struct Running {
+    scheduler: Arc<Scheduler>,
+    connection: String,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        lock(&self.scheduler.running).remove(&self.connection);
+        self.scheduler.wake.notify_one();
+    }
+}
+
+/// A std mutex's guard, whether or not a panic poisoned it: nothing it
+/// guards is left half-changed.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs every connection's syncs: on schedule, and when a person asks.
+pub struct Scheduler {
+    db: Arc<Mutex<Db>>,
+    sources: Box<dyn Sources>,
+    clock: Arc<dyn Clock>,
+    policy: Policy,
+    /// Picks each jitter, from 0 to 1.
+    sample: Box<dyn Fn() -> f64 + Send + Sync>,
+    /// The syncs running now, by connection, for others to join.
+    running: Mutex<HashMap<String, watch::Receiver<Option<Report>>>>,
+    /// When each connection's last sync in this process started. One whose
+    /// state couldn't be saved waits a backoff before it is tried again.
+    attempts: Mutex<HashMap<String, Timestamp>>,
+    /// One per connection, held by its sync and by changes to it, such as a
+    /// new watch or a disconnect, so they never overlap.
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Wakes the schedule to look again.
+    wake: Notify,
+}
+
+impl Scheduler {
+    pub fn new(
+        db: Arc<Mutex<Db>>,
+        sources: Box<dyn Sources>,
+        clock: Arc<dyn Clock>,
+        policy: Policy,
+    ) -> Arc<Self> {
+        Self::with_sample(db, sources, clock, policy, Box::new(random_sample))
+    }
+    fn with_sample(
+        db: Arc<Mutex<Db>>,
+        sources: Box<dyn Sources>,
+        clock: Arc<dyn Clock>,
+        policy: Policy,
+        sample: Box<dyn Fn() -> f64 + Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            sources,
+            clock,
+            policy,
+            sample,
+            running: Mutex::default(),
+            attempts: Mutex::default(),
+            locks: Mutex::default(),
+            wake: Notify::new(),
+        })
+    }
+    fn db(&self) -> MutexGuard<'_, Db> {
+        lock(&self.db)
+    }
+    pub fn now(&self) -> Timestamp {
+        Timestamp::of(self.clock.now())
+    }
+    /// The connector for `provider`.
+    pub fn connector(&self, provider: &str) -> Result<Box<dyn Connector>> {
+        self.sources.connector(provider)
+    }
+    /// Look at the schedule again, as after a connection was added or
+    /// changed.
+    pub fn wake(&self) {
+        self.wake.notify_one();
+    }
+    /// Hold connection `id` against its syncs and other changes until the
+    /// guard is dropped.
+    pub async fn hold(&self, id: &str) -> OwnedMutexGuard<()> {
+        let mutex = lock(&self.locks).entry(id.into()).or_default().clone();
+        mutex.lock_owned().await
+    }
+    /// Drop what the scheduler kept about connection `id`, once it is
+    /// disconnected.
+    pub fn forget(&self, id: &str) {
+        lock(&self.attempts).remove(id);
+        lock(&self.locks).remove(id);
+    }
+    fn is_running(&self, id: &str) -> bool {
+        lock(&self.running).contains_key(id)
+    }
+    /// Fill in how each connection is scheduled.
+    pub fn annotate(&self, connections: &mut [Connection]) {
+        for c in connections {
+            c.schedule = Schedule {
+                interval_secs: self.policy.interval(c).as_secs(),
+                running: self.is_running(&c.id),
+                needs_user: c.sync.error_kind == Some(ErrorKind::Auth),
+            };
+        }
+    }
+    /// When `c` is next due to sync on schedule: none while it runs or needs
+    /// the person, and now if it never was scheduled.
+    fn due_at(&self, c: &Connection, now: Timestamp) -> Option<Timestamp> {
+        if c.sync.error_kind == Some(ErrorKind::Auth) || self.is_running(&c.id) {
+            return None;
+        }
+        let due = c.sync.next_due.unwrap_or(now);
+        // A sync whose state couldn't be saved left no backoff behind.
+        let unsaved = lock(&self.attempts)
+            .get(&c.id)
+            .copied()
+            .filter(|at| c.sync.last_attempt.is_none_or(|saved| saved < *at));
+        Some(unsaved.map_or(due, |at| due.max(at.after(FIRST_BACKOFF))))
+    }
+    /// The connections due to sync on schedule now.
+    pub fn due(&self) -> Result<Vec<String>> {
+        let now = self.now();
+        let connections = self.db().connections()?;
+        Ok(connections
+            .into_iter()
+            .filter(|c| self.due_at(c, now).is_some_and(|due| due <= now))
+            .map(|c| c.id)
+            .collect())
+    }
+    /// Start the syncs that are due.
+    pub fn tick(self: &Arc<Self>) -> Result<Vec<Pending>> {
+        Ok(self
+            .due()?
+            .iter()
+            .map(|id| self.start(id, Trigger::Scheduled))
+            .collect())
+    }
+    /// How long to sleep before the next sync is due, within bounds.
+    fn sleep(&self) -> Duration {
+        let now = self.now();
+        let soonest = match self.db().connections() {
+            Ok(connections) => connections.iter().filter_map(|c| self.due_at(c, now)).min(),
+            Err(_) => None,
+        };
+        soonest
+            .map_or(MAX_SLEEP, |due| due.since(now))
+            .clamp(MIN_SLEEP, MAX_SLEEP)
+    }
+    /// Sync every connection when it is due, for as long as the service
+    /// runs.
+    pub async fn serve(self: Arc<Self>) {
+        loop {
+            if let Err(e) = self.tick() {
+                eprintln!("Cannot start scheduled syncs: {e:#}");
+            }
+            tokio::select! {
+                () = tokio::time::sleep(self.sleep()) => (),
+                () = self.wake.notified() => (),
+            }
+        }
+    }
+    /// Start a sync of connection `id`, or join the one running.
+    pub fn start(self: &Arc<Self>, id: &str, trigger: Trigger) -> Pending {
+        // For a report of a sync that never reports itself.
+        let label = self
+            .db()
+            .connection(id)
+            .map_or_else(|_| id.to_string(), |c| c.label);
+        let (send, done) = {
+            let mut running = lock(&self.running);
+            if let Some(done) = running.get(id) {
+                return Pending {
+                    connection: id.into(),
+                    label,
+                    trigger,
+                    coalesced: true,
+                    done: done.clone(),
+                };
+            }
+            let (send, done) = watch::channel(None);
+            running.insert(id.into(), done.clone());
+            (send, done)
+        };
+        let marked = Running {
+            scheduler: self.clone(),
+            connection: id.into(),
+        };
+        let this = self.clone();
+        let connection = id.to_string();
+        tokio::spawn(async move {
+            let report = this.run(&connection, trigger).await;
+            // No longer running before anyone hears it ended, so a sync
+            // asked for after that starts afresh.
+            drop(marked);
+            send.send_replace(Some(report));
+        });
+        Pending {
+            connection: id.into(),
+            label,
+            trigger,
+            coalesced: false,
+            done,
+        }
+    }
+    /// Sync connection `id` now, or join the sync running, and say what it
+    /// did.
+    pub async fn sync(self: &Arc<Self>, id: &str, trigger: Trigger) -> Report {
+        self.start(id, trigger).report().await
+    }
+    /// Sync every connection now, side by side, joining those running.
+    pub async fn sync_all(self: &Arc<Self>, trigger: Trigger) -> Result<Vec<Report>> {
+        let connections = self.db().connections()?;
+        let pending: Vec<_> = connections
+            .iter()
+            .map(|c| self.start(&c.id, trigger))
+            .collect();
+        let mut reports = Vec::new();
+        for p in pending {
+            reports.push(p.report().await);
+        }
+        Ok(reports)
+    }
+    /// One sync of connection `id`, start to end: what it found and its
+    /// state are saved together once it is processed, or, if it failed,
+    /// only its state.
+    async fn run(&self, id: &str, trigger: Trigger) -> Report {
+        let _held = self.hold(id).await;
+        let started = self.now();
+        lock(&self.attempts).insert(id.into(), started);
+        let loaded = {
+            let db = self.db();
+            db.connection(id).and_then(|c| {
+                let last = db.watched()?.into_iter().find(|w| w.connection_id == c.id);
+                Ok((db.secret(&c.id), db.items()?, last, c))
+            })
+        };
+        let (token, old, last, c) = match loaded {
+            Ok(loaded) => loaded,
+            // Its label is unknown too, so its ID stands in.
+            Err(e) => return Report::new(id, id, trigger).failed(&e),
+        };
+        let mut report = Report::new(id, &c.label, trigger);
+        let source = self.sources.connector(&c.provider);
+        let result = async {
+            let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let target = Target::new(&c.base_url, &token?)?;
+            Ok::<_, anyhow::Error>(
+                connector::sync_and_watch(
+                    source.as_ref(),
+                    &target,
+                    &c,
+                    &old,
+                    last.as_ref(),
+                    started,
+                )
+                .await?,
+            )
+        }
+        .await;
+        report.requests = source.ok().and_then(|s| s.requests());
+        let finished = self.now();
+        let sample = (self.sample)();
+        let mut db = self.db();
+        let saved = match result {
+            Ok((items, watched)) => {
+                let mut state = c.sync.succeeded(started);
+                state.next_due = self.policy.next_due(&c, &state, finished, sample);
+                report.items = Some(items.len());
+                report.watched = watched.as_ref().map(|w| Watched {
+                    login: w.login.clone(),
+                    items: w.items.len(),
+                    error: w.error.clone(),
+                });
+                db.save_sync(&c.id, &items, watched.as_ref(), &state)
+                    .map(|()| state)
+            }
+            Err(e) => {
+                let mut state = c.sync.failed(started, &e);
+                state.next_due = self.policy.next_due(&c, &state, finished, sample);
+                report.error = state.error.clone();
+                report.error_kind = state.error_kind;
+                db.save_sync_state(&c.id, &state).map(|()| state)
+            }
+        };
+        match saved {
+            Ok(state) => report.next_due = state.next_due,
+            Err(e) => {
+                report.items = None;
+                report.watched = None;
+                report = report.failed(&anyhow::anyhow!("Cannot save what the sync found: {e:#}"));
+            }
+        }
+        report
+    }
+    /// Check connection `id`'s credential again, or a new one for the same
+    /// account, which replaces it, and schedule a sync now. This is how a
+    /// connection whose credential was rejected gets its scheduled syncs
+    /// back once the person fixed it.
+    pub async fn verify(&self, id: &str, token: Option<&str>) -> Result<Connection> {
+        let _held = self.hold(id).await;
+        let (c, stored) = {
+            let db = self.db();
+            let c = db.connection(id)?;
+            let stored = db.secret(id);
+            (c, stored)
+        };
+        let target = Target::new(
+            &c.base_url,
+            &match token {
+                Some(token) => token.to_string(),
+                None => stored?,
+            },
+        )?;
+        let source = self.sources.connector(&c.provider)?;
+        let account = connector::verify(source.as_ref(), &target).await?;
+        if account.id != c.account_id {
+            bail!(
+                "That credential belongs to {}, not {}; connect it as a separate connection",
+                account.name,
+                c.account_name
+            )
+        }
+        let state = SyncState {
+            next_due: Some(self.now()),
+            failures: 0,
+            error_kind: None,
+            error: None,
+            held_until: None,
+            ..c.sync.clone()
+        };
+        let mut db = self.db();
+        // A new credential is staged first and put in place only once the
+        // state is saved. A crash in between leaves the old credential with
+        // the schedule back, which fails as before and stops it again, never
+        // the new credential with the schedule stopped; verifying again
+        // recovers either way. The connection's lock keeps its syncs out
+        // until the credential is in place.
+        let staged = token
+            .map(|_| db.stage_secret(id, target.credential.expose()))
+            .transpose()?;
+        db.save_sync_state(id, &state)?;
+        if let Some(staged) = staged {
+            db.install_secret(id, &staged)?;
+        }
+        let mut c = db.connection(id)?;
+        drop(db);
+        self.annotate(std::slice::from_mut(&mut c));
+        self.wake();
+        Ok(c)
+    }
+    /// Give connection `id` its own sync interval, or with `None` the
+    /// service's. A shorter one takes effect now, a longer one after the
+    /// sync already due.
+    pub async fn set_interval(&self, id: &str, interval: Option<Duration>) -> Result<Connection> {
+        if let Some(interval) = interval {
+            check_interval(interval)?;
+        }
+        let _held = self.hold(id).await;
+        let mut db = self.db();
+        let mut c = db.connection(id)?;
+        c.sync_interval = interval.map(|i| i.as_secs());
+        db.save_connection(&c)?;
+        if c.sync.error_kind.is_none() {
+            let sooner = self
+                .policy
+                .next_due(&c, &c.sync, self.now(), (self.sample)());
+            // One never scheduled is due now anyway.
+            let state = SyncState {
+                next_due: c
+                    .sync
+                    .next_due
+                    .map(|due| sooner.map_or(due, |sooner| due.min(sooner))),
+                ..c.sync.clone()
+            };
+            db.save_sync_state(id, &state)?;
+            c.sync = state;
+        }
+        drop(db);
+        self.annotate(std::slice::from_mut(&mut c));
+        self.wake();
+        Ok(c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        clock::ManualClock,
+        connector::{
+            Account, BoxFuture, ConnectorError, ConnectorResult, Refreshed, RemoteItem, Tracked,
+        },
+        db,
+        model::{Item, Outcome, Zone},
+    };
+    use std::collections::VecDeque;
+    use tokio::sync::Semaphore;
+
+    const TOKEN: &str = "test-only-token";
+    /// A token that belongs to another account.
+    const OTHER_ACCOUNT: &str = "other-account-token";
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// The sources, as the fake connectors see them: what each instance
+    /// answers to `list`, and how often it was asked.
+    #[derive(Default)]
+    struct World {
+        /// What `list` answers next, by instance host: a number of items,
+        /// or an error. Two items when nothing is queued.
+        answers: Mutex<HashMap<String, VecDeque<ConnectorResult<usize>>>>,
+        lists: Mutex<HashMap<String, usize>>,
+        /// Hosts whose `list` waits for a permit.
+        gates: Mutex<HashMap<String, Arc<Semaphore>>>,
+        /// Told when a gated `list` starts waiting.
+        entered: Notify,
+    }
+
+    impl World {
+        fn answer(&self, host: &str, answer: ConnectorResult<usize>) {
+            lock(&self.answers)
+                .entry(host.into())
+                .or_default()
+                .push_back(answer);
+        }
+        fn lists(&self, host: &str) -> usize {
+            lock(&self.lists).get(host).copied().unwrap_or_default()
+        }
+        fn gate(&self, host: &str) -> Arc<Semaphore> {
+            lock(&self.gates)
+                .entry(host.into())
+                .or_insert_with(|| Arc::new(Semaphore::new(0)))
+                .clone()
+        }
+    }
+
+    struct Fake(Arc<World>);
+
+    fn host(target: &Target) -> String {
+        target.base_url.host_str().unwrap_or_default().into()
+    }
+
+    impl Connector for Fake {
+        fn kind(&self) -> &str {
+            "fake"
+        }
+        fn verify<'a>(&'a self, target: &'a Target) -> BoxFuture<'a, ConnectorResult<Account>> {
+            let id = if target.credential.expose() == OTHER_ACCOUNT {
+                "43"
+            } else {
+                "42"
+            };
+            Box::pin(async move {
+                Ok(Account {
+                    id: id.into(),
+                    name: format!("user{id}"),
+                })
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            target: &'a Target,
+            _: &'a Account,
+        ) -> BoxFuture<'a, ConnectorResult<Vec<RemoteItem>>> {
+            Box::pin(async move {
+                let host = host(target);
+                *lock(&self.0.lists).entry(host.clone()).or_default() += 1;
+                let gate = lock(&self.0.gates).get(&host).cloned();
+                if let Some(gate) = gate {
+                    self.0.entered.notify_one();
+                    gate.acquire().await.unwrap().forget();
+                }
+                let answer = lock(&self.0.answers)
+                    .get_mut(&host)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(Ok(2));
+                Ok((0..answer?)
+                    .map(|n| RemoteItem {
+                        remote_id: n.to_string(),
+                        key: format!("{host}-{n}"),
+                        title: format!("Item {n} of {host}"),
+                        url: format!("https://{host}/{n}"),
+                        status: "open".into(),
+                        outcome: Outcome::Open,
+                        outcome_reason: "Open".into(),
+                        action: "next".into(),
+                        updated_at: "2026-10-12T00:00:00Z".into(),
+                        reasons: vec![],
+                    })
+                    .collect())
+            })
+        }
+        fn refresh<'a>(
+            &'a self,
+            _: &'a Target,
+            _: &'a Account,
+            tracked: &'a [Tracked],
+        ) -> BoxFuture<'a, ConnectorResult<Vec<Refreshed>>> {
+            Box::pin(async move {
+                Ok(tracked
+                    .iter()
+                    .map(|t| Refreshed::inaccessible(&t.remote_id, "Gone"))
+                    .collect())
+            })
+        }
+    }
+
+    struct FakeSources(Arc<World>);
+
+    impl Sources for FakeSources {
+        fn connector(&self, _: &str) -> Result<Box<dyn Connector>> {
+            Ok(Box::new(Fake(self.0.clone())))
+        }
+    }
+
+    /// When the tests start: 2026-10-12T00:00:00Z.
+    fn t0() -> Timestamp {
+        Timestamp::from_unix(1_791_763_200)
+    }
+    fn at(minutes: u64) -> Timestamp {
+        t0().after(MINUTE * u32::try_from(minutes).unwrap())
+    }
+
+    /// A data directory with a connection to each host, and a scheduler
+    /// over it, its clock at [`t0`] and its jitter none.
+    struct Harness {
+        temp: tempfile::TempDir,
+        world: Arc<World>,
+        clock: Arc<ManualClock>,
+        db: Arc<Mutex<Db>>,
+        scheduler: Arc<Scheduler>,
+        /// Connection IDs, by host.
+        ids: HashMap<String, String>,
+    }
+
+    impl Harness {
+        fn new(hosts: &[(&str, Option<Duration>)]) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let db = Db::open(temp.path()).unwrap();
+            let mut ids = HashMap::new();
+            for (n, (host, interval)) in hosts.iter().enumerate() {
+                let c = Connection {
+                    id: format!("c0ffee00-0000-4000-8000-{n:012}"),
+                    provider: "errata".into(),
+                    label: (*host).into(),
+                    base_url: format!("https://{host}/"),
+                    account_id: "42".into(),
+                    account_name: "user42".into(),
+                    zone: Zone::External,
+                    sync_interval: interval.map(|i| i.as_secs()),
+                    ..Connection::default()
+                };
+                db.save_connection(&c).unwrap();
+                db::write_secret(&temp.path().join("secrets").join(&c.id), TOKEN).unwrap();
+                ids.insert((*host).to_string(), c.id);
+            }
+            let world = Arc::new(World::default());
+            let clock = Arc::new(ManualClock::at(t0()));
+            let db = Arc::new(Mutex::new(db));
+            let scheduler = Self::scheduler(&db, &world, &clock, || 0.5);
+            Self {
+                temp,
+                world,
+                clock,
+                db,
+                scheduler,
+                ids,
+            }
+        }
+        fn scheduler(
+            db: &Arc<Mutex<Db>>,
+            world: &Arc<World>,
+            clock: &Arc<ManualClock>,
+            sample: impl Fn() -> f64 + Send + Sync + 'static,
+        ) -> Arc<Scheduler> {
+            Scheduler::with_sample(
+                db.clone(),
+                Box::new(FakeSources(world.clone())),
+                clock.clone(),
+                Policy::default(),
+                Box::new(sample),
+            )
+        }
+        fn id(&self, host: &str) -> &str {
+            &self.ids[host]
+        }
+        fn connection(&self, host: &str) -> Connection {
+            let mut c = lock(&self.db).connection(self.id(host)).unwrap();
+            self.scheduler.annotate(std::slice::from_mut(&mut c));
+            c
+        }
+        fn state(&self, host: &str) -> SyncState {
+            self.connection(host).sync
+        }
+        /// The hosts due now.
+        fn due(&self) -> Vec<String> {
+            let due = self.scheduler.due().unwrap();
+            let mut hosts: Vec<_> = self
+                .ids
+                .iter()
+                .filter(|(_, id)| due.contains(id))
+                .map(|(host, _)| host.clone())
+                .collect();
+            hosts.sort();
+            hosts
+        }
+        /// Run what is due now to the end, and say what it did.
+        async fn tick(&self) -> Vec<Report> {
+            let mut reports = Vec::new();
+            for pending in self.scheduler.tick().unwrap() {
+                reports.push(pending.report().await);
+            }
+            reports.sort_by(|a, b| a.label.cmp(&b.label));
+            reports
+        }
+        /// Move the clock to `t`.
+        fn set(&self, t: Timestamp) {
+            let now = Timestamp::of(self.clock.now());
+            assert!(t >= now, "the clock only moves forward");
+            self.clock.advance(t.since(now));
+        }
+        fn items(&self, host: &str) -> Vec<String> {
+            let id = self.id(host);
+            lock(&self.db)
+                .items()
+                .unwrap()
+                .into_iter()
+                .filter(|i| i.connection_id.as_deref() == Some(id))
+                .map(|i: Item| format!("{} {:?}", i.key, i.outcome))
+                .collect()
+        }
+    }
+
+    /// `state`, with its next sync due at `t`.
+    fn due_at(state: SyncState, t: Timestamp) -> SyncState {
+        SyncState {
+            next_due: Some(t),
+            ..state
+        }
+    }
+    /// A second before `t`.
+    fn before(t: Timestamp) -> Timestamp {
+        Timestamp::from_unix(t.unix() - 1)
+    }
+
+    fn transient() -> ConnectorError {
+        ConnectorError::new(ErrorKind::Transient, "Network down")
+    }
+
+    #[test]
+    fn backoff_never_passes_its_cap_even_with_jitter() {
+        let c = Connection::default();
+        let failing = SyncState {
+            failures: 20,
+            error_kind: Some(ErrorKind::Transient),
+            ..SyncState::default()
+        };
+        for (sample, wait) in [
+            (0.0, MAX_BACKOFF.mul_f64(0.9)),
+            (0.5, MAX_BACKOFF),
+            (1.0, MAX_BACKOFF),
+        ] {
+            let due = Policy::default().next_due(&c, &failing, t0(), sample);
+            assert_eq!(due, Some(t0().after(wait)), "{sample}");
+        }
+    }
+
+    #[test]
+    fn waits_are_jittered_within_bounds() {
+        let wait = 5 * MINUTE;
+        let (shortest, longest) = (wait.mul_f64(0.9), wait.mul_f64(1.1));
+        assert_eq!(jitter(wait, 0.0), shortest);
+        assert_eq!(jitter(wait, 0.5), wait);
+        assert!(jitter(wait, 0.999_999) < longest);
+        // Out of range samples are kept in it.
+        assert_eq!(jitter(wait, -1.0), shortest);
+        assert_eq!(jitter(wait, 2.0), longest);
+        assert_eq!(jitter(wait, f64::NAN), wait);
+        let samples: Vec<_> = (0..2000).map(|_| random_sample()).collect();
+        assert!(samples.iter().all(|s| (0.0..1.0).contains(s)));
+        // Not all on one side, as a stuck generator would be.
+        assert!(samples.iter().any(|s| *s < 0.25) && samples.iter().any(|s| *s > 0.75));
+        for sample in samples {
+            let jittered = jitter(wait, sample);
+            assert!(jittered >= shortest && jittered <= longest, "{sample}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_connection_syncs_on_its_own_schedule() {
+        let h = Harness::new(&[("a.example", None), ("b.example", Some(10 * MINUTE))]);
+        // Never synced: both are due at once.
+        assert_eq!(h.due(), ["a.example", "b.example"]);
+        let reports = h.tick().await;
+        assert!(reports
+            .iter()
+            .all(|r| r.error.is_none() && r.items == Some(2)));
+        assert!(reports
+            .iter()
+            .all(|r| r.trigger == Trigger::Scheduled && !r.coalesced));
+        let a = h.connection("a.example");
+        assert_eq!(a.sync, due_at(SyncState::default().succeeded(t0()), at(5)));
+        assert_eq!(a.schedule.interval_secs, 300);
+        assert_eq!(h.state("b.example").next_due, Some(at(10)));
+        assert_eq!(h.connection("b.example").schedule.interval_secs, 600);
+        assert_eq!(
+            h.items("a.example"),
+            ["a.example-0 Open", "a.example-1 Open"]
+        );
+        // Nothing until the first is due, then only it.
+        h.set(at(4));
+        assert!(h.due().is_empty());
+        assert!(h.tick().await.is_empty());
+        h.set(at(5));
+        assert_eq!(h.due(), ["a.example"]);
+        h.tick().await;
+        assert_eq!(h.state("a.example").next_due, Some(at(10)));
+        h.set(at(10));
+        assert_eq!(h.due(), ["a.example", "b.example"]);
+        assert_eq!(
+            (h.world.lists("a.example"), h.world.lists("b.example")),
+            (2, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_next_sync_is_jittered() {
+        let h = Harness::new(&[("a.example", None)]);
+        for (sample, due) in [(0.0, 270), (0.5, 300), (1.0, 330)] {
+            let scheduler = Harness::scheduler(&h.db, &h.world, &h.clock, move || sample);
+            let report = scheduler.sync(h.id("a.example"), Trigger::Explicit).await;
+            let now = Timestamp::of(h.clock.now());
+            assert_eq!(report.next_due, Some(now.after(Duration::from_secs(due))));
+        }
+    }
+
+    #[tokio::test]
+    async fn failures_back_off_exponentially_up_to_a_cap() {
+        let h = Harness::new(&[("a.example", None)]);
+        let mut now = t0();
+        for (failures, minutes) in [
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (4, 8),
+            (5, 16),
+            (6, 32),
+            (7, 60),
+            (8, 60),
+        ] {
+            h.world.answer("a.example", Err(transient()));
+            h.set(now);
+            assert_eq!(h.due(), ["a.example"]);
+            let [report] = h.tick().await.try_into().unwrap();
+            assert_eq!(report.error_kind, Some(ErrorKind::Transient));
+            let state = h.state("a.example");
+            assert_eq!(state.failures, failures);
+            assert_eq!(state.last_success, None);
+            assert_eq!(state.last_attempt, Some(now));
+            assert_eq!(state.error.as_deref(), Some("Network down"));
+            now = now.after(MINUTE * minutes);
+            assert_eq!(state.next_due, Some(now), "after {failures} failures");
+            assert_eq!(report.next_due, Some(now));
+            h.set(before(now));
+            assert!(h.due().is_empty(), "not before");
+        }
+        // A success starts over.
+        h.set(now);
+        h.tick().await;
+        let state = h.state("a.example");
+        assert_eq!(
+            state,
+            due_at(SyncState::default().succeeded(now), now.after(5 * MINUTE))
+        );
+        assert_eq!(backoff(u32::MAX), MAX_BACKOFF);
+        assert_eq!(backoff(0), FIRST_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_hold_defers_the_next_sync_until_it_ends() {
+        let h = Harness::new(&[("a.example", None)]);
+        let held = |minutes| {
+            let until = std::time::UNIX_EPOCH + Duration::from_secs(at(minutes).unix() as u64);
+            ConnectorError::new(ErrorKind::Transient, "Rate limited").held_until(until)
+        };
+        h.world.answer("a.example", Err(held(20)));
+        h.tick().await;
+        let state = h.state("a.example");
+        assert_eq!(
+            (state.held_until, state.next_due),
+            (Some(at(20)), Some(at(20)))
+        );
+        h.set(before(at(20)));
+        assert!(h.due().is_empty());
+        h.set(at(20));
+        assert_eq!(h.due(), ["a.example"]);
+        // A hold shorter than the backoff waits the backoff.
+        h.world.answer("a.example", Err(held(20)));
+        h.tick().await;
+        assert_eq!(h.state("a.example").next_due, Some(at(22)));
+        assert_eq!(h.world.lists("a.example"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_credential_stops_scheduled_syncs_until_verified() {
+        let h = Harness::new(&[("a.example", None), ("b.example", None)]);
+        let denied = ConnectorError::new(ErrorKind::Auth, "Credential rejected");
+        h.world.answer("a.example", Err(denied.clone()));
+        h.tick().await;
+        let a = h.connection("a.example");
+        assert_eq!(a.sync.error_kind, Some(ErrorKind::Auth));
+        assert_eq!(a.sync.next_due, None);
+        assert!(a.schedule.needs_user);
+        assert!(!h.connection("b.example").schedule.needs_user);
+        // A day later, only the other one ever synced again.
+        for minutes in (5..=24 * 60).step_by(5) {
+            h.set(at(minutes));
+            assert!(!h.due().contains(&"a.example".to_string()));
+            h.tick().await;
+        }
+        assert_eq!(h.world.lists("a.example"), 1);
+        assert!(h.world.lists("b.example") > 200);
+        // Asked for, it syncs, and stays stopped while it fails.
+        h.world.answer("a.example", Err(denied));
+        let report = h.scheduler.sync(h.id("a.example"), Trigger::Explicit).await;
+        assert_eq!(report.error_kind, Some(ErrorKind::Auth));
+        assert!(h.connection("a.example").schedule.needs_user);
+        // A credential of another account is refused, and changes nothing.
+        let error = h
+            .scheduler
+            .verify(h.id("a.example"), Some(OTHER_ACCOUNT))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("separate connection"), "{error}");
+        assert!(h.connection("a.example").schedule.needs_user);
+        // Verified again with a new credential for the account, it is due
+        // now, and syncs on schedule again.
+        let c = h
+            .scheduler
+            .verify(h.id("a.example"), Some("new-token"))
+            .await
+            .unwrap();
+        assert!(!c.schedule.needs_user);
+        assert_eq!((c.sync.error, c.sync.failures), (None, 0));
+        let secret = h.temp.path().join("secrets").join(h.id("a.example"));
+        assert_eq!(std::fs::read_to_string(secret).unwrap(), "new-token");
+        assert!(h.due().contains(&"a.example".to_string()));
+        h.tick().await;
+        assert_eq!(h.state("a.example").error, None);
+        // Verifying the stored credential works the same.
+        let c = h.scheduler.verify(h.id("a.example"), None).await.unwrap();
+        assert_eq!(c.sync.next_due, Some(Timestamp::of(h.clock.now())));
+    }
+
+    #[tokio::test]
+    async fn a_connection_never_syncs_alongside_itself_and_others_go_on() {
+        let h = Harness::new(&[("a.example", None), ("b.example", None)]);
+        let gate = h.world.gate("a.example");
+        let first = h.scheduler.start(h.id("a.example"), Trigger::Scheduled);
+        h.world.entered.notified().await;
+        assert!(h.connection("a.example").schedule.running);
+        // The schedule doesn't start it again, and the other one syncs
+        // while it is stuck.
+        assert_eq!(h.due(), ["b.example"]);
+        let [b] = h.tick().await.try_into().unwrap();
+        assert_eq!((b.label.as_str(), b.items), ("b.example", Some(2)));
+        // Asked for, it joins the sync running, as does a sync of all.
+        let joined = h.scheduler.start(h.id("a.example"), Trigger::Explicit);
+        let all = {
+            let scheduler = h.scheduler.clone();
+            tokio::spawn(async move { scheduler.sync_all(Trigger::Explicit).await })
+        };
+        tokio::task::yield_now().await;
+        gate.add_permits(1);
+        let (first, joined) = (first.report().await, joined.report().await);
+        let all = all.await.unwrap().unwrap();
+        assert!(!first.coalesced && joined.coalesced, "{joined:?}");
+        assert_eq!(
+            Report {
+                coalesced: false,
+                ..joined
+            },
+            first
+        );
+        assert_eq!(first.trigger, Trigger::Scheduled);
+        let labels: Vec<_> = all
+            .iter()
+            .map(|r| (r.label.as_str(), r.coalesced))
+            .collect();
+        assert_eq!(labels, [("a.example", true), ("b.example", false)]);
+        assert_eq!(h.world.lists("a.example"), 1, "one sync of it");
+        assert!(!h.connection("a.example").schedule.running);
+        // Once it ended, a new one starts.
+        gate.add_permits(1);
+        let again = h.scheduler.sync(h.id("a.example"), Trigger::Explicit).await;
+        assert!(!again.coalesced && again.trigger == Trigger::Explicit);
+        assert_eq!(h.world.lists("a.example"), 2);
+    }
+
+    #[test]
+    fn a_sync_stopped_before_it_saved_leaves_the_last_good_data_and_is_due_again() {
+        let h = Harness::new(&[("a.example", None)]);
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        runtime().block_on(h.tick());
+        let saved = h.state("a.example");
+        assert_eq!(h.items("a.example").len(), 2);
+        // The next sync, on schedule, finds three items, but the service
+        // stops while it is still listing them: as in a crash, its task
+        // ends at that point, and nothing after it runs.
+        h.set(at(5));
+        h.world.answer("a.example", Ok(3));
+        let gate = h.world.gate("a.example");
+        let stopped = runtime();
+        stopped.block_on(async {
+            let pending = h.scheduler.tick().unwrap();
+            assert_eq!(pending.len(), 1);
+            h.world.entered.notified().await;
+        });
+        drop(stopped);
+        drop(h.scheduler);
+        // Started again on the same data directory.
+        let db = Arc::new(Mutex::new(Db::open(h.temp.path()).unwrap()));
+        let h = Harness {
+            scheduler: Harness::scheduler(&db, &h.world, &h.clock, || 0.5),
+            db,
+            ..h
+        };
+        assert_eq!(h.state("a.example"), saved);
+        assert_eq!(
+            h.items("a.example"),
+            ["a.example-0 Open", "a.example-1 Open"]
+        );
+        // It wasn't skipped: it is due, and syncs what it missed.
+        assert_eq!(h.due(), ["a.example"]);
+        gate.add_permits(1);
+        let [report] = runtime().block_on(h.tick()).try_into().unwrap();
+        assert_eq!(report.items, Some(3));
+        assert_eq!(h.items("a.example").len(), 3);
+        assert_eq!(h.state("a.example").last_success, Some(at(5)));
+    }
+
+    #[tokio::test]
+    async fn a_sync_that_saved_nothing_waits_before_it_is_tried_again() {
+        let h = Harness::new(&[("a.example", None)]);
+        h.tick().await;
+        h.set(at(5));
+        // A sync started now couldn't save its state, as on a full disk, so
+        // the state still says it is due.
+        lock(&h.scheduler.attempts).insert(h.id("a.example").into(), at(5));
+        assert!(h.due().is_empty());
+        h.set(before(at(6)));
+        assert!(h.due().is_empty());
+        h.set(at(6));
+        assert_eq!(h.due(), ["a.example"]);
+        // One disconnected from under it says so, and isn't left running.
+        lock(&h.db)
+            .sql
+            .execute("DELETE FROM connections", [])
+            .unwrap();
+        let report = h.scheduler.sync(h.id("a.example"), Trigger::Explicit).await;
+        assert!(report.error.unwrap().contains("not found"));
+        assert!(h.due().is_empty());
+        assert!(!h.scheduler.is_running(h.id("a.example")));
+    }
+
+    #[tokio::test]
+    async fn a_shorter_interval_takes_effect_now() {
+        let h = Harness::new(&[("a.example", None)]);
+        // Never synced: it stays due now.
+        let c = h
+            .scheduler
+            .set_interval(h.id("a.example"), Some(30 * MINUTE))
+            .await
+            .unwrap();
+        assert_eq!((c.sync.next_due, c.schedule.interval_secs), (None, 1800));
+        h.tick().await;
+        assert_eq!(h.state("a.example").next_due, Some(at(30)));
+        let c = h
+            .scheduler
+            .set_interval(h.id("a.example"), Some(10 * MINUTE))
+            .await
+            .unwrap();
+        assert_eq!(c.sync.next_due, Some(at(10)));
+        // A longer one after the sync already due.
+        let c = h
+            .scheduler
+            .set_interval(h.id("a.example"), None)
+            .await
+            .unwrap();
+        assert_eq!((c.sync.next_due, c.sync_interval), (Some(at(5)), None));
+        for wrong in [Duration::from_secs(59), MAX_INTERVAL + MINUTE] {
+            assert!(h
+                .scheduler
+                .set_interval(h.id("a.example"), Some(wrong))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_schedule_sleeps_until_the_next_sync_is_due() {
+        let h = Harness::new(&[("a.example", None)]);
+        // Due now: as short a sleep as it takes.
+        assert_eq!(h.scheduler.sleep(), MIN_SLEEP);
+        h.tick().await;
+        // Due in five minutes: it looks again sooner anyway.
+        assert_eq!(h.scheduler.sleep(), MAX_SLEEP);
+        h.set(Timestamp::from_unix(at(5).unix() - 10));
+        assert_eq!(h.scheduler.sleep(), Duration::from_secs(10));
+        // Waiting for the person: nothing to wake up for.
+        let denied = ConnectorError::new(ErrorKind::Auth, "Credential rejected");
+        h.world.answer("a.example", Err(denied));
+        h.scheduler.sync(h.id("a.example"), Trigger::Explicit).await;
+        assert_eq!(h.scheduler.sleep(), MAX_SLEEP);
+    }
+}

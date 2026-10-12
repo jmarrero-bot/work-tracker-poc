@@ -1,8 +1,10 @@
 use crate::{
+    clock::SystemClock,
     connector::{self, Target},
     connectors,
     db::{self, Db},
     model::*,
+    schedule::{self, Builtin, Policy, Scheduler, Trigger},
     zone,
 };
 use anyhow::{bail, Result};
@@ -16,11 +18,12 @@ use axum::{
     Json, Router,
 };
 use rust_embed::RustEmbed;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -32,8 +35,7 @@ struct App {
     db: Arc<Mutex<Db>>,
     token: Arc<String>,
     origin: String,
-    sync_gate: Arc<tokio::sync::Mutex<()>>,
-    connectors: connectors::Shared,
+    scheduler: Arc<Scheduler>,
 }
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 struct ApiError(anyhow::Error);
@@ -122,7 +124,9 @@ async fn session(State(app): State<App>) -> Response {
     res
 }
 async fn snapshot(State(app): State<App>) -> ApiResult<Snapshot> {
-    Ok(Json(app.db.lock().unwrap().snapshot()?))
+    let mut snapshot = app.db.lock().unwrap().snapshot()?;
+    app.scheduler.annotate(&mut snapshot.connections);
+    Ok(Json(snapshot))
 }
 /// What waits on each connection's account, and apart from it what watching
 /// other users found. A local view: internal work shows here, and never
@@ -145,8 +149,11 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
     if let Some(login) = watch_user {
         check_watch_user(&input.provider, login)?;
     }
-    let plugins = app.db.lock().unwrap().root.join(connectors::PLUGINS_DIR);
-    let source = connectors::for_provider(&input.provider, &plugins, &app.connectors)?;
+    let sync_interval = input.sync_interval.map(Duration::from_secs);
+    if let Some(interval) = sync_interval {
+        schedule::check_interval(interval)?;
+    }
+    let source = app.scheduler.connector(&input.provider)?;
     let target = Target::new(&base, &input.token)?;
     let account = connector::verify(source.as_ref(), &target).await?;
     let (id, name) = (account.id, account.name);
@@ -170,7 +177,9 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         account_name: name,
         zone: input.zone,
         watch_user: watch_user.map(str::to_string),
-        ..Default::default()
+        sync_interval: input.sync_interval,
+        sync: SyncState::default(),
+        schedule: Schedule::default(),
     };
     let path = db.root.join("secrets").join(&c.id);
     db::write_secret(&path, target.credential.expose())?;
@@ -178,6 +187,11 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         let _ = std::fs::remove_file(path);
         return Err(e.into());
     }
+    drop(db);
+    // Its first sync is due now.
+    app.scheduler.wake();
+    let mut c = c;
+    app.scheduler.annotate(std::slice::from_mut(&mut c));
     Ok(Json(c))
 }
 fn bail_api(message: &str) -> Result<()> {
@@ -195,89 +209,102 @@ fn check_watch_user(provider: &str, login: &str) -> Result<()> {
     }
     Ok(())
 }
+/// A field that may be left out, apart from one set to null: `None` when
+/// absent, `Some(None)` when null.
+fn present<'de, T: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+/// What changes about a connection: only the fields given.
 #[derive(Deserialize)]
-struct WatchInput {
-    /// Who to watch, or nobody.
-    watch_user: Option<String>,
+struct ConnectionPatch {
+    /// Who to watch, or with null nobody.
+    #[serde(default, deserialize_with = "present")]
+    watch_user: Option<Option<String>>,
+    /// How often it syncs, in seconds, or with null as often as the
+    /// service's default.
+    #[serde(default, deserialize_with = "present")]
+    sync_interval: Option<Option<u64>>,
 }
 /// Watch another user's activity visible to a GitHub connection's token, or
-/// stop.
-/// What it finds shows as theirs, never as the connection's account's.
-async fn watch(
+/// stop, and change how often a connection syncs. What watching finds shows
+/// as theirs, never as the connection's account's.
+async fn patch_connection(
     State(app): State<App>,
     Path(id): Path<String>,
-    Json(input): Json<WatchInput>,
+    Json(input): Json<ConnectionPatch>,
 ) -> ApiResult<Connection> {
-    // Not while a sync is saving what it found for the old setting.
-    let _guard = app.sync_gate.lock().await;
-    let mut db = app.db.lock().unwrap();
-    let c = db.connection(&id)?;
-    let login = input.watch_user.as_deref().map(str::trim);
-    if let Some(login) = login {
+    // Every field is checked before any is written.
+    let c = app.db.lock().unwrap().connection(&id)?;
+    let interval = input.sync_interval.map(|i| i.map(Duration::from_secs));
+    if let Some(Some(interval)) = interval {
+        schedule::check_interval(interval)?;
+    }
+    let watch_user = input
+        .watch_user
+        .map(|login| login.map(|login| login.trim().to_string()));
+    if let Some(Some(login)) = &watch_user {
         check_watch_user(&c.provider, login)?;
         if login.eq_ignore_ascii_case(&c.account_name) {
             bail_api(OWN_ACCOUNT)?
         }
     }
-    Ok(Json(db.set_watch_user(&id, login)?))
+    if let Some(interval) = interval {
+        app.scheduler.set_interval(&id, interval).await?;
+    }
+    if let Some(login) = watch_user {
+        // Not while a sync is saving what it found for the old setting.
+        let _held = app.scheduler.hold(&id).await;
+        app.db
+            .lock()
+            .unwrap()
+            .set_watch_user(&id, login.as_deref())?;
+    }
+    let mut c = app.db.lock().unwrap().connection(&id)?;
+    app.scheduler.annotate(std::slice::from_mut(&mut c));
+    Ok(Json(c))
+}
+#[derive(Deserialize)]
+struct VerifyInput {
+    /// A new credential for the same account, to replace the stored one.
+    #[serde(default)]
+    token: Option<String>,
+}
+/// Check a connection's credential again, or replace it with a new one for
+/// the same account, and sync it soon. A connection whose credential was
+/// rejected gets its scheduled syncs back this way.
+async fn verify(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(input): Json<VerifyInput>,
+) -> ApiResult<Connection> {
+    Ok(Json(
+        app.scheduler.verify(&id, input.token.as_deref()).await?,
+    ))
 }
 async fn disconnect(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Value> {
-    let _guard = app.sync_gate.lock().await;
+    // Not while it syncs, which would save what it found afterwards.
+    let _held = app.scheduler.hold(&id).await;
     app.db.lock().unwrap().delete_connection(&id)?;
+    app.scheduler.forget(&id);
     Ok(Json(json!({"ok":true})))
 }
-async fn sync(State(app): State<App>) -> ApiResult<Value> {
-    let _guard = app.sync_gate.lock().await;
-    let connections = app.db.lock().unwrap().connections()?;
-    let mut results = Vec::new();
-    for c in connections {
-        let started = Timestamp::of(std::time::SystemTime::now());
-        let (token, old, last, plugins) = {
-            let db = app.db.lock().unwrap();
-            let plugins = db.root.join(connectors::PLUGINS_DIR);
-            let last = db.watched()?.into_iter().find(|w| w.connection_id == c.id);
-            (db.secret(&c.id), db.items()?, last, plugins)
-        };
-        let source = connectors::for_provider(&c.provider, &plugins, &app.connectors);
-        let result = async {
-            let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let target = Target::new(&c.base_url, &token?)?;
-            Ok::<_, anyhow::Error>(
-                connector::sync_and_watch(
-                    source.as_ref(),
-                    &target,
-                    &c,
-                    &old,
-                    last.as_ref(),
-                    started,
-                )
-                .await?,
-            )
+#[derive(Deserialize, Default)]
+struct SyncInput {
+    /// Only this connection; all of them when left out.
+    #[serde(default)]
+    connection: Option<String>,
+}
+/// Sync connected sources now: one, or all of them side by side. A sync
+/// already running, as on schedule, is joined, not started again.
+async fn sync(State(app): State<App>, Json(input): Json<SyncInput>) -> ApiResult<Value> {
+    let results = match input.connection {
+        Some(id) => {
+            app.db.lock().unwrap().connection(&id)?;
+            vec![app.scheduler.sync(&id, Trigger::Explicit).await]
         }
-        .await;
-        // What the connector sent, for those that count, so a person can
-        // check that a sync only read.
-        let requests = source.ok().and_then(|s| s.requests());
-        let mut db = app.db.lock().unwrap();
-        match result {
-            Ok((items, watched)) => {
-                // The items and the state that says how fresh they are, in
-                // one transaction.
-                db.save_sync(&c.id, &items, watched.as_ref(), &c.sync.succeeded(started))?;
-                let watched =
-                    watched.map(|w| json!({"login":w.login,"items":w.items.len(),"error":w.error}));
-                results.push(json!({"connection":c.id,"label":c.label,"items":items.len(),"watched":watched,"requests":requests}));
-            }
-            Err(e) => {
-                let state = c.sync.failed(started, &e);
-                db.save_sync_state(&c.id, &state)?;
-                results.push(
-                    json!({"connection":c.id,"label":c.label,"error":state.error,"error_kind":state.error_kind,"requests":requests}),
-                );
-            }
-        };
-    }
-    Ok(Json(json!({"results":results})))
+        None => app.scheduler.sync_all(Trigger::Explicit).await?,
+    };
+    Ok(Json(json!({ "results": results })))
 }
 async fn effort(State(app): State<App>, Json(input): Json<EffortInput>) -> ApiResult<Effort> {
     Ok(Json(app.db.lock().unwrap().create_effort(input)?))
@@ -457,7 +484,7 @@ async fn headers(req: Request, next: Next) -> Response {
     response.headers_mut().insert("content-security-policy",HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
     response
 }
-pub async fn serve(root: PathBuf, port: u16, demo: bool) -> Result<()> {
+pub async fn serve(root: PathBuf, port: u16, demo: bool, interval: Duration) -> Result<()> {
     #[cfg(not(unix))]
     bail!("This initial server requires Unix file permissions; use Linux or macOS");
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
@@ -472,12 +499,23 @@ pub async fn serve(root: PathBuf, port: u16, demo: bool) -> Result<()> {
     }
     db::write_secret(&path, &token)?;
     let origin = format!("http://127.0.0.1:{port}");
+    let db = Arc::new(Mutex::new(db));
+    let sources = Builtin {
+        plugins: root.join(connectors::PLUGINS_DIR),
+        shared: connectors::Shared::default(),
+    };
+    let scheduler = Scheduler::new(
+        db.clone(),
+        Box::new(sources),
+        Arc::new(SystemClock),
+        Policy { interval },
+    );
+    tokio::spawn(scheduler.clone().serve());
     let app = App {
-        db: Arc::new(Mutex::new(db)),
+        db,
         token: Arc::new(token),
         origin: origin.clone(),
-        sync_gate: Arc::new(tokio::sync::Mutex::new(())),
-        connectors: connectors::Shared::default(),
+        scheduler,
     };
     let api = Router::new()
         .route("/snapshot", get(snapshot))
@@ -487,8 +525,9 @@ pub async fn serve(root: PathBuf, port: u16, demo: bool) -> Result<()> {
         .route("/connections", post(connect))
         .route(
             "/connections/{id}",
-            axum::routing::delete(disconnect).patch(watch),
+            axum::routing::delete(disconnect).patch(patch_connection),
         )
+        .route("/connections/{id}/verify", post(verify))
         .route("/sync", post(sync))
         .route("/efforts", post(effort))
         .route("/efforts/{id}", axum::routing::patch(share_effort))

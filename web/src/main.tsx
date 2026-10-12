@@ -109,7 +109,18 @@ type Connection = {
   // Another GitHub user whose activity, as far as this connection's token
   // can see it, the connection watches.
   watch_user: string | null;
+  // How often it syncs, in seconds, if not as often as the service's default.
+  sync_interval: number | null;
   sync: SyncState;
+  schedule: Schedule;
+};
+// How a connection's syncs are scheduled now.
+type Schedule = {
+  interval_secs: number;
+  running: boolean;
+  // Its credential was rejected: scheduled syncs stopped until it is
+  // verified again.
+  needs_user: boolean;
 };
 type ErrorKind = "auth" | "transient" | "inaccessible" | "invalid";
 // What a connection's syncs did. Times are UTC, in RFC 3339.
@@ -193,6 +204,59 @@ function OutcomeIcon({ item, size }: { item: Outcomed; size: number }) {
   if (needsDecision(item)) return <AlertCircle size={size} />;
   if (item.outcome === "abandoned") return <X size={size} />;
   return <Circle size={size - 4} fill="currentColor" />;
+}
+// When an ISO time is, seen from now: "in 4 min", "3 h ago".
+function relative(iso: string, now = Date.now()) {
+  const seconds = Math.round((new Date(iso).getTime() - now) / 1000);
+  const span = Math.abs(seconds);
+  if (span < 60) return seconds >= 0 ? "within a minute" : "just now";
+  const amount =
+    span < 7200
+      ? `${Math.floor(span / 60)} min`
+      : span < 172800
+        ? `${Math.floor(span / 3600)} h`
+        : `${Math.floor(span / 86400)} d`;
+  return seconds >= 0 ? `in ${amount}` : `${amount} ago`;
+}
+function every(seconds: number) {
+  return seconds % 86400 === 0
+    ? `${seconds / 86400}d`
+    : seconds % 3600 === 0
+      ? `${seconds / 3600}h`
+      : seconds % 60 === 0
+        ? `${seconds / 60}m`
+        : `${seconds}s`;
+}
+// How a connection's syncs are going, and whether that needs attention.
+function syncStatus(c: Connection): { text: string; attention: boolean } {
+  const s = c.sync;
+  const last = s.last_success
+    ? `Last synced ${relative(s.last_success)}.`
+    : "Never synced.";
+  // Past due: the schedule starts it within moments.
+  const next = !s.next_due
+    ? "soon"
+    : new Date(s.next_due).getTime() <= Date.now()
+      ? "due now"
+      : relative(s.next_due);
+  if (c.schedule.needs_user)
+    return {
+      text: `Needs you: ${s.error ?? "credential rejected"}. Scheduled syncs stopped until the credential works; fix it, then verify again. ${last}`,
+      attention: true,
+    };
+  if (c.schedule.running) return { text: `Syncing now. ${last}`, attention: false };
+  if (!s.error)
+    return {
+      text: `${last} Next sync ${next}, every ${every(c.schedule.interval_secs)}.`,
+      attention: false,
+    };
+  const held = s.held_until && new Date(s.held_until).getTime() > Date.now();
+  return {
+    text: held
+      ? `${s.error}. The source asked to wait; next try ${next}. ${last}`
+      : `${s.error}. ${s.failures} failed ${s.failures === 1 ? "sync" : "syncs"} in a row, backing off; next try ${next}. ${last}`,
+    attention: true,
+  };
 }
 function progressText(p: Progress) {
   const parts = [
@@ -537,7 +601,7 @@ function App() {
       setSelected([]);
       setNotice(
         modal === "connect"
-          ? "Account verified. Sync to fetch your work."
+          ? "Account verified. Its first sync starts now, then it syncs on schedule."
           : "Saved.",
       );
     } catch (e) {
@@ -560,6 +624,16 @@ function App() {
       await reload();
     } catch (err) {
       setError((err as Error).message);
+    }
+  }
+  async function verify(c: Connection) {
+    setError("");
+    try {
+      await api(`connections/${c.id}/verify`, {});
+      await reload();
+      setNotice(`${c.label} works again and syncs on schedule.`);
+    } catch (e) {
+      setError((e as Error).message);
     }
   }
   async function disconnect(c: Connection) {
@@ -972,7 +1046,7 @@ function App() {
                       <p>
                         {data.items.length
                           ? "Try another source, attention filter, or search."
-                          : "Connect Jira, GitLab or GitHub, then sync to bring in your work."}
+                          : "Connect Jira, GitLab or GitHub; your work comes in with its first sync."}
                       </p>
                       <button
                         className="quiet"
@@ -1063,7 +1137,7 @@ function App() {
                 title="Waiting on you"
                 note="From the account behind each connection. Internal work shows only on this machine."
                 rows={mineView.mine}
-                empty="Nothing waits on your connected accounts. Sync to check again."
+                empty="Nothing waits on your connected accounts. Sources sync on schedule, or sync now to check again."
               />
               {(mineView.watching.length > 0 ||
                 mineView.watch_errors.length > 0) && (
@@ -1229,12 +1303,23 @@ function App() {
                               )}
                             </strong>
                             <span>{c.base_url}</span>
-                            <p>
-                              {c.sync.error ??
-                                (c.sync.last_success
-                                  ? `Last sync: ${new Date(c.sync.last_success).toLocaleString()}`
-                                  : "Verified. Ready for the first sync.")}
+                            <p
+                              className={
+                                syncStatus(c).attention ? "danger" : undefined
+                              }
+                            >
+                              {syncStatus(c).text}
                             </p>
+                            {c.schedule.needs_user && (
+                              <button
+                                className="quiet"
+                                onClick={() => verify(c)}
+                                title={`Check the stored credential again. To give it a new one, run workboard verify ${c.id} --token-stdin`}
+                              >
+                                <UserCheck size={14} />
+                                Verify again
+                              </button>
+                            )}
                             <button
                               className="quiet danger"
                               onClick={() => disconnect(c)}

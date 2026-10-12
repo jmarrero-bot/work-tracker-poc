@@ -23,10 +23,30 @@ pub struct Connection {
     /// what it finds is theirs, never this account's.
     #[serde(default)]
     pub watch_user: Option<String>,
+    /// How often it syncs, in seconds, if not as often as the service's
+    /// default.
+    #[serde(default)]
+    pub sync_interval: Option<u64>,
     /// What its syncs did. Kept in a table of its own, saved with what a
     /// sync found, and never stored with the connection.
     #[serde(default)]
     pub sync: SyncState,
+    /// How its syncs are scheduled, worked out when it is shown and never
+    /// stored.
+    #[serde(default)]
+    pub schedule: Schedule,
+}
+
+/// How a connection's syncs are scheduled now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Schedule {
+    /// How often it syncs, in seconds: its own interval, or the service's.
+    pub interval_secs: u64,
+    /// A sync of it is running.
+    pub running: bool,
+    /// Its credential was rejected, so its scheduled syncs stopped until the
+    /// person verifies it again, gives it a new credential, or reconnects.
+    pub needs_user: bool,
 }
 
 /// What a connection's syncs did: what is saved, in the same transaction as
@@ -163,6 +183,10 @@ pub struct ConnectInput {
     /// Another GitHub user to watch as well.
     #[serde(default)]
     pub watch_user: Option<String>,
+    /// How often it syncs, in seconds, if not as often as the service's
+    /// default.
+    #[serde(default)]
+    pub sync_interval: Option<u64>,
 }
 
 /// The items a connection found by watching another user, as of its last

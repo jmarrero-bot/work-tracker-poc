@@ -222,7 +222,9 @@ pub fn external_only(snapshot: &Snapshot) -> ExternalSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ConnectInput, Connection, Effort, EffortView, SyncState, Timestamp};
+    use crate::model::{
+        ConnectInput, Connection, Effort, EffortView, Schedule, SyncState, Timestamp,
+    };
 
     #[test]
     fn zones_default_to_internal() {
@@ -288,6 +290,8 @@ mod tests {
             account_name: format!("{tag} account {n}"),
             zone,
             watch_user: Some(format!("{INTERNAL}-watched")),
+            sync_interval: None,
+            schedule: Schedule::default(),
             sync: SyncState {
                 last_success: Some(Timestamp::from_unix(1_791_763_200 + n as i64)),
                 last_attempt: Some(Timestamp::from_unix(1_791_763_300)),
