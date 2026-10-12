@@ -3,7 +3,7 @@
 //! besides an item's usual fields. The connector itself is
 //! `connectors/github/bot.rs`; like every GitHub connector, it only reads.
 
-use crate::model::{valid_github_login, valid_github_name, Snapshot, Timestamp};
+use crate::model::{valid_github_login, valid_github_name, Item, Snapshot, Timestamp};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -489,8 +489,90 @@ pub fn find_heartbeat(
     Ok(None)
 }
 
+/// The label of an issue that asks the bot for something, which the bot
+/// triages.
+pub const ASK_LABEL: &str = "needs-triage";
+/// Longest title an issue asking about an item is given, in characters.
+const MAX_ASK_TITLE: usize = 120;
+
+/// Links that ask the bot for something, for the person to open in their
+/// own browser and submit there, as themselves. They are only links:
+/// building them sends nothing anywhere, and Workboard holds no
+/// credential that could write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ask {
+    /// A new issue in the bot's tracker, labeled for triage, its body a
+    /// template to fill in.
+    pub issue_url: String,
+    /// For an item: its issue or pull request, to comment on, and how the
+    /// comment starts. GitHub takes no comment text in a link, so the page
+    /// and the CLI show it to paste.
+    pub comment_url: Option<String>,
+    pub comment: Option<String>,
+}
+
+/// `text` percent-encoded for a URL's query: every byte but the unreserved
+/// ones (letters, digits and `-._~`), so nothing in it can end a value,
+/// start another, or begin the fragment.
+fn encode(text: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// How to ask the bot of `config`, on the instance whose web address is
+/// `base`, for something: about `item`, if given, or anything at all.
+pub fn ask(config: &BotConfig, base: &Url, item: Option<&Item>) -> Result<Ask> {
+    let (owner, repo) = config
+        .tracker_parts()
+        .context("The bot's tracker isn't a repository")?;
+    let mut url = base.join(&format!("{owner}/{repo}/issues/new"))?;
+    let what = "<!-- Opened from Workboard. Say what the bot should do, and why; it triages this issue. -->";
+    let template = "## What to do\n\n\n## Why\n\n";
+    let (title, body) = match item {
+        Some(i) => {
+            let title: String = format!("About {}: {}", i.key, i.title)
+                .chars()
+                .take(MAX_ASK_TITLE)
+                .collect();
+            let body = format!(
+                "{what}\n\nAbout {} ({}, {})\n\n{template}",
+                i.url, i.key, i.status
+            );
+            (Some(title), body)
+        }
+        None => (None, format!("{what}\n\n{template}")),
+    };
+    let mut query = String::new();
+    if let Some(title) = &title {
+        query = format!("title={}&", encode(title));
+    }
+    query.push_str(&format!(
+        "labels={}&body={}",
+        encode(ASK_LABEL),
+        encode(&body)
+    ));
+    url.set_query(Some(&query));
+    let comment_url = item.and_then(|i| item_on(&i.url, base)).map(|(url, _)| url);
+    Ok(Ask {
+        issue_url: url.into(),
+        comment: comment_url
+            .as_ref()
+            .map(|_| format!("@{} ", config.bot_login)),
+        comment_url,
+    })
+}
+
 /// A bot connection as the page and the CLI show it: where its board is,
-/// and what it last read of its heartbeat and its board.
+/// what it last read of its heartbeat and its board, and how to ask it
+/// for something.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BotView {
     pub connection_id: String,
@@ -499,6 +581,10 @@ pub struct BotView {
     pub board_url: String,
     /// None until a sync read them.
     pub agents: Option<AgentRuns>,
+    /// Ask it for anything.
+    pub ask: Ask,
+    /// Ask it about one of its items, by the item's ID.
+    pub asks: BTreeMap<String, Ask>,
 }
 
 /// Each bot connection of `snapshot`, with what it read of its heartbeat
@@ -511,12 +597,21 @@ pub fn views(snapshot: &Snapshot, agents: &[AgentRuns]) -> Vec<BotView> {
         .filter_map(|c| {
             let config = c.bot.as_ref()?;
             let base = Url::parse(&c.base_url).ok()?;
+            let mut asks = BTreeMap::new();
+            for i in &snapshot.items {
+                let mine = i.connection_id.as_deref() == Some(c.id.as_str());
+                if i.bot.is_some() && mine {
+                    asks.insert(i.id.clone(), ask(config, &base, Some(i)).ok()?);
+                }
+            }
             Some(BotView {
                 connection_id: c.id.clone(),
                 label: c.label.clone(),
                 bot_login: config.bot_login.clone(),
                 board_url: config.board_url(&base).ok()?.into(),
                 agents: agents.iter().find(|a| a.connection_id == c.id).cloned(),
+                ask: ask(config, &base, None).ok()?,
+                asks,
             })
         })
         .collect()
@@ -835,6 +930,100 @@ pub mod tests {
         ] {
             let found = item_on(url, &base).map(|(_, key)| key);
             assert_eq!(found.as_deref(), key, "{url}");
+        }
+    }
+
+    /// An item of the bot's, with `title`, at `url`.
+    fn bot_item(title: &str, url: &str) -> Item {
+        let mut item: Item = serde_json::from_value(serde_json::json!({
+            "id": "c1:bot:PVTI_a", "connection_id": "c1", "provider": "bot",
+            "remote_id": "PVTI_a", "key": "o/r#7", "title": title, "url": url,
+            "status": "Needs human", "outcome": "open", "outcome_reason": "", "action": "next",
+            "updated_at": "", "effort_id": null, "demo": false,
+        }))
+        .unwrap();
+        item.bot = Some(BotFields::default());
+        item
+    }
+    /// The query of `url`, decoded, by name.
+    fn query(url: &str) -> BTreeMap<String, String> {
+        Url::parse(url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect()
+    }
+
+    #[test]
+    fn asking_the_bot_anything_opens_a_new_tracker_issue() {
+        let a = ask(&config(), &github(), None).unwrap();
+        let url = Url::parse(&a.issue_url).unwrap();
+        assert_eq!(
+            (url.host_str(), url.path()),
+            (Some("github.com"), "/jmarrero-forge/tracker/issues/new")
+        );
+        let q = query(&a.issue_url);
+        assert_eq!(q["labels"], "needs-triage");
+        assert!(q["body"].contains("## What to do"), "{q:?}");
+        assert!(!q.contains_key("title"), "{q:?}");
+        assert!(a.comment_url.is_none() && a.comment.is_none());
+        // Under the instance's own address, on GitHub Enterprise Server.
+        let ghes = Url::parse("https://ghe.example.com/github/").unwrap();
+        let url = ask(&config(), &ghes, None).unwrap().issue_url;
+        assert!(
+            url.starts_with("https://ghe.example.com/github/jmarrero-forge/tracker/issues/new?"),
+            "{url}"
+        );
+    }
+
+    #[test]
+    fn asking_about_an_item_carries_it_whole_and_encoded() {
+        let title = "Fix \"a&b=c\" #1 + 100% <script>alert(1)</script>\nnext?line ü";
+        let item = bot_item(title, "https://github.com/o/r/issues/7");
+        let a = ask(&config(), &github(), Some(&item)).unwrap();
+        // Nothing in the title ends a value, starts another, or begins the
+        // fragment: every value decodes back to what it was.
+        let url = Url::parse(&a.issue_url).unwrap();
+        assert!(url.fragment().is_none(), "{url}");
+        let raw = url.query().unwrap();
+        assert_eq!(raw.matches('&').count(), 2, "{raw}");
+        assert!(!raw.contains(['#', ' ', '\n', '+', '"', '<']), "{raw}");
+        let q = query(&a.issue_url);
+        assert_eq!(q.len(), 3, "{q:?}");
+        assert_eq!(q["title"], format!("About o/r#7: {title}"));
+        assert_eq!(q["labels"], "needs-triage");
+        assert!(
+            q["body"].contains("About https://github.com/o/r/issues/7 (o/r#7, Needs human)"),
+            "{}",
+            q["body"]
+        );
+        // Or a comment on the item itself, which starts by naming the bot.
+        assert_eq!(
+            a.comment_url.as_deref(),
+            Some("https://github.com/o/r/issues/7")
+        );
+        assert_eq!(a.comment.as_deref(), Some("@jmarrero-bot "));
+        // A long title is cut, by characters.
+        let long = bot_item(&"ü".repeat(500), "https://github.com/o/r/issues/7");
+        let q = query(&ask(&config(), &github(), Some(&long)).unwrap().issue_url);
+        assert_eq!(q["title"].chars().count(), MAX_ASK_TITLE);
+        // An item elsewhere can only be asked about in a new issue.
+        let elsewhere = bot_item("Elsewhere", "https://gitlab.com/o/r/-/issues/7");
+        let a = ask(&config(), &github(), Some(&elsewhere)).unwrap();
+        assert!(a.comment_url.is_none() && a.comment.is_none());
+        assert!(query(&a.issue_url)["body"].contains("https://gitlab.com/o/r/-/issues/7"));
+    }
+
+    #[test]
+    fn encoding_keeps_only_unreserved_bytes() {
+        for (text, encoded) in [
+            ("abc-._~XYZ09", "abc-._~XYZ09"),
+            ("a b", "a%20b"),
+            ("a+b&c=d#e?f/g%h", "a%2Bb%26c%3Dd%23e%3Ff%2Fg%25h"),
+            ("\n\r\t", "%0A%0D%09"),
+            ("ü", "%C3%BC"),
+        ] {
+            assert_eq!(encode(text), encoded, "{text}");
         }
     }
 }

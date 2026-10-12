@@ -668,7 +668,7 @@ mod tests {
         bot::tests::config,
         connector,
         connectors::test_connection,
-        model::{Connection, Item, Snapshot},
+        model::{Connection, Snapshot},
     };
     use axum::{
         extract::Query,
@@ -920,18 +920,15 @@ mod tests {
             ..test_connection()
         }
     }
-    async fn sync(old: &[Item]) -> (ConnectorResult<Vec<Item>>, Requests) {
-        let (target, task) = crate::connectors::fixture(router(), "test-only-token").await;
-        let bot = Bot::new(Arc::default(), config()).unwrap();
-        let items = connector::sync(&bot, &target, &connection(), old).await;
-        task.abort();
-        (items, bot.requests().unwrap())
-    }
 
     #[tokio::test]
     async fn board_items_and_fork_prs_become_items() {
         use Outcome::*;
-        let (items, requests) = sync(&[]).await;
+        let (target, task) = crate::connectors::fixture(router(), "test-only-token").await;
+        let bot = Bot::new(Arc::default(), config()).unwrap();
+        let items = connector::sync(&bot, &target, &connection(), &[]).await;
+        task.abort();
+        let requests = bot.requests().unwrap();
         let items = items.unwrap();
         let by_key = |key: &str| {
             items
@@ -1013,7 +1010,10 @@ mod tests {
         assert_eq!(requests, expected);
         // Needs human and Draft wait on the person, in the Mine view.
         let snapshot = Snapshot {
-            connections: vec![connection()],
+            connections: vec![Connection {
+                base_url: target.base_url.to_string(),
+                ..connection()
+            }],
             items: items.clone(),
             efforts: vec![],
         };
@@ -1026,6 +1026,24 @@ mod tests {
             .iter()
             .all(|r| r.waits_on[0].reasons == [Reason::BotWaiting]));
         assert_eq!(Reason::BotWaiting.label(), "bot waiting on you");
+        // Asking the bot about each of them is only a link to build: the
+        // views take no client, and nothing more was sent.
+        let views = crate::bot::views(&snapshot, &[]);
+        let [view] = &views[..] else {
+            panic!("{views:?}")
+        };
+        assert_eq!(view.asks.len(), items.len());
+        let ask = &view.asks[&by_key("o/r#1").id];
+        assert!(
+            ask.issue_url
+                .contains("/jmarrero-forge/tracker/issues/new?"),
+            "{ask:?}"
+        );
+        assert_eq!(
+            ask.comment_url.as_deref(),
+            Some(by_key("o/r#1").url.as_str())
+        );
+        assert_eq!(bot.requests().unwrap(), requests);
     }
 
     #[tokio::test]

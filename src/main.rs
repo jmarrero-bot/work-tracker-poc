@@ -152,6 +152,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Ask a connected bot for something, in your browser: a new issue in
+    /// its tracker, prefilled and labeled for triage, or with --comment
+    /// the item's own issue or pull request to comment on. You submit it
+    /// yourself, as yourself; Workboard only builds the link and sends
+    /// nothing.
+    Ask {
+        /// About this item, by its ID (see `inbox --json`), rather than
+        /// anything.
+        item: Option<String>,
+        /// Comment on the item's issue or pull request instead.
+        #[arg(long, requires = "item")]
+        comment: bool,
+        /// Which bot connection, when several are connected.
+        #[arg(long, value_name = "CONNECTION")]
+        connection: Option<String>,
+        /// Print the link instead of opening it.
+        #[arg(long)]
+        print: bool,
+    },
     /// Show items that need action now, including any closed without delivery
     /// or unknown.
     Next {
@@ -685,6 +704,52 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Ask {
+            item,
+            comment,
+            connection,
+            print,
+        } => {
+            let views: Vec<bot::BotView> =
+                request(&client, &root, args.port, reqwest::Method::GET, "bot", None).await?;
+            let chosen: Vec<&bot::BotView> = views
+                .iter()
+                .filter(|v| connection.as_ref().is_none_or(|c| *c == v.connection_id))
+                .filter(|v| item.as_ref().is_none_or(|i| v.asks.contains_key(i)))
+                .collect();
+            let view = match chosen[..] {
+                [view] => view,
+                [] if views.is_empty() => {
+                    bail!("No bot is connected; `workboard connect bot` connects one")
+                }
+                [] if item.is_some() => {
+                    bail!("That isn't an item of a connected bot; `workboard inbox --json` lists their IDs")
+                }
+                [] => bail!("No bot connection has that ID; `workboard bot` lists them"),
+                _ => bail!("Several bots are connected; choose one with --connection"),
+            };
+            let ask = match &item {
+                Some(i) => &view.asks[i],
+                None => &view.ask,
+            };
+            let (url, starts) = if comment {
+                let url = ask.comment_url.as_ref().context(
+                    "That item isn't an issue or pull request on the bot's GitHub; ask about it in a new issue instead",
+                )?;
+                (url, ask.comment.as_deref())
+            } else {
+                (&ask.issue_url, None)
+            };
+            if print {
+                println!("{url}");
+            } else {
+                open_in_browser(url)?;
+                println!("Opened in your browser; nothing is sent until you submit it there");
+            }
+            if let Some(text) = starts {
+                println!("Start the comment with: {text}");
+            }
+        }
         Command::Status { query, json } => {
             let s: SnapshotClient = request(
                 &client,
@@ -874,16 +939,7 @@ async fn main() -> Result<()> {
             if print {
                 println!("{}", i.url)
             } else {
-                #[cfg(target_os = "macos")]
-                let program = "open";
-                #[cfg(target_os = "windows")]
-                let program = "explorer";
-                #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-                let program = "xdg-open";
-                std::process::Command::new(program)
-                    .arg(&i.url)
-                    .spawn()
-                    .context("Cannot launch the browser; use --print")?;
+                open_in_browser(&i.url)?;
             }
         }
         Command::Disconnect { connection } => {
@@ -962,6 +1018,20 @@ async fn main() -> Result<()> {
         }
         Command::Serve { .. } => unreachable!(),
     }
+    Ok(())
+}
+/// Open `url` with the system browser.
+fn open_in_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let program = "xdg-open";
+    std::process::Command::new(program)
+        .arg(url)
+        .spawn()
+        .context("Cannot launch the browser; use --print")?;
     Ok(())
 }
 /// A bot connection: its board's counts, its coordinator's heartbeat and
