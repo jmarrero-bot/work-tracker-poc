@@ -10,7 +10,7 @@ This is jmarrero's Workboard prototype from his handoff, now built and tested by
 
 1. [Outcome semantics: closed is not delivered](https://github.com/jmarrero-bot/work-tracker-poc/issues/2) (done)
 2. [Connector plugins with per-connection zones](https://github.com/jmarrero-bot/work-tracker-poc/issues/3) (done)
-3. [GitHub connector (read-only) and the Mine view](https://github.com/jmarrero-bot/work-tracker-poc/issues/4)
+3. [GitHub connector (read-only) and the Mine view](https://github.com/jmarrero-bot/work-tracker-poc/issues/4) (done)
 4. [Fedora Forge discovery and a Forgejo connector](https://github.com/jmarrero-bot/work-tracker-poc/issues/5), and an [Errata investigation](https://github.com/jmarrero-bot/work-tracker-poc/issues/6)
 5. [Scheduled sync with checkpoints and backoff](https://github.com/jmarrero-bot/work-tracker-poc/issues/7)
 6. [Hub mode: an external-only store on the tailnet](https://github.com/jmarrero-bot/work-tracker-poc/issues/8)
@@ -25,6 +25,8 @@ This is jmarrero's Workboard prototype from his handoff, now built and tested by
 Approvals and DCO sign-offs stay on GitHub, tied to jmarrero's review of the exact head of a pull request. The app may show them and link to them, but never records one itself. Commands to the bot are posted as jmarrero with his own GitHub App user token, so the bot checks them the same way it checks his comments today.
 
 Live Jira, internal GitLab and Errata tests aren't possible from the bot, so those connectors are tested with recorded fixtures until jmarrero connects them from his laptop.
+
+GitHub is connected read-only, enforced in code: one client is the only way to GitHub, and it refuses any request that could change it (see [docs/architecture.md](docs/architecture.md)). Live tests use the bot's token, so a GitHub connection can also watch jmarrero's activity, as far as that token can see it; that is listed as his, never as the bot's. The Mine view lists what waits on each connected account, and why.
 
 Every connection is in the internal or the external zone, internal unless marked external when connecting. Internal work stays on the machine that syncs it. Work leaves only through the external export (`workboard export --external`), which the hub will read and which carries external work alone. Connectors are plugins behind one interface: Jira and GitLab are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
 
@@ -72,6 +74,7 @@ Use **Connections → Connect account** in the browser. Alternatively, set a tok
 workboard connect jira --url https://jira.example.com/ --label 'Work Jira' --token-env WORKBOARD_JIRA_TOKEN
 workboard connect gitlab-internal --url https://gitlab.example.com/ --label 'Internal GitLab' --token-env WORKBOARD_INTERNAL_GITLAB_TOKEN
 workboard connect gitlab-public --url https://gitlab.com/ --label 'Public GitLab' --token-env WORKBOARD_PUBLIC_GITLAB_TOKEN
+workboard connect github --url https://github.com/ --label GitHub --external --token-env WORKBOARD_GITHUB_TOKEN
 workboard connections
 workboard sync
 ```
@@ -85,12 +88,26 @@ Current live connectors:
 | Source | Authentication | Imported work |
 | --- | --- | --- |
 | Jira Data Center | Personal access token, Bearer authentication | Active issues assigned to the authenticated user |
-| Internal/public GitLab | Personal API token via `PRIVATE-TOKEN`; `read_api` is recommended | Open MRs authored by you, assigned to you, or requesting your review |
-| GitHub, Fedora Forge or Errata through a connector plugin | Whatever the plugin uses; the token reaches it on standard input only | Whatever the plugin lists ([docs/plugins.md](docs/plugins.md)) |
+| Internal/public GitLab | Personal API token via `PRIVATE-TOKEN`; `read_api` is recommended | Open MRs authored by you, assigned to you, or requesting your review, and the MRs and issues on your To-Do list |
+| GitHub (github.com or Enterprise Server) | A token, as a bearer token; Workboard only reads, whatever it allows | Open pull requests and issues requesting your review (directly or through a team) or assigned to you, and your open pull requests, noting those with changes requested or failing checks |
+| Fedora Forge or Errata through a connector plugin | Whatever the plugin uses; the token reaches it on standard input only | Whatever the plugin lists ([docs/plugins.md](docs/plugins.md)) |
 
 Internal instances require network/VPN reachability from the machine running the service. TLS certificate verification stays enabled; there is no insecure TLS switch. Jira Cloud OAuth/API-token authentication is not implemented.
 
-Without a plugin, GitHub, Fedora Forge and Errata are supported as **manual source links**, not live connectors. A plugin is an executable named after the source in the data directory's `plugins` directory, such as `~/.local/share/workboard/plugins/errata`; it has to be owned by you and not writable by others, and runs with a minimal environment and a time limit, but as your user, so install only plugins you trust. Errata's live adapter requires the actual instance, API contract and supported authentication method. GitHub CLI, GitLab CLI and OS keychain credential reuse are planned; this version uses explicitly supplied tokens.
+Without a plugin, Fedora Forge and Errata are supported as **manual source links**, not live connectors. A plugin is an executable named after the source in the data directory's `plugins` directory, such as `~/.local/share/workboard/plugins/errata`; it has to be owned by you and not writable by others, and runs with a minimal environment and a time limit, but as your user, so install only plugins you trust. Errata's live adapter requires the actual instance, API contract and supported authentication method. GitHub CLI, GitLab CLI and OS keychain credential reuse are planned; this version uses explicitly supplied tokens.
+
+## Mine
+
+`workboard mine` (or the Mine tab) lists what waits on the account behind each connection, and why: review requested, team review requested, assigned, mentioned, or your own change needs action because of requested changes or failing checks; GitLab's other To-Do items show as on the to-do list. Each row shows the source's status, the outcome, the zone and the link, and appears once however many listings or connections found it, with each account it waits on and that account's reasons. Internal rows show only here, on this machine; the external export carries the reasons of external items only.
+
+A GitHub connection can also watch another user: their review requests, assignments and open pull requests and issues that the connection's token can see, private repositories included. It is a setting of its own, for a token that isn't theirs, such as the bot's:
+
+```sh
+workboard connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user jmarrero
+workboard watch CONNECTION_ID jmarrero        # or --stop
+```
+
+What watching finds is listed under **Watching**, with the watched login, and is never shown as yours, in the inbox, or exported. If a watch fails, for example because the login was renamed, the account's own work still syncs; Watching keeps the last list and shows the error, and `workboard sync` exits unsuccessfully.
 
 ## Efforts and source links
 
@@ -114,6 +131,7 @@ CLI equivalents:
 
 ```sh
 workboard inbox --json
+workboard mine --json                          # what waits on you, and what watching found
 workboard effort 'Ship a fix' --note 'Upstream, downstream, release' --item ITEM_ID
 workboard link ITEM_ID --effort EFFORT_ID
 workboard link ITEM_ID                         # ungroup
@@ -143,7 +161,7 @@ The credential handling follows the separation established in `jmarrero/atomic-s
 
 ## Synchronization behavior
 
-Connectors paginate inbox results. Items that were tracked before but no longer appear in the open inbox are fetched individually to detect completion or merge. Sync preserves manual effort assignments and commits each source's fetched item set transactionally. A source failure keeps its previous cache, records a visible error, and does not prevent other sources from syncing. The CLI exits unsuccessfully if any source sync fails. Rate limits are reported without an automatic retry loop.
+Connectors paginate inbox results, and fail rather than save part of a list. Items that were tracked before but no longer appear in the open inbox are fetched individually to detect completion or merge. Sync preserves manual effort assignments and commits each source's fetched item set transactionally. A source failure keeps its previous cache, records a visible error, and does not prevent other sources from syncing. The CLI exits unsuccessfully if any source sync fails. Rate limits are reported without an automatic retry loop. GitHub requests are conditional where GitHub returns an ETag, and once GitHub says a rate limit is used up, no more requests count against it until it resets. Each GitHub sync result lists the requests it sent by method, and those it refused.
 
 If a tracked item becomes inaccessible (HTTP 403 or 404), it is marked unknown with its last known status, never complete, and fetched again on the next sync. Other failures fail that source's sync and keep its previous cache. Manual links do not refresh automatically. GitLab pipelines, Jira release fields/blockers, automatic relationship suggestions, live Errata readiness, and hosted/team mode are not implemented yet.
 
@@ -157,7 +175,7 @@ cargo test
 python3 tests/smoke.py target/debug/workboard
 ```
 
-The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone and the external export, and secret file permissions.
+The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone, the external export and the Mine view, and secret file permissions. GitHub is tested against recorded answers in `cargo test`, since CI has no GitHub token.
 
 See `docs/architecture.md` for the next implementation boundaries.
 
