@@ -358,6 +358,52 @@ fn add_actions(app: &adw::Application, state: &Rc<State>) {
     app.set_accels_for_action("window.close", &["<Control>w"]);
 }
 
+/// In a Flatpak, ask the Background portal to let the app run with its
+/// window closed and start it, in the background, at login: GNOME then
+/// lists it among background apps, and the person decides. Outside one,
+/// the app just keeps running, and autostart is a desktop file of the
+/// person's (docs/gnome.md).
+fn request_background() {
+    if !std::path::Path::new("/.flatpak-info").exists() {
+        return;
+    }
+    let options = glib::VariantDict::new(None);
+    options.insert_value(
+        "reason",
+        &"Keep announcing new work while the window is closed, and from login".to_variant(),
+    );
+    options.insert_value("autostart", &true.to_variant());
+    options.insert_value(
+        "commandline",
+        &vec!["workboard-gnome", "--background"].to_variant(),
+    );
+    let parameters = glib::Variant::tuple_from_iter(["".to_variant(), options.end()]);
+    gio::bus_get(gio::BusType::Session, gio::Cancellable::NONE, move |bus| {
+        let bus = match bus {
+            Ok(bus) => bus,
+            Err(e) => return eprintln!("Cannot reach the session bus: {e}"),
+        };
+        // It answers on a request object, once the person decided; the
+        // decision is theirs and the portal's to keep.
+        bus.call(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Background",
+            "RequestBackground",
+            Some(&parameters),
+            None,
+            gio::DBusCallFlags::NONE,
+            -1,
+            gio::Cancellable::NONE,
+            |result| {
+                if let Err(e) = result {
+                    eprintln!("The Background portal didn't take the request: {e}");
+                }
+            },
+        );
+    });
+}
+
 fn startup(app: &adw::Application, state: &Rc<State>) {
     let css = gtk::CssProvider::new();
     css.load_from_string(include_str!("style.css"));
@@ -367,8 +413,15 @@ fn startup(app: &adw::Application, state: &Rc<State>) {
             &css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        // Run from the source tree, before `make install`: its icon is
+        // there.
+        let icons = gtk::IconTheme::for_display(&display);
+        if !icons.has_icon(APP_ID) {
+            icons.add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons"));
+        }
     }
     add_actions(app, state);
+    request_background();
     reload(state);
     let s = state.clone();
     glib::timeout_add_seconds_local(REFRESH_SECS, move || {
@@ -427,6 +480,7 @@ fn main() -> glib::ExitCode {
             }
         };
     }
+    // Read once, before the main loop starts; saved by a thread of its own.
     let seen_path = glib::user_state_dir().join(NOTIFIED);
     let seen = notify::Seen::load(&seen_path).unwrap_or_else(|e| {
         eprintln!("{e:#}; starting over, without announcing what is there now");

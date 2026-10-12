@@ -1,0 +1,43 @@
+# Build: flatpak-builder --user --install --force-clean build-dir gnome/io.github.jmarrero_bot.Workboard.yml
+id: io.github.jmarrero_bot.Workboard
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: workboard-gnome
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # The app talks to the Workboard service on the host's loopback only, but
+  # Flatpak can't limit network access to loopback: without this, the
+  # sandbox has a loopback of its own, where the service isn't. So this
+  # shares the host's whole network, as for any networked app.
+  - --share=network
+  # The service's token, which it replaces on every start: the copy it
+  # puts in the session's runtime directory, read-only. The data directory,
+  # with the database and the credentials, stays out of the sandbox.
+  - --filesystem=xdg-run/workboard:ro
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  # Cargo fetches the crates in Cargo.lock while building. A Flathub build
+  # would vendor them instead (flatpak-cargo-generator).
+  build-args:
+    - --share=network
+  env:
+    CARGO_HOME: /run/build/workboard-gnome/cargo
+modules:
+  - name: workboard-gnome
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked -p workboard-gnome
+      - make -C gnome install PREFIX=/app
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - web/node_modules
+          - .flatpak-builder
