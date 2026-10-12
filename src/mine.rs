@@ -15,6 +15,12 @@ pub struct WaitsOn {
     pub connection_id: String,
     /// Why it waits on this account, once each.
     pub reasons: Vec<Reason>,
+    /// When this connection last synced successfully, so its freshness is
+    /// judged by its own interval, not another connection's.
+    pub synced_at: Option<Timestamp>,
+    /// Whether that was too long ago for this connection's view of the row
+    /// to be current.
+    pub stale: bool,
 }
 
 /// One thing that waits, and on whom.
@@ -38,7 +44,8 @@ pub struct Row {
     pub waits_on: Vec<WaitsOn>,
     /// The oldest last success of the connections that found it.
     pub synced_at: Option<Timestamp>,
-    /// Whether any of them is stale, so it can't be shown as current.
+    /// Whether any of them is stale, each by its own interval, so it can't
+    /// be shown as current.
     pub stale: bool,
 }
 
@@ -102,6 +109,8 @@ fn rows<'a>(found: impl IntoIterator<Item = (&'a Item, &'a str)>) -> Vec<Row> {
             account: account.to_string(),
             connection_id: connection.to_string(),
             reasons,
+            synced_at: item.synced_at,
+            stale: item.stale,
         });
     }
     let mut rows: Vec<Row> = rows.into_values().collect();
@@ -277,7 +286,8 @@ mod tests {
             fresh("a", 2, t(200), false),
             fresh("b", 3, None, true),
         ]);
-        let rows: Vec<_> = mine(&s, &[])
+        let view = mine(&s, &[]);
+        let rows: Vec<_> = view
             .mine
             .iter()
             .map(|r| (r.key.clone(), r.synced_at, r.stale))
@@ -291,6 +301,14 @@ mod tests {
                 ("o/r#1".into(), t(100), true),
             ]
         );
+        // Each account keeps its own connection's freshness, so a client
+        // that ages the row judges each by its own interval.
+        let accounts: Vec<_> = view.mine[2]
+            .waits_on
+            .iter()
+            .map(|w| (w.connection_id.as_str(), w.synced_at, w.stale))
+            .collect();
+        assert_eq!(accounts, [("a", t(200), false), ("b", t(100), true)]);
     }
 
     #[test]
