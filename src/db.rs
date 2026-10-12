@@ -1,4 +1,4 @@
-use crate::{hub, model::*, outcome, zone::ExternalSnapshot};
+use crate::{bot::AgentRuns, hub, model::*, outcome, zone::ExternalSnapshot};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection as Sqlite, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ pub fn remove_if_there(path: &Path) -> Result<()> {
 
 /// The schema version this build writes, kept in SQLite's `user_version`.
 /// Version 0 is the prototype's schema, whose items only had a `terminal` flag.
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 fn schema_version(sql: &Sqlite) -> Result<i32> {
     let version = sql.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -101,6 +101,14 @@ fn migrate(sql: &mut Sqlite, root: &Path) -> Result<()> {
         )
         .context("Cannot add the hub")?;
     }
+    if version < 8 {
+        // Version 8: what each bot connection last read of its heartbeat,
+        // its agent runs, kept apart from items.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agents(connection_id TEXT PRIMARY KEY, body TEXT NOT NULL, error TEXT, last_success INTEGER, board TEXT)",
+        )
+        .context("Cannot add agent runs")?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -140,7 +148,7 @@ fn claim(sql: &mut Sqlite, root: &Path, mode: Mode) -> Result<()> {
         .optional()?;
     let recorded = recorded.as_deref().map(Mode::parse).transpose()?;
     let rows: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM items) OR EXISTS(SELECT 1 FROM efforts) OR EXISTS(SELECT 1 FROM connections) OR EXISTS(SELECT 1 FROM watched) OR EXISTS(SELECT 1 FROM hub)",
+        "SELECT EXISTS(SELECT 1 FROM items) OR EXISTS(SELECT 1 FROM efforts) OR EXISTS(SELECT 1 FROM connections) OR EXISTS(SELECT 1 FROM watched) OR EXISTS(SELECT 1 FROM agents) OR EXISTS(SELECT 1 FROM hub)",
         [],
         |r| r.get(0),
     )?;
@@ -330,6 +338,7 @@ enum Write<'a> {
         id: &'a str,
         items: &'a [Item],
         watched: Option<&'a WatchList>,
+        agents: Option<&'a AgentRuns>,
     },
     /// A connection's sync state alone.
     SyncState,
@@ -524,6 +533,13 @@ impl Db {
                 )));
             }
         }
+        for (id, _) in self.rows("SELECT connection_id,body FROM agents")? {
+            if !external(Some(&id)) {
+                return Err(refuse(format!(
+                    "agent runs of no external connection ({id})"
+                )));
+            }
+        }
         // Efforts link stored items only, which are external as checked
         // above; one linking anything else was changed behind the hub's back.
         let efforts: Vec<String> = self.efforts()?.into_iter().map(|e| e.id).collect();
@@ -562,13 +578,21 @@ impl Db {
                     ));
                 }
             }
-            Write::Sync { id, items, watched } => {
+            Write::Sync {
+                id,
+                items,
+                watched,
+                agents,
+            } => {
                 self.external_connection(id)?;
                 let theirs =
                     |i: &Item| i.connection_id.as_deref() == Some(id) && i.zone == Zone::External;
                 let watched_ok =
                     watched.is_none_or(|w| w.connection_id == id && w.items.iter().all(theirs));
-                if !items.iter().all(theirs) || !watched_ok {
+                // Agent runs have no zone of their own: they are the
+                // connection's, which is external.
+                let agents_ok = agents.is_none_or(|a| a.connection_id == id);
+                if !items.iter().all(theirs) || !watched_ok || !agents_ok {
                     return Err(refused("work that isn't its external connection's"));
                 }
             }
@@ -775,6 +799,18 @@ impl Db {
         )?;
         find()
     }
+    /// Save what a sync of connection `id` found, as [`Db::save_found`] does,
+    /// for a connector that reads no heartbeat.
+    #[cfg(test)]
+    pub fn save_sync(
+        &mut self,
+        id: &str,
+        items: &[Item],
+        watched: Option<&WatchList>,
+        state: &SyncState,
+    ) -> Result<()> {
+        self.save_found(id, items, watched, None, state)
+    }
     /// Save synced items without touching watch lists, as tests set up.
     #[cfg(test)]
     pub fn sync_items(&mut self, items: &[Item]) -> Result<()> {
@@ -785,17 +821,25 @@ impl Db {
     }
     /// Save what a sync of connection `id` found, all or nothing, once it
     /// has been processed: its items, what it found watching another user,
-    /// which replaces the last such list, and the connection's sync state.
-    /// Nothing is saved before, so a sync that stops halfway leaves the last
-    /// good data and state, and the next one fetches everything again.
-    pub fn save_sync(
+    /// which replaces the last such list, the agent runs of a bot's
+    /// heartbeat, which replace the last ones, and the connection's sync
+    /// state. Nothing is saved before, so a sync that stops halfway leaves
+    /// the last good data and state, and the next one fetches everything
+    /// again.
+    pub fn save_found(
         &mut self,
         id: &str,
         items: &[Item],
         watched: Option<&WatchList>,
+        agents: Option<&AgentRuns>,
         state: &SyncState,
     ) -> Result<()> {
-        self.admit(Write::Sync { id, items, watched })?;
+        self.admit(Write::Sync {
+            id,
+            items,
+            watched,
+            agents,
+        })?;
         let tx = self.sql.transaction()?;
         check_connected(&tx, id)?;
         upsert_synced(&tx, items)?;
@@ -812,6 +856,22 @@ impl Db {
                     serde_json::to_string(&w.items)?,
                     w.error,
                     w.last_success.map(Timestamp::unix)
+                ],
+            )?;
+        }
+        tx.execute("DELETE FROM agents WHERE connection_id=?1", [id])?;
+        if let Some(a) = agents {
+            if a.connection_id != id {
+                bail!("Agent runs were saved for another connection")
+            }
+            tx.execute(
+                "INSERT INTO agents(connection_id,body,error,last_success,board) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    id,
+                    serde_json::to_string(&a.heartbeat)?,
+                    a.error,
+                    a.last_success.map(Timestamp::unix),
+                    a.board.as_ref().map(serde_json::to_string).transpose()?
                 ],
             )?;
         }
@@ -865,6 +925,39 @@ impl Db {
             });
         }
         Ok(lists)
+    }
+    /// What each bot connection last read of its heartbeat, and why its last
+    /// sync couldn't read it, if it couldn't.
+    pub fn agents(&self) -> Result<Vec<AgentRuns>> {
+        let connections = self.connections()?;
+        let mut s = self.sql.prepare(
+            "SELECT connection_id,body,error,last_success,board FROM agents ORDER BY connection_id",
+        )?;
+        let rows = s.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut all = Vec::new();
+        for row in rows {
+            let (connection_id, body, error, last_success, board) = row?;
+            if !connections.iter().any(|c| c.id == connection_id) {
+                continue;
+            }
+            all.push(AgentRuns {
+                connection_id,
+                heartbeat: serde_json::from_str(&body)?,
+                error,
+                last_success: last_success.map(Timestamp::from_unix),
+                stale: false,
+                board: board.map(|b| serde_json::from_str(&b)).transpose()?,
+            });
+        }
+        Ok(all)
     }
     /// Watch another user from connection `id`, or stop. What was found for
     /// whoever it watched before is dropped.
@@ -970,6 +1063,7 @@ impl Db {
             tx.execute("DELETE FROM items WHERE id=?1", [item])?;
         }
         tx.execute("DELETE FROM watched WHERE connection_id=?1", [id])?;
+        tx.execute("DELETE FROM agents WHERE connection_id=?1", [id])?;
         tx.execute("DELETE FROM sync_state WHERE connection_id=?1", [id])?;
         tx.execute("DELETE FROM connections WHERE id=?1", [id])?;
         tx.commit()?;
@@ -2165,6 +2259,65 @@ mod tests {
         drop(db);
         // And it opens again.
         Db::open_as(&temp.path().join("hub"), Mode::Hub).unwrap();
+    }
+
+    #[test]
+    fn agent_runs_are_kept_apart_and_replaced_by_each_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_as(&temp.path().join("hub"), Mode::Hub).unwrap();
+        let c = connection("c0ffee00-0000-4000-8000-00000000000e", Zone::External);
+        db.save_connection(&c).unwrap();
+        let at = Timestamp::from_unix(1_791_763_200);
+        let ok = SyncState::default().succeeded(at);
+        let runs = |id: &str, error: Option<&str>| AgentRuns {
+            connection_id: id.into(),
+            heartbeat: None,
+            error: error.map(str::to_string),
+            last_success: Some(at),
+            stale: false,
+            board: Some(crate::bot::BoardSummary {
+                unreadable: 1,
+                ..Default::default()
+            }),
+        };
+        db.save_found(&c.id, &[], None, Some(&runs(&c.id, None)), &ok)
+            .unwrap();
+        assert_eq!(db.agents().unwrap(), [runs(&c.id, None)]);
+        // Never another connection's, on a hub or anywhere.
+        let other = runs("c0ffee00-0000-4000-8000-000000000001", None);
+        assert!(db.save_found(&c.id, &[], None, Some(&other), &ok).is_err());
+        db.save_found(&c.id, &[], None, Some(&runs(&c.id, Some("down"))), &ok)
+            .unwrap();
+        assert_eq!(db.agents().unwrap(), [runs(&c.id, Some("down"))]);
+        // They aren't items.
+        assert!(db.items().unwrap().is_empty());
+        drop(db);
+        // A hub opens again with them, and refuses a row of no external
+        // connection.
+        let db = Db::open_as(&temp.path().join("hub"), Mode::Hub).unwrap();
+        db.sql
+            .execute(
+                "INSERT INTO agents(connection_id,body) VALUES('elsewhere','null')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = Db::open_as(&temp.path().join("hub"), Mode::Hub)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("agent runs"), "{error}");
+        // Disconnecting removes them.
+        let mut db = Db::open(&temp.path().join("local")).unwrap();
+        db.save_connection(&c).unwrap();
+        db.save_found(&c.id, &[], None, Some(&runs(&c.id, None)), &ok)
+            .unwrap();
+        db.delete_connection(&c.id).unwrap();
+        let rows: i64 = db
+            .sql
+            .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

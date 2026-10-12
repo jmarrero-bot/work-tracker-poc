@@ -8,11 +8,11 @@
 //! source's rate-limit hold defers the next sync until it ends; a rejected
 //! credential stops scheduled syncs until the person verifies it again or
 //! reconnects. What a sync found is saved with the connection's sync state,
-//! in one transaction, only once the sync processed it ([`Db::save_sync`]),
+//! in one transaction, only once the sync processed it ([`Db::save_found`]),
 //! so a sync that stops halfway leaves the last good data and is due again.
 
 use crate::{
-    bot::BoardSummary,
+    bot::{self, AgentRuns, BoardSummary},
     clock::{Clock, Timestamp},
     connector::{self, Connector, Credential, Requests, Target},
     connectors,
@@ -202,6 +202,14 @@ pub struct Watched {
     pub error: Option<String>,
 }
 
+/// What a bot connection read of its heartbeat in a sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Agents {
+    /// The agent runs it lists, which is none if no heartbeat is published.
+    pub runs: usize,
+    pub error: Option<String>,
+}
+
 /// What one sync of one connection did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
@@ -221,6 +229,8 @@ pub struct Report {
     /// token can't read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub board: Option<BoardSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Agents>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,6 +252,7 @@ impl Report {
             items: None,
             watched: None,
             board: None,
+            agents: None,
             error: None,
             error_kind: None,
             requests: None,
@@ -418,6 +429,23 @@ impl Scheduler {
             for item in &mut list.items {
                 item.synced_at = list.last_success;
                 item.stale = stale;
+            }
+        }
+    }
+    /// Fill in how fresh what each bot connection read of its heartbeat is,
+    /// from `connections` as [`Scheduler::annotate`] left them: as fresh as
+    /// the sync that read it, since a heartbeat can keep failing while the
+    /// board syncs. And whether the heartbeat itself is too old to trust.
+    pub fn annotate_agents(&self, connections: &[Connection], agents: &mut [AgentRuns]) {
+        let now = self.now();
+        for a in agents {
+            let c = connections.iter().find(|c| c.id == a.connection_id);
+            a.stale = c.is_none_or(|c| {
+                a.last_success
+                    .is_none_or(|last| now.since(last) > self.policy.stale_after(c))
+            });
+            if let Some(heartbeat) = &mut a.heartbeat {
+                heartbeat.stale = bot::heartbeat_stale(heartbeat, now);
             }
         }
     }
@@ -681,10 +709,11 @@ impl Scheduler {
             let db = self.db();
             db.connection(id).and_then(|c| {
                 let last = db.watched()?.into_iter().find(|w| w.connection_id == c.id);
-                Ok((db.secret(&c.id), db.items()?, last, c))
+                let runs = db.agents()?.into_iter().find(|a| a.connection_id == c.id);
+                Ok((db.secret(&c.id), db.items()?, last, runs, c))
             })
         };
-        let (token, old, last, c) = match loaded {
+        let (token, old, last, runs, c) = match loaded {
             Ok(loaded) => loaded,
             // Its label is unknown too, so its ID stands in.
             Err(e) => return Report::new(id, id, trigger).failed(&e),
@@ -694,17 +723,18 @@ impl Scheduler {
         let result = async {
             let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
             let target = Target::new(&c.base_url, &token?)?;
-            Ok::<_, anyhow::Error>(
-                connector::sync_and_watch(
-                    source.as_ref(),
-                    &target,
-                    &c,
-                    &old,
-                    last.as_ref(),
-                    started,
-                )
-                .await?,
+            let (items, watched) = connector::sync_and_watch(
+                source.as_ref(),
+                &target,
+                &c,
+                &old,
+                last.as_ref(),
+                started,
             )
+            .await?;
+            let agents =
+                connector::agents(source.as_ref(), &target, &c, runs.as_ref(), started).await;
+            Ok::<_, anyhow::Error>((items, watched, agents))
         }
         .await;
         let source = source.ok();
@@ -714,7 +744,7 @@ impl Scheduler {
         let sample = (self.sample)();
         let mut db = self.db();
         let saved = match result {
-            Ok((items, watched)) => {
+            Ok((items, watched, agents)) => {
                 let mut state = c.sync.succeeded(started);
                 state.next_due = self.policy.next_due(&c, &state, finished, sample);
                 report.items = Some(items.len());
@@ -724,7 +754,11 @@ impl Scheduler {
                     error: w.error.clone(),
                 });
                 report.board = board;
-                db.save_sync(&c.id, &items, watched.as_ref(), &state)
+                report.agents = agents.as_ref().map(|a| Agents {
+                    runs: a.heartbeat.as_ref().map_or(0, |h| h.runs.len()),
+                    error: a.error.clone(),
+                });
+                db.save_found(&c.id, &items, watched.as_ref(), agents.as_ref(), &state)
                     .map(|()| state)
             }
             Err(e) => {
@@ -741,6 +775,7 @@ impl Scheduler {
                 report.items = None;
                 report.watched = None;
                 report.board = None;
+                report.agents = None;
                 report = report.failed(&anyhow::anyhow!("Cannot save what the sync found: {e:#}"));
             }
         }
