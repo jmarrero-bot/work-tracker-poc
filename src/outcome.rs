@@ -116,6 +116,15 @@ pub fn jira(status: &str, category: Option<&str>, resolution: Option<&str>) -> D
     }
 }
 
+/// A tracked item its source no longer returns: deleted, moved, or no longer
+/// visible to the account. Its last known status stays visible.
+pub fn inaccessible(source: &str, http_status: u16) -> Derived {
+    (
+        Outcome::Unknown,
+        format!("{source} returned HTTP {http_status} for this item (missing or no permission); its last known status is shown"),
+    )
+}
+
 /// Rows written before outcomes existed only had a `terminal` flag. Derive
 /// their outcome from what was stored: synced items through their connector's
 /// mapping, manual items from the status text the prototype treated as
