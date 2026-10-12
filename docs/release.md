@@ -40,13 +40,13 @@ Take the digest from there, not by resolving the tag later. Check its provenance
 gh attestation verify oci://ghcr.io/jmarrero-bot/work-tracker-poc@sha256:... --repo jmarrero-bot/work-tracker-poc
 ```
 
-## Make the package public, once
+## Check that the package is public
 
-A package new to ghcr.io can start out private even when its repository is public, and only the web UI changes that. After the first release, the package's owner, signed in as jmarrero-bot, opens <https://github.com/users/jmarrero-bot/packages/container/work-tracker-poc/settings> and, under "Danger Zone", changes its visibility to public. The bot machine then pulls it without credentials. The release run warns while the package isn't public.
+The bot machine pulls the image without credentials, so its package, <https://github.com/users/jmarrero-bot/packages/container/work-tracker-poc>, has to be public. It is, since v0.1.0, and the release run warns if an anonymous pull of the new digest fails. Should that happen, the package's owner, signed in as jmarrero-bot, changes its visibility back to public under its settings' "Danger Zone"; only the web UI can.
 
 ## Open the atomic-setup bump
 
-The bot proposes the bump like any atomic-setup change: a branch on its fork, jmarrero-forge/atomic-setup, and a draft pull request there (`bot-pr fork-pr`), which jmarrero reviews and promotes to jmarrero/atomic-setup, and merges. The change is the `Image=` line of `bot/workboard-hub/workboard-hub.container`, with a commit such as `workboard-hub: Update to v0.1.0`. Its description links the release run, the attestation check, and the changes since the last pinned tag (`https://github.com/jmarrero-bot/work-tracker-poc/compare/vOLD...vNEW`), and says if the hub's flags or setup changed with it.
+The bot proposes the bump like any atomic-setup change: a branch on its fork, jmarrero-forge/atomic-setup, and a pull request from it to jmarrero/atomic-setup, which jmarrero reviews and merges. The change is the `Image=` line of `bot/workboard-hub/workboard-hub.container` and the comment above it naming the tag and its release run, with a commit such as `workboard-hub: Update to v0.2.0`. Its description links the release run, the attestation check, and the changes since the last pinned tag (`https://github.com/jmarrero-bot/work-tracker-poc/compare/vOLD...vNEW`), and says if the hub's flags or setup changed with it.
 
 Once it is merged, in the atomic-setup checkout on the bot machine:
 
