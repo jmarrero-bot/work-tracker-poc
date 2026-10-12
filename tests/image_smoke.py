@@ -105,6 +105,7 @@ def check_api():
     status, body = call('/api/snapshot', token)
     assert status == 200 and json.loads(body)['mode'] == 'hub', (status, body)
     # Through `tailscale serve`, which passes on the tailnet name.
+    assert call('/api/snapshot', host=TAILNET)[0] == 401
     assert call('/api/snapshot', token, host=TAILNET)[0] == 200
     assert call('/api/snapshot', token, host='attacker.example')[0] == 403
     assert call('/api/snapshot', token, host=TAILNET, extra={'Tailscale-Funnel-Request': '?1'})[0] == 403
