@@ -4,6 +4,28 @@ A local work inbox with a Rust API/CLI, React + TypeScript dashboard, and SQLite
 
 This is an initial single-user prototype for Linux and macOS, not a hosted team service. No connection to your real accounts has been made.
 
+## Status and roadmap
+
+This is jmarrero's Workboard prototype from his handoff, now built and tested by CI on every pull request. The goal is one board for internal and external work: internal items stay on the work laptop, and a hub serves the external part over the tailnet. The app also becomes the control plane for jmarrero-bot, while the work itself stays public on the forge. The epic is [jmarrero-forge/tracker#8](https://github.com/jmarrero-forge/tracker/issues/8); the slices below are its sub-issues, in order.
+
+1. [Outcome semantics: closed is not delivered](https://github.com/jmarrero-bot/work-tracker-poc/issues/2)
+2. [Connector plugins with per-connection zones](https://github.com/jmarrero-bot/work-tracker-poc/issues/3)
+3. [GitHub connector (read-only) and the Mine view](https://github.com/jmarrero-bot/work-tracker-poc/issues/4)
+4. [Fedora Forge discovery and a Forgejo connector](https://github.com/jmarrero-bot/work-tracker-poc/issues/5), and an [Errata investigation](https://github.com/jmarrero-bot/work-tracker-poc/issues/6)
+5. [Scheduled sync with checkpoints and backoff](https://github.com/jmarrero-bot/work-tracker-poc/issues/7)
+6. [Hub mode: an external-only store on the tailnet](https://github.com/jmarrero-bot/work-tracker-poc/issues/8)
+7. [Bot plugin: the Workstream board, fork PRs and the heartbeat](https://github.com/jmarrero-bot/work-tracker-poc/issues/9)
+8. [GitHub App login: web on the hub, device flow on the companion](https://github.com/jmarrero-bot/work-tracker-poc/issues/12)
+9. [Commands posted as jmarrero to a control repository](https://github.com/jmarrero-bot/work-tracker-poc/issues/13)
+10. [A bot-board backend over the app's API](https://github.com/jmarrero-bot/work-tracker-poc/issues/14)
+11. [Conversations in the app](https://github.com/jmarrero-bot/work-tracker-poc/issues/15)
+12. [GNOME companion app in GTK4 and libadwaita](https://github.com/jmarrero-bot/work-tracker-poc/issues/10)
+13. [Publish the hub image and deploy it from atomic-setup](https://github.com/jmarrero-bot/work-tracker-poc/issues/11)
+
+Approvals and DCO sign-offs stay on GitHub, tied to jmarrero's review of the exact head of a pull request. The app may show them and link to them, but never records one itself. Commands to the bot are posted as jmarrero with his own GitHub App user token, so the bot checks them the same way it checks his comments today.
+
+Live Jira, internal GitLab and Errata tests aren't possible from the bot, so those connectors are tested with recorded fixtures until jmarrero connects them from his laptop.
+
 ## Run
 
 Requirements: a current stable Rust toolchain, Node.js 20.19+ or 22.12+, npm, and a C compiler for bundled SQLite.
