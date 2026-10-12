@@ -774,7 +774,9 @@ function App() {
           label: form.label ?? providers[connectProvider].name,
           base_url: form.url,
           token: form.token,
-          zone: hub || form.zone === "external" ? "external" : "internal",
+          // The person's explicit choice, on a hub too, where the form
+          // requires it and the service refuses anything else.
+          zone: form.zone === "external" ? "external" : "internal",
           watch_user:
             connectProvider === "github" && form.watch?.trim()
               ? form.watch.trim()
@@ -1949,8 +1951,8 @@ function App() {
                   <label className="zone-choice">
                     <input
                       type="checkbox"
-                      checked={hub || form.zone === "external"}
-                      disabled={hub}
+                      checked={form.zone === "external"}
+                      required={hub}
                       onChange={(e) =>
                         setForm((f) => ({
                           ...f,
@@ -1960,7 +1962,7 @@ function App() {
                     />
                     <span>
                       {hub
-                        ? "External: this hub connects external sources only. Connect internal work such as Jira, internal GitLab or Errata on the companion."
+                        ? "External, required on a hub: its work is shown wherever the hub is reached. This hub connects external sources only; connect internal work such as Jira, internal GitLab or Errata on the companion."
                         : "External: its work may leave this machine in its external export, and only external sources can be connected on a hub. Leave this off for internal work such as Jira, internal GitLab or Errata. It can't be changed later."}
                     </span>
                   </label>
