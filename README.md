@@ -12,7 +12,7 @@ This is jmarrero's Workboard prototype from his handoff, now built and tested by
 2. [Connector plugins with per-connection zones](https://github.com/jmarrero-bot/work-tracker-poc/issues/3) (done)
 3. [GitHub connector (read-only) and the Mine view](https://github.com/jmarrero-bot/work-tracker-poc/issues/4) (done)
 4. [Fedora Forge discovery and a Forgejo connector](https://github.com/jmarrero-bot/work-tracker-poc/issues/5) (done), and an [Errata investigation](https://github.com/jmarrero-bot/work-tracker-poc/issues/6)
-5. [Scheduled sync with checkpoints and backoff](https://github.com/jmarrero-bot/work-tracker-poc/issues/7)
+5. [Scheduled sync with checkpoints and backoff](https://github.com/jmarrero-bot/work-tracker-poc/issues/7) (done)
 6. [Hub mode: an external-only store on the tailnet](https://github.com/jmarrero-bot/work-tracker-poc/issues/8)
 7. [Bot plugin: the Workstream board, fork PRs and the heartbeat](https://github.com/jmarrero-bot/work-tracker-poc/issues/9)
 8. [GitHub App login: web on the hub, device flow on the companion](https://github.com/jmarrero-bot/work-tracker-poc/issues/12)
@@ -29,6 +29,8 @@ Live Jira, internal GitLab and Errata tests aren't possible from the bot, so tho
 GitHub is connected read-only, enforced in code: one client is the only way to GitHub, and it refuses any request that could change it (see [docs/architecture.md](docs/architecture.md)). Live tests use the bot's token, so a GitHub connection can also watch jmarrero's activity, as far as that token can see it; that is listed as his, never as the bot's. The Mine view lists what waits on each connected account, and why.
 
 Fedora Forge is forge.fedoraproject.org, which runs Forgejo, and it is connected read-only the same way. Fedora's package dist-git, where the bootc, ostree and rpm-ostree packaging pull requests are, is still Pagure on src.fedoraproject.org while Fedora moves it to Forgejo, and takes manual source links until then. [docs/connectors/fedora-forge.md](docs/connectors/fedora-forge.md) has the evidence. The bot has no Fedora account, so the Fedora Forge connector was tested live only without a token, on a public repository.
+
+The service keeps every connection fresh on its own, with no model involved: each syncs on its own schedule, backs off when its source fails, waits out rate limits, and stops when its credential is rejected until you verify it again. Everything shows how fresh it is, and stale data is marked as such.
 
 Every connection is in the internal or the external zone, internal unless marked external when connecting. Internal work stays on the machine that syncs it. Work leaves only through the external export (`workboard export --external`), which the hub will read and which carries external work alone. Connectors are plugins behind one interface: Jira, GitLab, GitHub and Fedora Forge are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
 
@@ -79,8 +81,9 @@ workboard connect gitlab-public --url https://gitlab.com/ --label 'Public GitLab
 workboard connect github --url https://github.com/ --label GitHub --external --token-env WORKBOARD_GITHUB_TOKEN
 workboard connect fedora --url https://forge.fedoraproject.org/ --label 'Fedora Forge' --external --token-env WORKBOARD_FEDORA_TOKEN
 workboard connections
-workboard sync
 ```
+
+Each new connection syncs right away, then every 5 minutes; you don't need to run `workboard sync`. See [Synchronization behavior](#synchronization-behavior).
 
 Each connection is **internal** unless you add `--external` (or turn on **External** in the connection dialog). Internal work, such as Jira, internal GitLab or Errata, is never exported; external work, such as gitlab.com or Fedora Forge, is what `workboard export --external` prints for the hub. A connection's zone can't be changed later; disconnect and connect again instead. Manual source links are internal. An effort with external work is exported with that work only, and its note never; its title only once you share it (`workboard share-title EFFORT_ID`, or the switch on the effort), since a title can name internal work. Until then the hub sees a neutral label.
 
@@ -147,7 +150,7 @@ workboard export --external                    # the external zone only, as JSON
 workboard disconnect CONNECTION_ID
 ```
 
-Source statuses are never changed through this app. Manual links are snapshots; edit their status and outcome in Workboard when the source changes. Sync is explicit: the page refreshes cached data every 30 seconds, but does not poll external services automatically.
+Source statuses are never changed through this app. Manual links are snapshots; edit their status and outcome in Workboard when the source changes. The service syncs connected sources on schedule, and the page refreshes what the service has every 30 seconds.
 
 ## Authentication and storage
 
@@ -165,7 +168,24 @@ The credential handling follows the separation established in `jmarrero/atomic-s
 
 ## Synchronization behavior
 
-Connectors paginate inbox results, and fail rather than save part of a list. Items that were tracked before but no longer appear in the open inbox are fetched individually to detect completion or merge. Sync preserves manual effort assignments and commits each source's fetched item set transactionally. A source failure keeps its previous cache, records a visible error, and does not prevent other sources from syncing. The CLI exits unsuccessfully if any source sync fails. Rate limits are reported without an automatic retry loop. Fedora Forge sends no ETags; when it asks to wait (HTTP 429, or 503 with `retry-after`), no more requests go to it with that token until the wait is over. GitHub requests are conditional where GitHub returns an ETag, and once GitHub says a rate limit is used up, no more requests count against it until it resets. Each GitHub sync result lists the requests it sent by method, and those it refused.
+The service syncs each connection on its own schedule: right after it is connected, then every 5 minutes, or as often as `workboard serve --sync-interval` (such as `15m`) or the connection's own interval says. Each wait varies by up to 10% at random, so connections drift apart. Connections sync side by side and independently, so a slow or failing source never holds up the others, and a connection never syncs alongside itself. No model is involved.
+
+```sh
+workboard connect github --url https://github.com/ --external --token-env WORKBOARD_GITHUB_TOKEN --sync-interval 15m
+workboard schedule CONNECTION_ID 1h            # or --default
+workboard sync                                 # all now; or `workboard sync CONNECTION_ID`
+workboard verify CONNECTION_ID                 # check the credential again; --token-stdin gives a new one
+```
+
+`workboard sync`, **Sync sources** in the page, and `POST /api/sync` still sync on request. If a scheduled sync of a connection is running, the request joins it and reports its result, rather than starting a second one.
+
+When a sync fails, the next one backs off: a minute after the first failure, doubling after each next one, up to an hour. A source that asks to wait (GitHub's rate limits, or Fedora Forge's `retry-after`) gets no request with that token until the wait is over, and the next sync is not due before then. A rejected credential (`auth`) stops the connection's scheduled syncs, since retrying can't fix it: `workboard connections` and the page say it needs you. Fix the credential, then run `workboard verify CONNECTION_ID` (with `--token-stdin` or `--token-env` to give it a new token for the same account), or click **Verify again**; its scheduled syncs resume. An explicit sync still runs, and one that succeeds resumes them too.
+
+Each connection keeps its sync state: its last success, its last attempt, when its next sync is due, its failures in a row, and its last error and the kind of that error. What a sync found and that state are saved together, in one transaction, only after the sync has processed everything; nothing is saved before. A sync that fails keeps the previous data and records only its failure; one cut short because the service stopped saves nothing, so the previous data and state stay, and the connection is still due when the service starts again: nothing is skipped. The state survives restarts; GitHub's answers kept for conditional requests don't (see `docs/architecture.md`).
+
+Everything shows how fresh it is. A connection is **stale** when it never synced, or when its last success is more than three of its intervals old, which one slow or failed sync doesn't reach. Each synced item carries its connection's last success and stale flag, in the API, `inbox --json` and `mine --json`; what watching found carries the last success of its own, since a watch can keep failing while the account syncs. `workboard connections`, `inbox` and `mine` and the page mark stale data, so it is never shown as current. The page also ages what it shows by each connection's threshold, and once it can't reach the service it says so and marks everything synced stale. The external export carries each connection's last success and stale flag, and the kind of its error, never the message.
+
+Connectors paginate inbox results, and fail rather than save part of a list. Items that were tracked before but no longer appear in the open inbox are fetched individually to detect completion or merge. Sync preserves manual effort assignments. A source failure keeps its previous cache, records a visible error, and does not prevent other sources from syncing. `workboard sync` exits unsuccessfully if any source sync fails. Fedora Forge sends no ETags. GitHub requests are conditional where GitHub returns an ETag, and once GitHub says a rate limit is used up, no more requests count against it until it resets. A wait a source asks for is honored for at most an hour. Each GitHub sync result lists the requests it sent by method, and those it refused.
 
 If a tracked item becomes inaccessible (HTTP 403 or 404), it is marked unknown with its last known status, never complete, and fetched again on the next sync. Other failures fail that source's sync and keep its previous cache. Manual links do not refresh automatically. GitLab pipelines, Jira release fields/blockers, automatic relationship suggestions, live Errata readiness, and hosted/team mode are not implemented yet.
 
@@ -179,7 +199,7 @@ cargo test
 python3 tests/smoke.py target/debug/workboard
 ```
 
-The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone, the external export and the Mine view, and secret file permissions. GitHub and Fedora Forge are tested against recorded answers in `cargo test`, since CI has no token for either. An ignored test reads a public repository on the real Fedora Forge without a token, and prints counts: `cargo test -- --ignored --nocapture live_fedora_forge`, or `workboard-tests --ignored --nocapture live_fedora_forge` with the test binary CI uploads next to `workboard`.
+The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone, the external export and the Mine view, scheduled sync with backoff, a stopped connection and freshness, sync state across a restart, and secret file permissions. The scheduler's own tests use a clock they control and fake connectors, so they never wait. GitHub and Fedora Forge are tested against recorded answers in `cargo test`, since CI has no token for either. An ignored test reads a public repository on the real Fedora Forge without a token, and prints counts: `cargo test -- --ignored --nocapture live_fedora_forge`, or `workboard-tests --ignored --nocapture live_fedora_forge` with the test binary CI uploads next to `workboard`.
 
 See `docs/architecture.md` for the next implementation boundaries.
 

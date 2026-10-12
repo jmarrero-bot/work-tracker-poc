@@ -35,7 +35,7 @@ Workboard runs a plugin:
 - with no arguments, `/` as its working directory, and an environment of only `PATH=/usr/local/bin:/usr/bin:/bin` and `LANG=C.UTF-8`. There is no `HOME`, no proxy variables such as `HTTPS_PROXY`, and no CA bundle variables such as `SSL_CERT_FILE`, so a plugin that needs them has to find them on its own for now;
 - with its standard error discarded, since a plugin's own diagnostics could echo the credential;
 - in a process group of its own, which is killed when the call ends, so a helper it started can't outlive the call;
-- for at most 120 seconds per call. After that it is killed and the call fails as `transient`;
+- for at most 120 seconds per call. After that it is killed and the call fails as `transient`. Meanwhile only its own connection waits: other connections sync on their own;
 - reading at most 16 MiB of its answer.
 
 An error message from a plugin is shown after the plugin's name, with any copy of the credential replaced by `[redacted]`, without control characters, and cut at 500 characters. An item that contains the credential is refused.
@@ -101,10 +101,10 @@ Text fields are limited to 8192 bytes. Unknown fields are ignored, so a later mi
 
 | `kind` | Meaning | What Workboard does |
 | --- | --- | --- |
-| `auth` | The credential was rejected, lacks a permission, or belongs to another account. | Keeps the previous items and shows the error on the connection: a person has to fix the credential. |
-| `transient` | Network, timeout, rate limit or a server error. | Keeps the previous items and shows the error; a later sync can succeed. |
+| `auth` | The credential was rejected, lacks a permission, or belongs to another account. | Keeps the previous items, shows the error on the connection, and stops its scheduled syncs: a person has to fix the credential and verify it again. |
+| `transient` | Network, timeout, rate limit or a server error. | Keeps the previous items and shows the error; the next scheduled sync backs off, and can succeed. |
 | `inaccessible` | One tracked item is missing or hidden from the account. Only valid inside `refresh` results. | Marks that item unknown, keeps its last known status, and fetches it again next time. |
-| `invalid` | The source answered something unusable, or the request can't be done (for example too many items to list completely). | Keeps the previous items and shows the error. |
+| `invalid` | The source answered something unusable, or the request can't be done (for example too many items to list completely). | Keeps the previous items and shows the error; the next scheduled sync backs off. |
 
 Messages are shown to the person. They never contain the credential or a remote response body, which can echo it.
 
