@@ -317,6 +317,7 @@ fn rate_limited(resource: &str, until: SystemTime) -> ConnectorError {
         ErrorKind::Transient,
         format!("GitHub's {resource} rate limit is used up; try again in about {minutes} min"),
     )
+    .held_until(until)
 }
 
 /// A GitHub client that only reads. One serves one sync, and counts what it
@@ -802,6 +803,9 @@ mod tests {
             let search = || client.get(&target, "search/issues", &query);
             let error = search().await.err().unwrap();
             assert_eq!(error.kind, ErrorKind::Transient, "{error}");
+            // Saying until when, so a scheduled sync waits as long.
+            let held = error.hold_until.expect("held");
+            assert!(held > SystemTime::now(), "{limited:?}");
             let limit = limited.3;
             assert!(
                 error.message.contains(&format!("{limit} rate limit")),
@@ -810,6 +814,7 @@ mod tests {
             // Not asked again until it frees up.
             let error = search().await.err().unwrap();
             assert_eq!(error.kind, ErrorKind::Transient, "{error}");
+            assert_eq!(error.hold_until, Some(held), "{limited:?}");
             let user = client.get_found(&target, "user", &[]).await;
             let graphql = client
                 .graphql(&target, "{ viewer { login } }", Map::new())
