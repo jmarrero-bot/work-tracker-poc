@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run the hub's container image as it is deployed, check its health and
-its API, and stop it. The data directory is a new named volume, so the
+its API, and stop it, gracefully, on the engine's default SIGTERM. The data directory is a new named volume, so the
 image must make it the service's own; a restart must keep the hub's
 companion token, so the volume holds its state.
 
@@ -28,6 +28,7 @@ LOCAL = f'127.0.0.1:{PORT}'
 TAILNET = 'hub.example.ts.net'
 DATA = '/var/lib/workboard'
 HEALTHY_WITHIN = 120
+STOP_WITHIN = 30
 
 parser = argparse.ArgumentParser()
 parser.add_argument('image')
@@ -126,12 +127,16 @@ try:
     assert user.split(':')[0] not in ('', '0', 'root'), f'Runs as {user!r}'
     wait_healthy()
     companion = check_api()
-    engine('stop', NAME)
+    # The engine's default stop signal, SIGTERM, stops it gracefully, well
+    # before the engine would resort to SIGKILL (exit code 137).
+    engine('stop', '--time', str(STOP_WITHIN), NAME)
+    code = engine('inspect', '--format', '{{.State.ExitCode}}', NAME).stdout.strip()
+    assert code == '0', f'Stopped with exit code {code}'
     wait_port_free()
     engine('start', NAME)
     wait_healthy()
     assert check_api() == companion, 'The companion token did not survive a restart'
-    print(f'{args.image}: healthy as user {user}, API checks passed, state kept across a restart')
+    print(f'{args.image}: healthy as user {user}, API checks passed, stopped cleanly, state kept across a restart')
 except Exception:
     logs = engine('logs', NAME, check=False)
     print(logs.stdout, logs.stderr)

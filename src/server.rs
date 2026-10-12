@@ -902,12 +902,33 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
             .map(|host| format!("https://{host}/#token={token}")),
     );
     println!("{running}. Open this private pairing URL:\n{}\nKeep this URL private. CLI commands use the same data directory.", urls.join("\n"));
+    let stop = stop_requested()?;
     axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(stop)
         .await?;
     Ok(())
+}
+/// Resolves once the service is asked to stop: on Ctrl-C (SIGINT), or on
+/// SIGTERM, which container engines and systemd send. Without a handler,
+/// SIGTERM would kill the service anywhere but as a container's PID 1,
+/// where it would be ignored until the engine resorts to SIGKILL.
+#[cfg(unix)]
+fn stop_requested() -> Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate =
+        signal(SignalKind::terminate()).context("Cannot handle SIGTERM to stop gracefully")?;
+    Ok(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    })
+}
+#[cfg(not(unix))]
+fn stop_requested() -> Result<impl std::future::Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }
 #[cfg(test)]
 mod tests {
