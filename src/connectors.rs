@@ -44,6 +44,26 @@ pub fn client() -> Result<Client> {
 /// The Jira issue fields an item is built from.
 const JIRA_FIELDS: &str = "summary,status,resolution,updated";
 
+/// What a request found.
+enum Fetched {
+    Found(Value),
+    /// HTTP 403 or 404: deleted, moved, or not visible to this account.
+    Inaccessible(StatusCode),
+}
+
+fn http_error(status: StatusCode) -> anyhow::Error {
+    let reason = match status {
+        StatusCode::UNAUTHORIZED => "Credential rejected",
+        StatusCode::FORBIDDEN => "Access denied; check token scope and account permissions",
+        StatusCode::TOO_MANY_REQUESTS => "Rate limited; try again later",
+        s if s.is_redirection() => {
+            "Instance redirected the API request; verify its base URL and API authentication"
+        }
+        _ => "Instance API request failed",
+    };
+    anyhow!("{reason} (HTTP {})", status.as_u16())
+}
+
 pub struct Provider {
     client: Client,
     base: Url,
@@ -66,6 +86,14 @@ impl Provider {
         })
     }
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
+        match self.fetch(path, query).await? {
+            Fetched::Found(v) => Ok(v),
+            Fetched::Inaccessible(status) => Err(http_error(status)),
+        }
+    }
+    /// Like `get`, but a 403 or 404 is an answer about that one resource
+    /// rather than an error.
+    async fn fetch(&self, path: &str, query: &[(&str, String)]) -> Result<Fetched> {
         let url = self.base.join(path)?;
         if url.origin() != self.base.origin() {
             bail!("API request changed origin")
@@ -79,15 +107,26 @@ impl Provider {
         let response = req.send().await.map_err(|_| {
             anyhow!("Cannot reach the instance; check network, VPN and certificate trust")
         })?;
-        if !response.status().is_success() {
-            let reason=match response.status() {StatusCode::UNAUTHORIZED=>"Credential rejected",StatusCode::FORBIDDEN=>"Access denied; check token scope and account permissions",StatusCode::TOO_MANY_REQUESTS=>"Rate limited; try again later",s if s.is_redirection()=>"Instance redirected the API request; verify its base URL and API authentication",_=>"Instance API request failed"};
-            bail!("{reason} (HTTP {})", response.status().as_u16());
+        let status = response.status();
+        if matches!(status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN) {
+            return Ok(Fetched::Inaccessible(status));
+        }
+        if !status.is_success() {
+            return Err(http_error(status));
         }
         // Do not surface remote error bodies, request headers or credentials.
         response
             .json()
             .await
+            .map(Fetched::Found)
             .map_err(|_| anyhow!("Instance did not return the expected JSON response"))
+    }
+    fn source_name(&self) -> &'static str {
+        if is_gitlab(&self.provider) {
+            "GitLab"
+        } else {
+            "Jira"
+        }
     }
     pub async fn identity(&self) -> Result<(String, String)> {
         let v = self
@@ -194,7 +233,9 @@ impl Provider {
             }
         }
         // Refresh previously tracked items that left the open inbox, so a merge or
-        // completed ticket can advance its effort. A failed refresh aborts this sync.
+        // completed ticket can advance its effort. An item the source no longer
+        // shows becomes unknown, never done; any other failed refresh aborts
+        // this sync.
         let missing: Vec<_> = old
             .iter()
             .filter(|i| {
@@ -204,18 +245,16 @@ impl Provider {
             })
             .collect();
         for item in missing {
-            let next = if is_gitlab(&self.provider) {
+            let fetched = if is_gitlab(&self.provider) {
                 let (project, iid) = item
                     .remote_id
                     .split_once(':')
                     .context("Invalid stored merge request identity")?;
-                let row = self
-                    .get(
-                        &format!("api/v4/projects/{project}/merge_requests/{iid}"),
-                        &[],
-                    )
-                    .await?;
-                gitlab_item(c, &row, "follow-up")?
+                self.fetch(
+                    &format!("api/v4/projects/{project}/merge_requests/{iid}"),
+                    &[],
+                )
+                .await?
             } else {
                 let key = item
                     .key
@@ -224,13 +263,22 @@ impl Provider {
                 if !key {
                     bail!("Invalid stored Jira key")
                 }
-                let row = self
-                    .get(
-                        &format!("rest/api/2/issue/{}", item.key),
-                        &[("fields", JIRA_FIELDS.into())],
-                    )
-                    .await?;
-                jira_item(c, &row, "follow-up")?
+                self.fetch(
+                    &format!("rest/api/2/issue/{}", item.key),
+                    &[("fields", JIRA_FIELDS.into())],
+                )
+                .await?
+            };
+            let next = match fetched {
+                Fetched::Found(row) if is_gitlab(&self.provider) => {
+                    gitlab_item(c, &row, "follow-up")?
+                }
+                Fetched::Found(row) => jira_item(c, &row, "follow-up")?,
+                Fetched::Inaccessible(status) => {
+                    let mut gone = item.clone();
+                    gone.set_outcome(outcome::inaccessible(self.source_name(), status.as_u16()));
+                    gone
+                }
             };
             all.insert(next.id.clone(), next);
         }
@@ -382,6 +430,20 @@ mod tests {
             assert_eq!(i.action, if outcome == Open { "next" } else { "" });
         }
     }
+    /// Serve a GitLab API fixture over plain HTTP, which production
+    /// constructors refuse.
+    async fn fixture(router: axum::Router, token: &str) -> (Provider, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let p = Provider {
+            client: client().unwrap(),
+            base: Url::parse(&base).unwrap(),
+            token: token.into(),
+            provider: "gitlab-internal".into(),
+        };
+        (p, task)
+    }
     fn mr(iid: u64, state: &str) -> Value {
         serde_json::json!({"project_id":7,"iid":iid,"title":format!("fix {iid}"),"state":state,"web_url":format!("https://example.com/p/-/merge_requests/{iid}"),"updated_at":"2026-10-06T20:00:00Z"})
     }
@@ -411,32 +473,43 @@ mod tests {
             .route(
                 "/api/v4/projects/7/merge_requests/999",
                 get(|| async { Json(mr(999, "merged")) }),
+            )
+            .route(
+                "/api/v4/projects/7/merge_requests/998",
+                get(|| async { Json(mr(998, "closed")) }),
+            )
+            .route(
+                "/api/v4/projects/7/merge_requests/997",
+                get(|| async { StatusCode::FORBIDDEN }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}/", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        // Test-only HTTP fixture; production constructors require HTTPS.
-        let p = Provider {
-            client: client().unwrap(),
-            base: Url::parse(&base).unwrap(),
-            token: "test-only-token".into(),
-            provider: "gitlab-internal".into(),
-        };
-        let old = gitlab_item(&c(), &mr(999, "opened"), "next").unwrap();
-        let items = p.sync(&c(), &[old]).await.unwrap();
-        assert_eq!(items.len(), 102);
+        // 996 has no route: GitLab answers 404 for a deleted merge request.
+        let (p, task) = fixture(router, "test-only-token").await;
+        let old: Vec<_> = [999, 998, 997, 996]
+            .into_iter()
+            .map(|iid| gitlab_item(&c(), &mr(iid, "opened"), "next").unwrap())
+            .collect();
+        let items = p.sync(&c(), &old).await.unwrap();
+        assert_eq!(items.len(), 105);
         assert_eq!(
             items.iter().find(|i| i.remote_id == "7:1").unwrap().action,
             "review"
         );
-        assert_eq!(
-            items
-                .iter()
-                .find(|i| i.remote_id == "7:999")
-                .unwrap()
-                .outcome,
-            Outcome::Delivered
-        );
+        for (remote_id, status, outcome, reason) in [
+            ("7:999", "merged", Outcome::Delivered, "merged"),
+            ("7:998", "closed", Outcome::ClosedWithoutDelivery, "closed"),
+            // The last known status stays; the outcome is unknown, never done.
+            ("7:997", "opened", Outcome::Unknown, "HTTP 403"),
+            ("7:996", "opened", Outcome::Unknown, "HTTP 404"),
+        ] {
+            let i = items.iter().find(|i| i.remote_id == remote_id).unwrap();
+            assert_eq!(
+                (i.status.as_str(), i.outcome),
+                (status, outcome),
+                "{remote_id}"
+            );
+            assert!(i.outcome_reason.contains(reason), "{}", i.outcome_reason);
+            assert_eq!(i.action, "", "{remote_id}");
+        }
         task.abort();
     }
     #[tokio::test]
@@ -451,18 +524,41 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}/", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let p = Provider {
-            client: client().unwrap(),
-            base: Url::parse(&base).unwrap(),
-            token: "sensitive-test-token".into(),
-            provider: "gitlab-internal".into(),
-        };
+        let (p, task) = fixture(router, "sensitive-test-token").await;
         let error = p.identity().await.unwrap_err().to_string();
         assert!(error.contains("Credential rejected"));
         assert!(!error.contains("sensitive-test-token"));
         task.abort();
+    }
+    #[tokio::test]
+    async fn access_denied_for_the_account_or_listing_fails_the_sync() {
+        use axum::{response::IntoResponse, routing::get, Json, Router};
+        // Only a single tracked item may turn unknown on a 403; a denied
+        // account check or listing fails the whole sync.
+        for account_denied in [true, false] {
+            let account = if account_denied {
+                get(|| async { StatusCode::FORBIDDEN.into_response() })
+            } else {
+                get(|| async { Json(serde_json::json!({"id":1,"username":"me"})).into_response() })
+            };
+            let router = Router::new()
+                .route("/api/v4/user", account)
+                .route(
+                    "/api/v4/merge_requests",
+                    get(|| async { StatusCode::FORBIDDEN }),
+                )
+                .route(
+                    "/api/v4/projects/7/merge_requests/5",
+                    get(|| async { StatusCode::FORBIDDEN }),
+                );
+            let (p, task) = fixture(router, "test-only-token").await;
+            let old = gitlab_item(&c(), &mr(5, "opened"), "next").unwrap();
+            let error = p.sync(&c(), &[old]).await.unwrap_err().to_string();
+            assert!(
+                error.contains("Access denied") && error.contains("HTTP 403"),
+                "account_denied={account_denied}: {error}"
+            );
+            task.abort();
+        }
     }
 }
