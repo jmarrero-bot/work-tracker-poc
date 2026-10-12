@@ -122,7 +122,7 @@ Current live connectors:
 
 Internal instances require network/VPN reachability from the machine running the service. TLS certificate verification stays enabled; there is no insecure TLS switch. Jira Cloud OAuth/API-token authentication is not implemented.
 
-Without a plugin, Errata is supported as **manual source links**, not a live connector, and so is Fedora's Pagure dist-git (src.fedoraproject.org). A plugin is an executable named after the source in the data directory's `plugins` directory, such as `~/.local/share/workboard/plugins/errata`; it has to be owned by you and not writable by others, and runs with a minimal environment and a time limit, but as your user, so install only plugins you trust. Errata's live adapter requires the actual instance, API contract and supported authentication method. GitHub CLI, GitLab CLI and OS keychain credential reuse are planned; this version uses explicitly supplied tokens.
+Without a plugin, Errata is supported as **manual source links**, not a live connector, and so is Fedora's Pagure dist-git (src.fedoraproject.org). A plugin is an executable named after the source in the data directory's `plugins` directory, such as `~/.local/share/workboard/plugins/errata`; it has to be owned by you and not writable by others, and runs with a minimal environment and a time limit, but as your user, so install only plugins you trust. Errata's live adapter requires the actual instance, API contract and supported authentication method. GitHub CLI, GitLab CLI and macOS keychain credential reuse are planned; this version uses explicitly supplied tokens, kept in files or GNOME Keyring (see [Authentication and storage](#authentication-and-storage)).
 
 ## Mine
 
@@ -177,7 +177,21 @@ Source statuses are never changed through this app. Manual links are snapshots; 
 
 ## Authentication and storage
 
-The initial credential backend is a private local directory, **not encrypted at rest**. On Unix, the directory is mode `0700`; credential files and database are mode `0600`. Only connection metadata is stored in SQLite; tokens are separate files named by a validated UUID. Disconnect removes the credential and its source's cached items. Private filesystem permissions do not protect against programs running as the same user.
+By default, credentials are kept in a private local directory, **not encrypted at rest**. On Unix, the directory is mode `0700`; credential files and database are mode `0600`. Only connection metadata is stored in SQLite; tokens are separate files named by a validated UUID. Disconnect removes the credential and its source's cached items. Private filesystem permissions do not protect against programs running as the same user.
+
+In a desktop session on Linux, a data directory can keep them in the Secret Service instead, which GNOME Keyring provides: encrypted at rest, and locked with the session. The connections' tokens and the hub's companion token are kept there, each labeled "Workboard credential ID", and no credential is ever written to a file: `secrets/` holds only `in-secret-service.json`, which names the keyring's store for this data directory, so the credentials are found if the directory moves and its path stays out of the keyring. If the keyring can't be reached when the service starts, the service fails closed: every connection's sync fails, nothing falls back to files, and nothing asks for a password; restart the service once the keyring is there, and the connections sync again on their own, without being verified again: each once its backoff is over, which can take up to an hour, or right away with **Sync sources** (`workboard sync`). The service token the CLI and the GNOME app read stays a file, as it must. A hub always keeps files: it runs without a desktop session.
+
+Moving the credentials is a command of its own, run with the service stopped:
+
+```sh
+workboard credentials migrate --to keyring    # or --to files
+```
+
+It copies every credential into the store given and reads each copy back, then makes that the store, and only then drops the old copies; each step is made durable on disk before the next one counts on it, so a power cut doesn't lose a credential either. Deleted credential files are unlinked, not scrubbed: if what was on the disk worries you, rotate those tokens. Cut short anywhere, nothing is lost: the marker file says which store is the authority meanwhile, the service refuses to start, and running the command again, to either store, finishes it. Starting the service never moves anything. The service and the command lock the data directory, so neither runs while the other does, and no two services share a data directory.
+
+Every start deletes the partial files a write cut short left in `secrets/`, since one can hold a token, and drops credentials staged by a verify that never completed. Once the database has been read, it also drops credentials no connection or hub link uses, from the store in use, which catches a removal cut short; if anything stored can't be read, nothing is dropped. A copy of a data directory shares its keyring store, so don't run a copy kept by the keyring next to the original ([#41](https://github.com/jmarrero-bot/work-tracker-poc/issues/41)).
+
+The keyring is unlocked when the service starts, which may ask for your password. After that the service never asks, since a sync would wait on you meanwhile. A keyring locked later fails each sync that needs it, which backs off and syncs again on its own once you unlock it, within its backoff of up to an hour, or right away with **Sync sources**. Every call to the Secret Service has a time limit, so a keyring that doesn't answer fails syncs rather than holding the service up.
 
 A new version may upgrade the database when the service starts. Upgrades are one-way, so the service first copies `work.sqlite` to `work.vN.sqlite` in the same directory, N being the old schema version. To go back to an older version, stop the service and restore that copy as `work.sqlite`.
 
@@ -221,6 +235,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 python3 tests/smoke.py target/debug/workboard
 python3 tests/hub_smoke.py target/debug/workboard
+# Credentials in the Secret Service, with one on the session bus:
+cargo test secret_service -- --ignored
 # The GNOME app, with GTK 4 and libadwaita installed:
 cargo clippy -p workboard-gnome --all-targets -- -D warnings
 cargo test -p workboard-gnome

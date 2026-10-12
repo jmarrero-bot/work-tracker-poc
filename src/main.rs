@@ -10,6 +10,7 @@ mod model;
 mod oauth;
 mod outcome;
 mod schedule;
+mod secrets;
 mod server;
 mod zone;
 use anyhow::{anyhow, bail, Context, Result};
@@ -36,6 +37,16 @@ struct Args {
     port: u16,
     #[command(subcommand)]
     command: Command,
+}
+#[derive(Subcommand)]
+enum CredentialsCommand {
+    /// Copy every credential into the store given, read each copy back,
+    /// make it the store, then drop the old copies. Run it with the service
+    /// stopped. Cut short, running it again, to either store, finishes it.
+    Migrate {
+        #[arg(long, value_enum)]
+        to: secrets::Backend,
+    },
 }
 #[derive(Subcommand)]
 enum Command {
@@ -75,6 +86,12 @@ enum Command {
         /// such as 30m or 1h.
         #[arg(long, value_name = "INTERVAL", default_value = "5m", value_parser = interval)]
         sync_interval: Duration,
+    },
+    /// Move the credentials between private files and the desktop session's
+    /// Secret Service (GNOME Keyring), with the service stopped.
+    Credentials {
+        #[command(subcommand)]
+        command: CredentialsCommand,
     },
     /// Connect Jira Data Center, a GitLab instance, GitHub, Fedora Forge, a
     /// harness bot's work on GitHub, or a source served by a connector
@@ -499,6 +516,12 @@ async fn main() -> Result<()> {
         login::save_secret(&root, &secret)?;
         println!("Kept the GitHub App's client secret; the hub reads it when it starts next");
         return Ok(());
+    }
+    if let Command::Credentials {
+        command: CredentialsCommand::Migrate { to },
+    } = args.command
+    {
+        return migrate_credentials(&root, to);
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(900))
@@ -1089,7 +1112,9 @@ async fn main() -> Result<()> {
             let token = v["token"].as_str().context("The hub sent no token")?;
             println!("{token}");
         }
-        Command::Serve { .. } | Command::GithubApp { .. } => unreachable!(),
+        Command::Serve { .. } | Command::GithubApp { .. } | Command::Credentials { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
 }
@@ -1145,6 +1170,25 @@ async fn hub_login(
         }
         interval = poll["interval"].as_u64().unwrap_or(interval);
     }
+}
+/// `workboard credentials migrate`: offline, under the data directory's
+/// lock, in a local service's data directory only.
+fn migrate_credentials(root: &std::path::Path, to: secrets::Backend) -> Result<()> {
+    db::private_dir(root)?;
+    let _lock = db::lock(root)?;
+    // A hub keeps files; opening the database as a local one refuses a hub's.
+    db::Db::open_as(root, db::Mode::Local)
+        .context("Credentials move only in a local service's data directory")?;
+    let migrated = secrets::migrate(root, to)?;
+    let store = match to {
+        secrets::Backend::Files => "private files",
+        secrets::Backend::Keyring => "GNOME Keyring",
+    };
+    println!(
+        "The credentials are kept in {store}: {} copied, {} old copies dropped",
+        migrated.copied, migrated.dropped
+    );
+    Ok(())
 }
 /// Open `url` with the system browser.
 fn open_in_browser(url: &str) -> Result<()> {

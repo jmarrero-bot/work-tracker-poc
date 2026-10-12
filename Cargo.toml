@@ -29,7 +29,12 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["fs", "process"] }
+
+# The Secret Service (GNOME Keyring), for data directories that keep the
+# credentials there (`workboard credentials migrate --to keyring`).
+[target.'cfg(target_os = "linux")'.dependencies]
+oo7 = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

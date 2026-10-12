@@ -829,19 +829,26 @@ impl Scheduler {
         // the new credential with the schedule stopped; verifying again
         // recovers either way. The connection's lock keeps its syncs out
         // until the credential is in place.
-        let staged = token
-            .map(|_| db.stage_secret(id, target.credential.expose()))
-            .transpose()?;
+        let staged = token.is_some();
+        if staged {
+            db.stage_secret(id, target.credential.expose())?;
+        }
         let installed = db.save_sync_state(id, &state).and_then(|()| {
-            staged
-                .as_deref()
-                .map_or(Ok(()), |staged| db.install_secret(id, staged))
+            if staged {
+                db.install_secret(id)
+            } else {
+                Ok(())
+            }
         });
         if let Err(e) = installed {
-            // Never leave the new credential behind, where a disconnect
-            // wouldn't find it.
-            if let Some(staged) = &staged {
-                let _ = std::fs::remove_file(staged);
+            // Never leave the new credential behind; and say so if it
+            // stays, which the next start sorts out.
+            if staged {
+                if let Err(discarded) = db.discard_staged_secret(id) {
+                    bail!(
+                        "{e:#}; and the new credential wasn't dropped, which the next start of the service does: {discarded:#}"
+                    );
+                }
             }
             return Err(e);
         }

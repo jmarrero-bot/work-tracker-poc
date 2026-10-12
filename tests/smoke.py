@@ -53,6 +53,14 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         token = (root / 'service.token').read_text().strip()
         # A copy in the session's runtime directory, by port, for sandboxed
         # clients, as private as the data directory's.
+        # One service, or credentials migration, per data directory.
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            other_port = sock.getsockname()[1]
+        second = subprocess.run([binary, '--data-dir', str(root), '--port', str(other_port), 'serve'], capture_output=True, text=True, timeout=20)
+        assert second.returncode != 0 and 'Another Workboard service' in second.stderr, second
+        migrating = subprocess.run(command + ['credentials', 'migrate', '--to', 'files'], capture_output=True, text=True)
+        assert migrating.returncode != 0 and 'Another Workboard service' in migrating.stderr, migrating
         published = runtime / 'workboard' / f'service-{port}.token'
         assert published.read_text().strip() == token
         assert published.stat().st_mode & 0o777 == 0o600 and published.parent.stat().st_mode & 0o777 == 0o700

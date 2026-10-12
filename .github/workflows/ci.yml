@@ -104,6 +104,27 @@ jobs:
       - name: Smoke test the image
         run: python3 tests/image_smoke.py localhost/workboard:ci --engine docker --network host
 
+  # Credentials in the Secret Service, against GNOME Keyring in a session
+  # bus of the job's own, unlocked with an empty password.
+  keyring:
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install Rust and GNOME Keyring
+        run: dnf -y install --setopt=install_weak_deps=False cargo gcc git gnome-keyring dbus-daemon shadow-utils util-linux
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # As a user, as in a desktop session: gnome-keyring-daemon refuses
+      # to run as root in a container, where it can't drop capabilities.
+      # The page isn't needed here, but rust-embed wants its directory.
+      - name: Secret Service round trip
+        run: |
+          mkdir -p web/dist
+          useradd --create-home tester
+          chown -R tester .
+          runuser -u tester -- dbus-run-session -- sh tests/keyring_session.sh cargo test --locked secret_service -- --ignored --nocapture
+
   # The GNOME app, on Fedora, as in jmarrero's toolbox: GTK 4 and
   # libadwaita as Fedora ships them, newer than Ubuntu's.
   gnome:
@@ -198,7 +219,7 @@ jobs:
   # unless every job it needs succeeded. List every job above in needs.
   ci:
     if: always()
-    needs: [fmt, build, image, gnome, gnome-smoke, flatpak]
+    needs: [fmt, build, image, keyring, gnome, gnome-smoke, flatpak]
     runs-on: ubuntu-latest
     steps:
       - name: Check the jobs it needs

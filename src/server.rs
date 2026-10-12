@@ -588,10 +588,9 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         schedule: Schedule::default(),
         from_hub: false,
     };
-    let path = db.root.join("secrets").join(&c.id);
-    db::write_secret(&path, target.credential.expose())?;
+    db.create_secret(&c.id, target.credential.expose())?;
     if let Err(e) = db.save_connection(&c) {
-        let _ = std::fs::remove_file(path);
+        let _ = db.remove_secrets(&c.id);
         return Err(e.into());
     }
     drop(db);
@@ -1285,8 +1284,20 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     let config = github_app
         .map(|app| AppConfig::new(&app.client_id, &app.callback, &app.users, &hosts))
         .transpose()?;
+    // One service, or credentials migration, per data directory, held for
+    // as long as it runs.
+    db::private_dir(&root)?;
+    let _lock = db::lock(&root)?;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let mut db = Db::open_as(&root, mode)?;
+    let secrets = crate::secrets::open(&root, mode == Mode::Hub)?;
+    println!("Credentials are kept in {}", secrets.describe());
+    db.use_secrets(secrets);
+    match db.drop_unused_secrets() {
+        Ok(0) => (),
+        Ok(n) => println!("Dropped {n} credentials that no connection uses"),
+        Err(e) => eprintln!("Not checking for credentials no connection uses: {e:#}"),
+    }
     let mode = db.mode();
     // With the App or not: a hub started without it keeps no sessions.
     login::forget_user_tokens(&root)?;
