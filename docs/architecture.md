@@ -4,6 +4,7 @@
 flowchart TD
   Web["React browser"] --> API["Rust API"]
   CLI["Rust CLI"] --> API
+  GNOME["GNOME app (GTK 4, libadwaita)"] --> API
   API --> DB["SQLite work state"]
   API --> Secrets["Private credentials"]
   API --> Jira["Jira connector"]
@@ -15,7 +16,7 @@ flowchart TD
   API --> Hub["A hub's external export (companion, read only)"]
 ```
 
-Both clients operate on the same API. The CLI is not a second database writer. The service enforces URL validation, credentials, grouping and synchronization. UI summaries are computed from the same source data returned to the CLI.
+Every client operates on the same API: the page, the CLI and the GNOME app ([gnome.md](gnome.md)). Neither the CLI nor the app is a second database writer, and the app never opens the database. The service enforces URL validation, credentials, grouping and synchronization. UI summaries are computed from the same source data returned to the CLI.
 
 ## Model
 
@@ -53,7 +54,7 @@ The GitHub and bot connectors hold a token that may be able to write: for testin
 - `POST` to the GraphQL endpoint passes only with a JSON body of a `query` document and optional `variables`, when the document parses and every operation in it is a query. A mutation or subscription anywhere in it, even next to queries, an `operationName`, or anything else in the body refuses it. The document sent is printed from what was parsed, so GitHub reads what was checked;
 - everything else is refused before it is sent, and counted.
 
-Its HTTP client is private to that module, and clippy (`clippy.toml`, run with warnings denied) refuses the calls that could send another method anywhere in the crate unless marked as an exception. There are four exceptions: the one send of each read-only client, GitHub's, Fedora Forge's (below) and the companion's client of its hub (see Hub mode), after its check, and the CLI's calls to its own local service. reqwest sends a request through one of three paths, and each is covered:
+Its HTTP client is private to that module, and clippy (`clippy.toml`, run with warnings denied) refuses the calls that could send another method anywhere in the workspace unless marked as an exception. There are five exceptions: the one send of each read-only client, GitHub's, Fedora Forge's (below) and the companion's client of its hub (see Hub mode), after its check, and the CLI's and the GNOME app's calls to their own local service. reqwest sends a request through one of three paths, and each is covered:
 
 - `Client::execute`, on a client or a reference to one: refused, since it sends a `Request` of any method;
 - tower's `Service::call`, which `Client` and `&Client` implement, also when reached generically through `axum::ServiceExt`: refused, for the same reason;
