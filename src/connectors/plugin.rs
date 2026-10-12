@@ -412,11 +412,9 @@ mod tests {
             base_url: "https://forge.example/".into(),
             account_id: "42".into(),
             account_name: "fixture".into(),
-            last_sync: None,
-            error: None,
             zone: Zone::Internal,
-            error_kind: None,
             watch_user: None,
+            ..Default::default()
         }
     }
 

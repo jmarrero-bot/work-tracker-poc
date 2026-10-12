@@ -1,5 +1,5 @@
 use crate::{
-    connector::{self, ConnectorError, Target},
+    connector::{self, Target},
     connectors,
     db::{self, Db},
     model::*,
@@ -168,11 +168,9 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         base_url: base,
         account_id: id,
         account_name: name,
-        last_sync: None,
-        error: None,
         zone: input.zone,
-        error_kind: None,
         watch_user: watch_user.map(str::to_string),
+        ..Default::default()
     };
     let path = db.root.join("secrets").join(&c.id);
     db::write_secret(&path, target.credential.expose())?;
@@ -232,7 +230,8 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
     let _guard = app.sync_gate.lock().await;
     let connections = app.db.lock().unwrap().connections()?;
     let mut results = Vec::new();
-    for mut c in connections {
+    for c in connections {
+        let started = Timestamp::of(std::time::SystemTime::now());
         let (token, old, last, plugins) = {
             let db = app.db.lock().unwrap();
             let plugins = db.root.join(connectors::PLUGINS_DIR);
@@ -244,8 +243,15 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
             let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
             let target = Target::new(&c.base_url, &token?)?;
             Ok::<_, anyhow::Error>(
-                connector::sync_and_watch(source.as_ref(), &target, &c, &old, last.as_ref())
-                    .await?,
+                connector::sync_and_watch(
+                    source.as_ref(),
+                    &target,
+                    &c,
+                    &old,
+                    last.as_ref(),
+                    started,
+                )
+                .await?,
             )
         }
         .await;
@@ -255,31 +261,21 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
         let mut db = app.db.lock().unwrap();
         match result {
             Ok((items, watched)) => {
-                db.save_sync(&c.id, &items, watched.as_ref())?;
-                c.last_sync = Some(db.sql.query_row(
-                    "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')",
-                    [],
-                    |r| r.get(0),
-                )?);
-                c.error = None;
-                c.error_kind = None;
+                // The items and the state that says how fresh they are, in
+                // one transaction.
+                db.save_sync(&c.id, &items, watched.as_ref(), &c.sync.succeeded(started))?;
                 let watched =
                     watched.map(|w| json!({"login":w.login,"items":w.items.len(),"error":w.error}));
                 results.push(json!({"connection":c.id,"label":c.label,"items":items.len(),"watched":watched,"requests":requests}));
             }
             Err(e) => {
-                // Whether to fix a credential or retry later.
-                c.error_kind = Some(
-                    e.downcast_ref::<ConnectorError>()
-                        .map_or(ErrorKind::Invalid, |e| e.kind),
-                );
-                c.error = Some(e.to_string());
+                let state = c.sync.failed(started, &e);
+                db.save_sync_state(&c.id, &state)?;
                 results.push(
-                    json!({"connection":c.id,"label":c.label,"error":c.error,"error_kind":c.error_kind,"requests":requests}),
+                    json!({"connection":c.id,"label":c.label,"error":state.error,"error_kind":state.error_kind,"requests":requests}),
                 );
             }
         };
-        db.save_connection(&c)?;
     }
     Ok(Json(json!({"results":results})))
 }

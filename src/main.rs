@@ -1,3 +1,4 @@
+mod clock;
 mod connector;
 mod connectors;
 mod db;
@@ -364,7 +365,7 @@ async fn main() -> Result<()> {
                     c.account_name,
                     c.zone.label(),
                     watching,
-                    c.error.as_deref().unwrap_or("Ready")
+                    c.sync.error.as_deref().unwrap_or("Ready")
                 );
             }
         }

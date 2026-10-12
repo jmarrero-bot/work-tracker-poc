@@ -293,11 +293,9 @@ fn test_connection() -> crate::model::Connection {
         base_url: "https://example.com/".into(),
         account_id: "1".into(),
         account_name: "me".into(),
-        last_sync: None,
-        error: None,
         zone: crate::model::Zone::Internal,
-        error_kind: None,
         watch_user: None,
+        ..Default::default()
     }
 }
 

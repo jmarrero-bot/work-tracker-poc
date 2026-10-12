@@ -155,11 +155,9 @@ mod tests {
             base_url: "https://github.com/".into(),
             account_id: "1".into(),
             account_name: account.into(),
-            last_sync: None,
-            error: None,
             zone,
-            error_kind: None,
             watch_user: None,
+            ..Default::default()
         }
     }
     fn item(connection: &str, n: u32, reasons: Vec<Reason>, outcome: Outcome) -> Item {
@@ -261,6 +259,7 @@ mod tests {
             login: login.into(),
             items,
             error: error.map(str::to_string),
+            last_success: None,
         };
         let s = snapshot(vec![item("a", 1, vec![ReviewRequested], Outcome::Open)]);
         let lists = [
