@@ -689,6 +689,20 @@ async fn assets(req: Request) -> Response {
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     response
 }
+/// The header Tailscale Funnel adds to every request it brings from the
+/// internet. `tailscale serve` and Funnel strip inbound copies, so a request
+/// that has it came through Funnel.
+const FUNNEL_HEADER: &str = "tailscale-funnel-request";
+/// Refuse anything that came through Tailscale Funnel, which would put the
+/// service on the internet: a hub is for the tailnet only, and a local
+/// service for its own machine.
+async fn refuse_funnel(req: Request, next: Next) -> Response {
+    if req.headers().contains_key(FUNNEL_HEADER) {
+        let message = "Workboard is never served through Tailscale Funnel; use `tailscale serve`";
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": message }))).into_response();
+    }
+    next.run(req).await
+}
 async fn headers(req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;
     response
@@ -808,6 +822,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         .fallback(assets)
         .layer(DefaultBodyLimit::max(65536))
         .layer(middleware::from_fn(headers))
+        .layer(middleware::from_fn(refuse_funnel))
         .with_state(app.clone());
     let running = match mode {
         Mode::Local => "Workboard is running locally",
