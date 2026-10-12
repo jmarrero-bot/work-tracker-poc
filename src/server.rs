@@ -33,6 +33,7 @@ struct App {
     token: Arc<String>,
     origin: String,
     sync_gate: Arc<tokio::sync::Mutex<()>>,
+    connectors: connectors::Shared,
 }
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 struct ApiError(anyhow::Error);
@@ -134,7 +135,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
     }
     let base = connectors::base_url(&input.base_url)?;
     let plugins = app.db.lock().unwrap().root.join(connectors::PLUGINS_DIR);
-    let source = connectors::for_provider(&input.provider, &plugins)?;
+    let source = connectors::for_provider(&input.provider, &plugins, &app.connectors)?;
     let target = Target::new(&base, &input.token)?;
     let account = connector::verify(source.as_ref(), &target).await?;
     let (id, name) = (account.id, account.name);
@@ -184,13 +185,16 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
             let plugins = db.root.join(connectors::PLUGINS_DIR);
             (db.secret(&c.id), db.items()?, plugins)
         };
+        let source = connectors::for_provider(&c.provider, &plugins, &app.connectors);
         let result = async {
-            let token = token?;
-            let source = connectors::for_provider(&c.provider, &plugins)?;
-            let target = Target::new(&c.base_url, &token)?;
+            let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let target = Target::new(&c.base_url, &token?)?;
             Ok::<_, anyhow::Error>(connector::sync(source.as_ref(), &target, &c, &old).await?)
         }
         .await;
+        // What the connector sent, for those that count, so a person can
+        // check that a sync only read.
+        let requests = source.ok().and_then(|s| s.requests());
         let mut db = app.db.lock().unwrap();
         match result {
             Ok(items) => {
@@ -202,7 +206,7 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
                 )?);
                 c.error = None;
                 c.error_kind = None;
-                results.push(json!({"connection":c.id,"label":c.label,"items":items.len()}));
+                results.push(json!({"connection":c.id,"label":c.label,"items":items.len(),"requests":requests}));
             }
             Err(e) => {
                 // Whether to fix a credential or retry later.
@@ -212,7 +216,7 @@ async fn sync(State(app): State<App>) -> ApiResult<Value> {
                 );
                 c.error = Some(e.to_string());
                 results.push(
-                    json!({"connection":c.id,"label":c.label,"error":c.error,"error_kind":c.error_kind}),
+                    json!({"connection":c.id,"label":c.label,"error":c.error,"error_kind":c.error_kind,"requests":requests}),
                 );
             }
         };
@@ -418,6 +422,7 @@ pub async fn serve(root: PathBuf, port: u16, demo: bool) -> Result<()> {
         token: Arc::new(token),
         origin: origin.clone(),
         sync_gate: Arc::new(tokio::sync::Mutex::new(())),
+        connectors: connectors::Shared::default(),
     };
     let api = Router::new()
         .route("/snapshot", get(snapshot))

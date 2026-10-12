@@ -136,6 +136,56 @@ pub fn gitlab_issue(state: &str) -> Derived {
     }
 }
 
+/// GitHub pull requests: merged is delivered, closed without merging isn't,
+/// and a draft is open like any other.
+pub fn github_pull_request(state: &str, merged: bool, draft: bool) -> Derived {
+    match (state, merged) {
+        (_, true) => (Outcome::Delivered, "GitHub pull request was merged".into()),
+        ("open", _) if draft => (Outcome::Open, "GitHub pull request is a draft".into()),
+        ("open", _) => (Outcome::Open, "GitHub pull request is open".into()),
+        ("closed", _) => (
+            Outcome::ClosedWithoutDelivery,
+            "GitHub pull request was closed without merging; decide whether it was abandoned or needs rework".into(),
+        ),
+        (other, _) => (
+            Outcome::Unknown,
+            format!("GitHub reported an unrecognized pull request state '{other}'"),
+        ),
+    }
+}
+
+/// GitHub issues, from the state and the reason it was closed for. An issue
+/// closed without a reason (closed before GitHub recorded them) is not taken
+/// as delivered.
+pub fn github_issue(state: &str, reason: Option<&str>) -> Derived {
+    match (state, reason) {
+        ("open", _) => (Outcome::Open, "GitHub issue is open".into()),
+        ("closed", Some("completed")) => (
+            Outcome::Delivered,
+            "GitHub issue was closed as completed".into(),
+        ),
+        ("closed", Some(r @ ("not_planned" | "duplicate"))) => (
+            Outcome::ClosedWithoutDelivery,
+            format!(
+                "GitHub issue was closed as {}; decide whether it was abandoned or needs rework",
+                r.replace('_', " ")
+            ),
+        ),
+        ("closed", None) => (
+            Outcome::ClosedWithoutDelivery,
+            "GitHub issue was closed without a recorded reason; decide whether it was abandoned or needs rework".into(),
+        ),
+        ("closed", Some(other)) => (
+            Outcome::Unknown,
+            format!("GitHub issue was closed for an unrecognized reason '{other}'"),
+        ),
+        (other, _) => (
+            Outcome::Unknown,
+            format!("GitHub reported an unrecognized issue state '{other}'"),
+        ),
+    }
+}
+
 /// Jira resolutions that mean the work was delivered, compared
 /// case-insensitively. Any other resolution (Won't Do, Duplicate, Not a Bug,
 /// Obsolete, ...) is closed without delivery.
@@ -265,6 +315,43 @@ mod tests {
             ("locked", Unknown),
         ] {
             assert_eq!(gitlab_issue(state).0, expected, "{state}");
+        }
+    }
+
+    #[test]
+    fn github_pull_requests() {
+        for (state, merged, draft, expected) in [
+            ("open", false, false, Open),
+            ("open", false, true, Open),
+            ("closed", true, false, Delivered),
+            ("closed", false, false, ClosedWithoutDelivery),
+            ("closed", false, true, ClosedWithoutDelivery),
+            ("locked", false, false, Unknown),
+        ] {
+            let (outcome, reason) = github_pull_request(state, merged, draft);
+            assert_eq!(outcome, expected, "{state} merged={merged} draft={draft}");
+            assert!(reason.contains("pull request"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn github_issues() {
+        for (state, reason, expected) in [
+            ("open", None, Open),
+            ("open", Some("reopened"), Open),
+            ("closed", Some("completed"), Delivered),
+            ("closed", Some("not_planned"), ClosedWithoutDelivery),
+            ("closed", Some("duplicate"), ClosedWithoutDelivery),
+            // Closed is not delivered without a reason saying so.
+            ("closed", None, ClosedWithoutDelivery),
+            ("closed", Some("spam"), Unknown),
+            ("deleted", None, Unknown),
+        ] {
+            assert_eq!(
+                github_issue(state, reason).0,
+                expected,
+                "{state} {reason:?}"
+            );
         }
     }
 

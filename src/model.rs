@@ -131,9 +131,6 @@ pub struct ManualInput {
 pub fn is_gitlab(provider: &str) -> bool {
     matches!(provider, "gitlab-internal" | "gitlab-public")
 }
-pub fn supported(provider: &str) -> bool {
-    provider == "jira" || is_gitlab(provider)
-}
 pub fn valid_provider(provider: &str) -> bool {
-    supported(provider) || matches!(provider, "github" | "fedora" | "errata")
+    is_gitlab(provider) || matches!(provider, "jira" | "github" | "fedora" | "errata")
 }
