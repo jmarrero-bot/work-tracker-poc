@@ -1,6 +1,7 @@
 use crate::{model::*, outcome};
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection as Sqlite, Transaction, TransactionBehavior};
+use anyhow::{anyhow, bail, Context, Result};
+use rusqlite::{params, Connection as Sqlite, OptionalExtension, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -39,7 +40,7 @@ pub fn remove_if_there(path: &Path) -> Result<()> {
 
 /// The schema version this build writes, kept in SQLite's `user_version`.
 /// Version 0 is the prototype's schema, whose items only had a `terminal` flag.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 fn schema_version(sql: &Sqlite) -> Result<i32> {
     let version = sql.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -86,6 +87,12 @@ fn migrate(sql: &mut Sqlite, root: &Path) -> Result<()> {
     if version < 5 {
         migrate_sync_state(&tx).context("Cannot move sync state out of stored connections")?;
     }
+    if version < 6 {
+        // Version 6: settings of the data directory, such as its mode,
+        // recorded when a service first opens it.
+        tx.execute_batch(SETTINGS_TABLE)
+            .context("Cannot add the data directory's settings")?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -110,6 +117,41 @@ fn backup(sql: &Sqlite, path: &Path) -> Result<()> {
         .with_context(|| format!("Cannot back up the database to {target} before upgrading it"))?;
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Record that the database is opened as `mode`, or fail if it was first
+/// opened as the other. One that recorded no mode yet, from before modes
+/// existed, may hold internal work, so it becomes a hub only while empty.
+fn claim(sql: &mut Sqlite, mode: Mode) -> Result<()> {
+    let tx = sql.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let recorded: Option<String> = tx
+        .query_row("SELECT value FROM settings WHERE key=?1", [MODE], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let recorded = recorded.as_deref().map(Mode::parse).transpose()?;
+    let has_data: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM items) OR EXISTS(SELECT 1 FROM efforts) OR EXISTS(SELECT 1 FROM connections)",
+        [],
+        |r| r.get(0),
+    )?;
+    match (recorded, mode) {
+        (Some(recorded), mode) if recorded == mode => return Ok(()),
+        (Some(Mode::Hub), _) => bail!(
+            "This data directory is a hub's. Start it with `workboard serve --hub`; a hub never holds internal work, and starting it otherwise could add some"
+        ),
+        (None, Mode::Hub) if !has_data => (),
+        (_, Mode::Hub) => bail!(
+            "This data directory isn't a hub's, and may hold internal work. Start the hub with a new --data-dir"
+        ),
+        (_, Mode::Local) => (),
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO settings(key,value) VALUES(?1,?2)",
+        [MODE, mode.name()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -225,6 +267,75 @@ fn migrate_sync_state(tx: &Transaction) -> Result<()> {
     Ok(())
 }
 
+/// Settings of the data directory, by name.
+const SETTINGS_TABLE: &str =
+    "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)";
+/// The setting that records the data directory's [`Mode`].
+const MODE: &str = "mode";
+
+/// What a data directory is for, recorded the first time a service opens
+/// it, so it can't be started as the other later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// A person's own service, internal and external work alike, on the
+    /// machine that syncs it. With a hub set, it is the companion.
+    Local,
+    /// A hub: external work only. Every write is checked, and anything not
+    /// shown to be external is refused.
+    Hub,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Hub => "hub",
+        }
+    }
+    fn parse(name: &str) -> Result<Self> {
+        [Self::Local, Self::Hub]
+            .into_iter()
+            .find(|m| m.name() == name)
+            .ok_or_else(|| anyhow!("This data directory has an unknown mode, '{name}'; use the Workboard that made it"))
+    }
+}
+
+/// A write into the database, as a hub's check sees it. Each write method
+/// says which it is before it writes anything; see [`Db::admit`].
+enum Write<'a> {
+    /// A connection's settings.
+    Connection(&'a Connection),
+    /// What a sync of connection `id` found.
+    Sync {
+        id: &'a str,
+        items: &'a [Item],
+        watched: Option<&'a WatchList>,
+    },
+    /// A connection's sync state alone.
+    SyncState,
+    /// Whom connection `id` watches.
+    Watch(&'a str),
+    /// A manual source link, new or changed.
+    Manual,
+    /// The demo's illustrative work.
+    Demo,
+    /// An effort, linking these items.
+    Effort(&'a [String]),
+    /// Linking an item to an effort, or ungrouping it.
+    Link(&'a str),
+    /// A person's decision about work already stored: abandoning a synced
+    /// item, or sharing an effort's title.
+    Decision,
+    /// Removing a connection and everything it brought.
+    Disconnect,
+}
+
+/// What a hub refuses, and why.
+fn refused(what: &str) -> anyhow::Error {
+    anyhow!("This is a hub, which keeps external work only, so it refuses {what}")
+}
+
 /// Each connection's [`SyncState`], one row each.
 const SYNC_STATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS sync_state(
   connection_id TEXT PRIMARY KEY,
@@ -320,6 +431,7 @@ fn upsert_synced(tx: &Transaction, items: &[Item]) -> Result<()> {
 pub struct Db {
     sql: Sqlite,
     pub root: PathBuf,
+    mode: Mode,
 }
 impl Db {
     /// The SQL connection, for tests that set up or break what they need.
@@ -327,7 +439,15 @@ impl Db {
     pub fn sql(&self) -> &Sqlite {
         &self.sql
     }
+    /// Open a local data directory, as tests do.
+    #[cfg(test)]
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_as(root, Mode::Local)
+    }
+    /// Open a data directory as `mode`: the mode it was first opened as, or,
+    /// for a new one, the mode it becomes. A local directory with data may
+    /// hold internal work, so it never becomes a hub.
+    pub fn open_as(root: &Path, mode: Mode) -> Result<Self> {
         private_dir(root)?;
         private_dir(&root.join("secrets"))?;
         let mut sql = Sqlite::open(root.join("work.sqlite"))?;
@@ -339,10 +459,114 @@ impl Db {
         migrate(&mut sql, root)?;
         #[cfg(unix)]
         fs::set_permissions(root.join("work.sqlite"), fs::Permissions::from_mode(0o600))?;
-        Ok(Self {
+        claim(&mut sql, mode)?;
+        let db = Self {
             sql,
             root: root.to_path_buf(),
-        })
+            mode,
+        };
+        if mode == Mode::Hub {
+            db.check_hub()?;
+        }
+        Ok(db)
+    }
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+    /// Refuse a hub's database that holds anything not external, as one
+    /// changed behind its back would.
+    fn check_hub(&self) -> Result<()> {
+        let refuse = |what: String| {
+            anyhow!("This hub's database holds {what}, which a hub never keeps; it won't start with it. Move the data directory aside and start the hub with a new one")
+        };
+        let connections = self.connections()?;
+        if let Some(c) = connections.iter().find(|c| c.zone != Zone::External) {
+            return Err(refuse(format!("an internal connection ({})", c.id)));
+        }
+        let external =
+            |id: Option<&str>| id.is_some_and(|id| connections.iter().any(|c| c.id == id));
+        for (id, body) in self.rows("SELECT id,body FROM items")? {
+            let item: Item = serde_json::from_str(&body)?;
+            if !external(item.connection_id.as_deref()) || item.zone != Zone::External {
+                return Err(refuse(format!("work that isn't external ({id})")));
+            }
+        }
+        for (id, _) in self.rows("SELECT connection_id,body FROM watched")? {
+            if !external(Some(&id)) {
+                return Err(refuse(format!(
+                    "a watch list of no external connection ({id})"
+                )));
+            }
+        }
+        Ok(())
+    }
+    /// The pairs of text columns `query` selects.
+    fn rows(&self, query: &str) -> Result<Vec<(String, String)>> {
+        let mut s = self.sql.prepare(query)?;
+        let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+    /// Check a write before it is made. A local service takes every write.
+    /// A hub takes only what is shown to be external, and nothing else:
+    /// each kind of write is listed, and one that can't show its work is
+    /// external is refused.
+    fn admit(&self, write: Write) -> Result<()> {
+        if self.mode == Mode::Local {
+            return Ok(());
+        }
+        match write {
+            Write::Connection(c) => {
+                if c.zone != Zone::External {
+                    return Err(refused(
+                        "internal connections; connect only external sources here, with --external",
+                    ));
+                }
+            }
+            Write::Sync { id, items, watched } => {
+                self.external_connection(id)?;
+                let theirs =
+                    |i: &Item| i.connection_id.as_deref() == Some(id) && i.zone == Zone::External;
+                let watched_ok =
+                    watched.is_none_or(|w| w.connection_id == id && w.items.iter().all(theirs));
+                if !items.iter().all(theirs) || !watched_ok {
+                    return Err(refused("work that isn't its external connection's"));
+                }
+            }
+            Write::Watch(id) => self.external_connection(id)?,
+            Write::Manual => {
+                return Err(refused(
+                    "manual source links, which are internal; add them on the companion",
+                ))
+            }
+            Write::Demo => return Err(refused("the demo's illustrative work, which is internal")),
+            Write::Effort(items) => {
+                for id in items {
+                    self.external_item(id)?;
+                }
+            }
+            Write::Link(item) => self.external_item(item)?,
+            // These add no work: they change or remove what was admitted.
+            Write::SyncState | Write::Decision | Write::Disconnect => (),
+        }
+        Ok(())
+    }
+    /// Fail unless `id` is a stored external connection.
+    fn external_connection(&self, id: &str) -> Result<()> {
+        match self.connection(id) {
+            Ok(c) if c.zone == Zone::External => Ok(()),
+            _ => Err(refused("work of a connection that isn't external")),
+        }
+    }
+    /// Fail unless `id` is a stored item of an external connection.
+    fn external_item(&self, id: &str) -> Result<()> {
+        let external = self
+            .items()?
+            .iter()
+            .any(|i| i.id == id && i.zone == Zone::External);
+        if !external {
+            return Err(refused("linking anything but its external work"));
+        }
+        Ok(())
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
         let items = self.items()?;
@@ -392,6 +616,7 @@ impl Db {
     /// Save a connection's settings. Its sync state is saved only with what
     /// a sync found, by [`Db::save_sync`] or [`Db::save_sync_state`].
     pub fn save_connection(&self, c: &Connection) -> Result<()> {
+        self.admit(Write::Connection(c))?;
         self.sql.execute("INSERT INTO connections VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![c.id,connection_body(c)?])?;
         Ok(())
     }
@@ -464,7 +689,9 @@ impl Db {
         })
         .collect()
     }
+    /// Save a manual source link, new or changed.
     pub fn upsert_item(&self, i: &Item) -> Result<()> {
+        self.admit(Write::Manual)?;
         self.sql.execute(
             "INSERT INTO items(id,body,effort_id) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
             params![i.id, serde_json::to_string(i)?, i.effort_id],
@@ -486,6 +713,7 @@ impl Db {
         if item.connection_id.is_none() {
             bail!("Set a manual item's outcome with its status edit instead")
         }
+        self.admit(Write::Decision)?;
         if abandoned
             && !force
             && !(item.outcome.needs_attention() || item.outcome == Outcome::Abandoned)
@@ -521,6 +749,7 @@ impl Db {
         watched: Option<&WatchList>,
         state: &SyncState,
     ) -> Result<()> {
+        self.admit(Write::Sync { id, items, watched })?;
         let tx = self.sql.transaction()?;
         check_connected(&tx, id)?;
         upsert_synced(&tx, items)?;
@@ -547,6 +776,7 @@ impl Db {
     /// Save the sync state of connection `id` after a sync that failed,
     /// leaving its items as they were.
     pub fn save_sync_state(&mut self, id: &str, state: &SyncState) -> Result<()> {
+        self.admit(Write::SyncState)?;
         let tx = self.sql.transaction()?;
         check_connected(&tx, id)?;
         write_sync_state(&tx, id, state)?;
@@ -592,6 +822,7 @@ impl Db {
     /// Watch another user from connection `id`, or stop. What was found for
     /// whoever it watched before is dropped.
     pub fn set_watch_user(&mut self, id: &str, login: Option<&str>) -> Result<Connection> {
+        self.admit(Write::Watch(id))?;
         let mut c = self.connection(id)?;
         c.watch_user = login.map(str::to_string);
         let tx = self.sql.transaction()?;
@@ -621,6 +852,7 @@ impl Db {
         if input.title.trim().is_empty() || input.title.len() > 250 {
             bail!("Enter a title of 1–250 characters")
         }
+        self.admit(Write::Effort(&input.item_ids))?;
         let e = Effort {
             id: Uuid::new_v4().to_string(),
             title: input.title.trim().into(),
@@ -647,6 +879,7 @@ impl Db {
     /// Let an effort's title leave this machine with its external items, or
     /// stop it.
     pub fn share_title(&self, id: &str, share: bool) -> Result<Effort> {
+        self.admit(Write::Decision)?;
         if self.sql.execute(
             "UPDATE efforts SET share_title=?1 WHERE id=?2",
             params![share, id],
@@ -660,6 +893,7 @@ impl Db {
             .context("Effort not found")
     }
     pub fn link(&self, item: &str, effort: Option<&str>) -> Result<()> {
+        self.admit(Write::Link(item))?;
         if let Some(e) = effort {
             if !self.efforts()?.iter().any(|v| v.id == e) {
                 bail!("Effort not found")
@@ -675,6 +909,7 @@ impl Db {
         Ok(())
     }
     pub fn delete_connection(&mut self, id: &str) -> Result<()> {
+        self.admit(Write::Disconnect)?;
         self.connection(id)?;
         Uuid::parse_str(id)?;
         let ids: Vec<_> = self
@@ -700,6 +935,7 @@ impl Db {
         Ok(())
     }
     pub fn seed(&mut self) -> Result<()> {
+        self.admit(Write::Demo)?;
         if !self.items()?.is_empty() || !self.efforts()?.is_empty() {
             bail!("Demo data requires an empty database; use a separate --data-dir")
         }
@@ -1452,6 +1688,245 @@ mod tests {
                 .all(|b| !b.contains("last_sync") && !b.contains("error")),
             "{bodies:?}"
         );
+    }
+
+    #[test]
+    fn a_data_directory_keeps_its_mode() {
+        use Mode::*;
+        let temp = tempfile::tempdir().unwrap();
+        let fresh = |name: &str| temp.path().join(name);
+        // (first opened as, then as, opens)
+        let cases = [
+            (Hub, Hub, true),
+            (Hub, Local, false),
+            (Local, Local, true),
+            // Even while empty: a local directory never becomes a hub.
+            (Local, Hub, false),
+        ];
+        for (n, (first, then, opens)) in cases.into_iter().enumerate() {
+            let root = fresh(&format!("case-{n}"));
+            drop(Db::open_as(&root, first).unwrap());
+            let opened = Db::open_as(&root, then);
+            assert_eq!(opened.is_ok(), opens, "case {n}");
+            if let Ok(db) = opened {
+                assert_eq!(db.mode(), then);
+            }
+        }
+        // From before modes were recorded: it may hold internal work, so it
+        // becomes a hub only while empty.
+        for (seeded, hub) in [(true, false), (false, true)] {
+            let root = fresh(&format!("unrecorded-{seeded}"));
+            let mut db = Db::open(&root).unwrap();
+            if seeded {
+                db.seed().unwrap();
+            }
+            db.sql.execute("DELETE FROM settings", []).unwrap();
+            drop(db);
+            assert_eq!(Db::open_as(&root, Hub).is_ok(), hub, "{seeded}");
+        }
+        // A hub's database with internal work in it, as if changed behind
+        // its back, isn't opened.
+        let root = fresh("tampered");
+        let db = Db::open_as(&root, Hub).unwrap();
+        db.sql
+            .execute(
+                "INSERT INTO connections VALUES('c1',?1)",
+                [serde_json::to_string(&connection("c1", Zone::Internal)).unwrap()],
+            )
+            .unwrap();
+        drop(db);
+        let error = Db::open_as(&root, Hub).err().unwrap().to_string();
+        assert!(error.contains("internal connection"), "{error}");
+    }
+
+    /// Every table's rows, as text.
+    fn dump(db: &Db) -> String {
+        use rusqlite::types::ValueRef;
+        let tables = db
+            .rows("SELECT name,sql FROM sqlite_master WHERE type='table'")
+            .unwrap();
+        let mut out = String::new();
+        for (table, _) in tables {
+            let mut s = db.sql.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns = s.column_count();
+            let rows = s
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|n| {
+                            Ok(match r.get_ref(n)? {
+                                ValueRef::Text(t) | ValueRef::Blob(t) => {
+                                    String::from_utf8_lossy(t).into_owned()
+                                }
+                                other => format!("{other:?}"),
+                            })
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap();
+            for row in rows {
+                out += &row.unwrap().join(",");
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_hub_refuses_every_write_of_work_not_shown_external() {
+        // Everything refused carries this, so a leak shows in the dump.
+        const INTERNAL: &str = "INTERNAL";
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_as(&temp.path().join("hub"), Mode::Hub).unwrap();
+        let external = connection("c0ffee00-0000-4000-8000-00000000000e", Zone::External);
+        let internal = Connection {
+            label: format!("{INTERNAL} label"),
+            ..connection("c0ffee00-0000-4000-8000-000000000001", Zone::Internal)
+        };
+        db.save_connection(&external).unwrap();
+        let ok = SyncState::default().succeeded(Timestamp::from_unix(1_791_763_200));
+        let item = |c: &Connection, zone: Zone, n: u32| Item {
+            id: format!("{}:errata:{n}", c.id),
+            connection_id: Some(c.id.clone()),
+            provider: "errata".into(),
+            remote_id: n.to_string(),
+            key: format!("K-{n}"),
+            title: if zone == Zone::External && c.zone == Zone::External {
+                format!("external {n}")
+            } else {
+                format!("{INTERNAL} {n}")
+            },
+            url: format!("https://example.com/{n}"),
+            status: "open".into(),
+            outcome: Outcome::Open,
+            outcome_reason: String::new(),
+            action: "next".into(),
+            updated_at: String::new(),
+            effort_id: None,
+            abandoned_at: None,
+            demo: false,
+            zone,
+            reasons: vec![],
+            synced_at: None,
+            stale: false,
+        };
+        let theirs = item(&external, Zone::External, 1);
+        db.save_sync(&external.id, std::slice::from_ref(&theirs), None, &ok)
+            .unwrap();
+        let watch = |items: Vec<Item>| WatchList {
+            connection_id: external.id.clone(),
+            login: "someone".into(),
+            items,
+            error: None,
+            last_success: None,
+        };
+        let manual = Item {
+            connection_id: None,
+            ..item(&internal, Zone::Internal, 9)
+        };
+        type Attempt<'a> = Box<dyn Fn(&mut Db) -> Result<()> + 'a>;
+        let refused: Vec<(&str, Attempt)> = vec![
+            (
+                "an internal connection",
+                Box::new(|db| db.save_connection(&internal)),
+            ),
+            (
+                "a row that says internal",
+                Box::new(|db| {
+                    db.save_sync(
+                        &external.id,
+                        &[item(&external, Zone::Internal, 2)],
+                        None,
+                        &ok,
+                    )
+                }),
+            ),
+            (
+                "another connection's work",
+                Box::new(|db| {
+                    db.save_sync(
+                        &external.id,
+                        &[item(&internal, Zone::External, 3)],
+                        None,
+                        &ok,
+                    )
+                }),
+            ),
+            (
+                "an internal connection's sync",
+                Box::new(|db| {
+                    db.save_sync(
+                        &internal.id,
+                        &[item(&internal, Zone::Internal, 4)],
+                        None,
+                        &ok,
+                    )
+                }),
+            ),
+            (
+                "a watch list with internal work",
+                Box::new(|db| {
+                    let list = watch(vec![item(&internal, Zone::Internal, 5)]);
+                    db.save_sync(&external.id, &[], Some(&list), &ok)
+                }),
+            ),
+            (
+                "a manual source link",
+                Box::new(|db| db.upsert_item(&manual)),
+            ),
+            ("the demo", Box::new(|db| db.seed())),
+            (
+                "an effort over unknown work",
+                Box::new(|db| {
+                    db.create_effort(EffortInput {
+                        title: format!("{INTERNAL} effort"),
+                        note: String::new(),
+                        item_ids: vec![manual.id.clone()],
+                        share_title: false,
+                    })
+                    .map(drop)
+                }),
+            ),
+            (
+                "linking unknown work",
+                Box::new(|db| db.link(&manual.id, None)),
+            ),
+            (
+                "watching from an internal connection",
+                Box::new(|db| db.set_watch_user(&internal.id, Some(INTERNAL)).map(drop)),
+            ),
+        ];
+        for (what, attempt) in &refused {
+            let error = attempt(&mut db)
+                .err()
+                .unwrap_or_else(|| panic!("{what} passed"));
+            assert!(error.to_string().contains("hub"), "{what}: {error}");
+        }
+        let dump = dump(&db);
+        assert!(!dump.contains(INTERNAL), "{dump}");
+        // What is external passes.
+        let list = watch(vec![item(&external, Zone::External, 6)]);
+        db.save_sync(
+            &external.id,
+            std::slice::from_ref(&theirs),
+            Some(&list),
+            &ok,
+        )
+        .unwrap();
+        let e = db
+            .create_effort(EffortInput {
+                title: "Ship it".into(),
+                note: String::new(),
+                item_ids: vec![theirs.id.clone()],
+                share_title: false,
+            })
+            .unwrap();
+        db.link(&theirs.id, None).unwrap();
+        db.link(&theirs.id, Some(&e.id)).unwrap();
+        db.share_title(&e.id, true).unwrap();
+        db.set_watch_user(&external.id, Some("someone")).unwrap();
+        drop(db);
+        // And it opens again.
+        Db::open_as(&temp.path().join("hub"), Mode::Hub).unwrap();
     }
 
     #[test]
