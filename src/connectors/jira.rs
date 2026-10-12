@@ -163,6 +163,7 @@ pub fn jira_item(base: &Url, v: &Value, action: &str) -> Result<RemoteItem> {
         action: action.into(),
         updated_at: string(&v["fields"], "updated")?,
         reasons: vec![],
+        bot: None,
     })
 }
 

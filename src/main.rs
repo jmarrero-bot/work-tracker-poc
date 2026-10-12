@@ -1,3 +1,4 @@
+mod bot;
 mod clock;
 mod connector;
 mod connectors;
@@ -56,12 +57,12 @@ enum Command {
         #[arg(long, value_name = "INTERVAL", default_value = "5m", value_parser = interval)]
         sync_interval: Duration,
     },
-    /// Connect Jira Data Center, a GitLab instance, GitHub, Fedora Forge,
-    /// or a source served by a connector plugin, using a personal token.
-    /// GitHub and Fedora Forge are only ever read: requests that could
-    /// change them are refused.
+    /// Connect Jira Data Center, a GitLab instance, GitHub, Fedora Forge, a
+    /// harness bot's work on GitHub, or a source served by a connector
+    /// plugin, using a personal token. GitHub, Fedora Forge and the bot are
+    /// only ever read: requests that could change them are refused.
     Connect {
-        #[arg(value_parser=["jira","gitlab-internal","gitlab-public","github","fedora","errata"])]
+        #[arg(value_parser=["jira","gitlab-internal","gitlab-public","github","fedora","bot","errata"])]
         provider: String,
         #[arg(long)]
         url: String,
@@ -85,6 +86,8 @@ enum Command {
         /// often as the service's default.
         #[arg(long, value_name = "INTERVAL", value_parser = interval)]
         sync_interval: Option<Duration>,
+        #[command(flatten)]
+        bot: BotArgs,
     },
     /// List connection identities and sync health: when each last synced,
     /// when it syncs next, and whether it needs you.
@@ -254,6 +257,48 @@ enum Command {
         rotate: bool,
     },
 }
+/// Where a bot's work is, for `connect bot`. All are needed; none is
+/// assumed.
+#[derive(clap::Args)]
+struct BotArgs {
+    /// For the bot: the Projects board it works from, as orgs/OWNER/NUMBER
+    /// or users/OWNER/NUMBER, or the board's address.
+    #[arg(long, value_name = "BOARD")]
+    board: Option<String>,
+    /// For the bot: the repository where work is asked of it, as OWNER/REPO.
+    #[arg(long, value_name = "OWNER/REPO")]
+    tracker: Option<String>,
+    /// For the bot: the tracker issue whose comment holds its heartbeat.
+    #[arg(long, value_name = "NUMBER")]
+    heartbeat: Option<u64>,
+    /// For the bot: its GitHub login.
+    #[arg(long, value_name = "LOGIN")]
+    bot_login: Option<String>,
+    /// For the bot: the organization that holds its forks.
+    #[arg(long, value_name = "ORG")]
+    forge_org: Option<String>,
+}
+impl BotArgs {
+    /// The bot's settings, if any were given; the service checks them.
+    fn input(self) -> Result<Option<BotInput>> {
+        let given = self.board.is_some()
+            || self.tracker.is_some()
+            || self.heartbeat.is_some()
+            || self.bot_login.is_some()
+            || self.forge_org.is_some();
+        if !given {
+            return Ok(None);
+        }
+        let missing = |what: &str| anyhow!("Give the bot's {what} too");
+        Ok(Some(BotInput {
+            board: self.board.ok_or_else(|| missing("--board"))?,
+            tracker: self.tracker.ok_or_else(|| missing("--tracker"))?,
+            heartbeat_issue: self.heartbeat.ok_or_else(|| missing("--heartbeat"))?,
+            bot_login: self.bot_login.ok_or_else(|| missing("--bot-login"))?,
+            forge_org: self.forge_org.ok_or_else(|| missing("--forge-org"))?,
+        }))
+    }
+}
 #[derive(Subcommand)]
 enum HubCommand {
     /// Pull from the hub at URL, with its companion token: the hub's
@@ -372,6 +417,7 @@ async fn main() -> Result<()> {
             external,
             watch_user,
             sync_interval,
+            bot,
         } => {
             let token = read_token(token_env, token_stdin)?.ok_or_else(|| {
                 anyhow!("Use --token-stdin or --token-env NAME. Tokens are never command-line arguments.")
@@ -388,6 +434,7 @@ async fn main() -> Result<()> {
                 },
                 watch_user,
                 sync_interval: sync_interval.map(|i| i.as_secs()),
+                bot: bot.input()?,
             };
             let c: Connection = request(
                 &client,

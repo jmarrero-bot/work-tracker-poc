@@ -5,8 +5,10 @@
 //! Every request goes through the read-only client in `readonly`, which
 //! refuses anything that could write.
 
+mod bot;
 mod readonly;
 
+pub use bot::Bot;
 pub use readonly::Memory;
 
 use super::inaccessible;
@@ -16,7 +18,7 @@ use crate::{
         Refreshed, RemoteItem, Requests, Target, Tracked,
     },
     connectors::source_url,
-    model::valid_github_login,
+    model::{valid_github_login, valid_github_name},
     outcome,
 };
 use anyhow::{bail, Context, Result};
@@ -298,24 +300,13 @@ fn direct_over_team(items: &mut [RemoteItem]) {
 /// How a draft pull request's status reads.
 const DRAFT: &str = "draft";
 
-/// Whether `name` can be a GitHub owner or repository name, and so is safe
-/// in an API path.
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 100
-        && name != "."
-        && name != ".."
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-}
-
 /// `OWNER/REPO` and the number of a key such as `OWNER/REPO#12`.
 fn parse_key(key: &str) -> Option<(String, u64)> {
     let (repository, number) = key.rsplit_once('#')?;
     let (owner, repo) = repository.split_once('/')?;
     let number = number.parse().ok()?;
-    (valid_name(owner) && valid_name(repo)).then(|| (format!("{owner}/{repo}"), number))
+    (valid_github_name(owner) && valid_github_name(repo))
+        .then(|| (format!("{owner}/{repo}"), number))
 }
 
 /// `OWNER/REPO` from an issue's `repository_url`, its API address.
@@ -327,7 +318,7 @@ fn repository(v: &Value) -> Result<String> {
         .rev();
     let (repo, owner) = (segments.next(), segments.next());
     match (owner, repo) {
-        (Some(owner), Some(repo)) if valid_name(owner) && valid_name(repo) => {
+        (Some(owner), Some(repo)) if valid_github_name(owner) && valid_github_name(repo) => {
             Ok(format!("{owner}/{repo}"))
         }
         _ => bail!("Invalid repository address"),
@@ -376,6 +367,7 @@ pub fn github_item(v: &Value, action: &str) -> Result<RemoteItem> {
             .context("Missing update time")?
             .into(),
         reasons: vec![],
+        bot: None,
     })
 }
 

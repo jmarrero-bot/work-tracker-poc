@@ -209,8 +209,6 @@ struct Answer {
 }
 
 /// What GitHub's GraphQL API answered: what it could read, and its errors.
-// The bot plugin (#9) reads Projects v2, which only GraphQL serves.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct GraphqlAnswer {
     pub data: Value,
@@ -492,8 +490,6 @@ impl ReadOnly {
     /// and return its `data`, with the errors GitHub answered next to what
     /// it could read, such as one for each ID that names nothing, for the
     /// caller to judge.
-    // The bot plugin (#9) reads Projects v2, which only GraphQL serves.
-    #[allow(dead_code)]
     pub async fn graphql(
         &self,
         target: &Target,

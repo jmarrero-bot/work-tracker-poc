@@ -1179,6 +1179,7 @@ impl Db {
                 synced_at: None,
                 stale: false,
                 from_hub: false,
+                bot: None,
             })?;
         }
         self.create_effort(EffortInput {title:"Ship the bootc storage fix".into(),note:"Example effort linking upstream work, a RHEL backport and an advisory. All items are illustrative.".into(),item_ids:[0,1,2,3,6].map(|n|format!("demo-{n}")).to_vec(),share_title:false})?;
@@ -1464,6 +1465,7 @@ mod tests {
             synced_at: None,
             stale: false,
             from_hub: false,
+            bot: None,
         }
     }
 
@@ -2032,6 +2034,7 @@ mod tests {
             synced_at: None,
             stale: false,
             from_hub: false,
+            bot: None,
         };
         let theirs = item(&external, Zone::External, 1);
         db.save_sync(&external.id, std::slice::from_ref(&theirs), None, &ok)

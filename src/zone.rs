@@ -313,6 +313,14 @@ mod tests {
                 held_until: None,
             },
             from_hub: false,
+            // Not exported: where a bot's work is says nothing about it.
+            bot: Some(crate::model::BotConfig {
+                board_owner: format!("{INTERNAL}-owner"),
+                tracker: format!("{INTERNAL}/tracker"),
+                bot_login: format!("{INTERNAL}-bot"),
+                forge_org: format!("{INTERNAL}-forge"),
+                ..crate::bot::tests::config()
+            }),
         }
     }
     /// An item of `connection`, or a manual one, whose row says `zone`.
@@ -348,6 +356,13 @@ mod tests {
             synced_at: None,
             stale: false,
             from_hub: false,
+            // Not exported, until someone decides it may leave.
+            bot: Some(crate::model::BotFields {
+                why: Some(format!("{INTERNAL} why {n}")),
+                news: Some(format!("{INTERNAL} news {n}")),
+                priority: Some(format!("{INTERNAL} priority {n}")),
+                ..Default::default()
+            }),
         }
     }
     /// An effort whose title is tagged internal unless it's shared.

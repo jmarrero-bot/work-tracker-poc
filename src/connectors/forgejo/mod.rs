@@ -363,6 +363,7 @@ pub fn forgejo_item(v: &Value, action: &str) -> Result<RemoteItem> {
             .context("Missing update time")?
             .into(),
         reasons: vec![],
+        bot: None,
     })
 }
 

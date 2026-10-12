@@ -186,6 +186,55 @@ pub fn github_issue(state: &str, reason: Option<&str>) -> Derived {
     }
 }
 
+/// What the pull request linked from a board item (its Branch) came to, as
+/// far as it was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Linked {
+    /// It has none, or its Branch isn't a pull request.
+    Absent,
+    Merged,
+    NotMerged,
+    /// It is missing, or hidden from the account.
+    Unreadable,
+}
+
+/// The status on the bot's board that says the bot is done with an item.
+pub const BOARD_DONE: &str = "Done";
+
+/// An item on the bot's board, from its board status, what its own issue
+/// or pull request came to (`content`, from [`github_issue`] or
+/// [`github_pull_request`]), and its linked pull request. The board saying
+/// Done is not delivery: only a merged pull request, its own or the linked
+/// one, or its issue closed as completed is. Done otherwise needs a
+/// person's decision.
+pub fn bot_board_item(status: Option<&str>, content: Derived, linked: Linked) -> Derived {
+    let board = status.unwrap_or("no status");
+    let done = status == Some(BOARD_DONE);
+    match (content.0, done, linked) {
+        (Outcome::Delivered, _, _) => (
+            Outcome::Delivered,
+            format!("{}; the bot's board says {board}", content.1),
+        ),
+        (_, true, Linked::Merged) => (
+            Outcome::Delivered,
+            "Done on the bot's board, and its linked pull request was merged".into(),
+        ),
+        (_, true, Linked::Unreadable) => (
+            Outcome::Unknown,
+            "Done on the bot's board, but its linked pull request can't be read".into(),
+        ),
+        (_, true, Linked::Absent | Linked::NotMerged) => (
+            Outcome::ClosedWithoutDelivery,
+            "Done on the bot's board, but no pull request of it was merged and its issue wasn't closed as completed; decide whether it was abandoned or needs rework".into(),
+        ),
+        (Outcome::Open, false, _) => (Outcome::Open, format!("{board} on the bot's board")),
+        (outcome, false, _) => (
+            outcome,
+            format!("{}; the bot's board still says {board}", content.1),
+        ),
+    }
+}
+
 /// Forgejo pull requests, such as Fedora Forge's: merged is delivered,
 /// closed without merging isn't, and a draft (a work-in-progress title) is
 /// open like any other.
@@ -391,6 +440,57 @@ mod tests {
                 "{state} {reason:?}"
             );
         }
+    }
+
+    #[test]
+    fn bot_board_items_are_delivered_only_by_a_merge_or_a_completed_issue() {
+        use Linked::*;
+        use Outcome::*;
+        let open_issue = || github_issue("open", None);
+        let completed = || github_issue("closed", Some("completed"));
+        let not_planned = || github_issue("closed", Some("not_planned"));
+        let merged_pr = || github_pull_request("merged", true, false);
+        let closed_pr = || github_pull_request("closed", false, false);
+        // (board status, its own issue or pull request, linked, outcome)
+        let cases = [
+            (Some("Done"), merged_pr(), Absent, Delivered),
+            (Some("Done"), completed(), Absent, Delivered),
+            (Some("Done"), open_issue(), Merged, Delivered),
+            (Some("Done"), not_planned(), Merged, Delivered),
+            // Closed is not delivered, and neither is the board saying Done.
+            (Some("Done"), open_issue(), Absent, ClosedWithoutDelivery),
+            (
+                Some("Done"),
+                not_planned(),
+                NotMerged,
+                ClosedWithoutDelivery,
+            ),
+            (Some("Done"), closed_pr(), Absent, ClosedWithoutDelivery),
+            (Some("Done"), open_issue(), Unreadable, Unknown),
+            // The work landed, whatever the board still says.
+            (Some("Draft"), merged_pr(), Absent, Delivered),
+            (None, completed(), Absent, Delivered),
+            // Not done: a merged Branch alone doesn't finish the item.
+            (Some("In Review"), open_issue(), Merged, Open),
+            (Some("Needs human"), open_issue(), Absent, Open),
+            (None, open_issue(), Absent, Open),
+            (
+                Some("In Progress"),
+                not_planned(),
+                Absent,
+                ClosedWithoutDelivery,
+            ),
+            (Some("Draft"), closed_pr(), Absent, ClosedWithoutDelivery),
+        ];
+        for (n, (status, content, linked, outcome)) in cases.into_iter().enumerate() {
+            let (got, reason) = bot_board_item(status, content, linked);
+            assert_eq!(got, outcome, "case {n}: {reason}");
+            assert!(!reason.is_empty(), "case {n}");
+        }
+        assert_eq!(
+            bot_board_item(Some("Needs human"), open_issue(), Absent).1,
+            "Needs human on the bot's board"
+        );
     }
 
     #[test]

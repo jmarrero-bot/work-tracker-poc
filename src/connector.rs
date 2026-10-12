@@ -8,8 +8,9 @@
 //! [`Item`], so a plugin can't store an unsafe link or a person's decision.
 
 use crate::{
+    bot::BoardSummary,
     connectors::source_url,
-    model::{Connection, Item, Outcome, Timestamp, WatchList},
+    model::{BotFields, Connection, Item, Outcome, Timestamp, WatchList},
     outcome,
 };
 use serde::{Deserialize, Serialize};
@@ -177,6 +178,9 @@ pub enum Reason {
     Authored,
     /// It is on the account's to-do list for another reason.
     Todo,
+    /// A bot waits on the account: for its decision, or its review of a
+    /// draft.
+    BotWaiting,
 }
 
 impl Reason {
@@ -190,6 +194,7 @@ impl Reason {
             Self::ChecksFailing => "needs action: checks failing",
             Self::Authored => "authored",
             Self::Todo => "on the to-do list",
+            Self::BotWaiting => "bot waiting on you",
         }
     }
 }
@@ -219,6 +224,10 @@ pub struct RemoteItem {
     /// Why it waits on the account, if it does. Optional in the protocol.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<Reason>,
+    /// What the bot connector reads besides. Built-in connectors only, so
+    /// not part of the plugin protocol.
+    #[serde(skip)]
+    pub bot: Option<BotFields>,
 }
 
 /// Items that several listings of one connector report, each once: their
@@ -335,6 +344,11 @@ pub trait Connector: Send + Sync {
             ))
         })
     }
+    /// What the last listing of a bot's board found, for the bot
+    /// connector.
+    fn board(&self) -> Option<BoardSummary> {
+        None
+    }
     /// What it has sent to its source, if it counts.
     fn requests(&self) -> Option<Requests> {
         None
@@ -394,6 +408,7 @@ pub fn to_item(c: &Connection, kind: &str, remote: RemoteItem) -> ConnectorResul
         ));
     }
     let url = source_url(&remote.url).map_err(ConnectorError::invalid)?;
+    let bot = remote.bot.map(checked_bot).transpose()?;
     let mut reasons = remote.reasons;
     reasons.sort();
     reasons.dedup();
@@ -418,9 +433,26 @@ pub fn to_item(c: &Connection, kind: &str, remote: RemoteItem) -> ConnectorResul
         synced_at: None,
         stale: false,
         from_hub: false,
+        bot,
     };
     item.set_outcome((remote.outcome, remote.outcome_reason));
     Ok(item)
+}
+
+/// A bot item's fields, if their text is within bounds and their links are
+/// HTTP(S).
+fn checked_bot(mut bot: BotFields) -> ConnectorResult<BotFields> {
+    for (field, value) in [
+        ("priority", &bot.priority),
+        ("why", &bot.why),
+        ("news", &bot.news),
+    ] {
+        check_text(field, value.as_deref().unwrap_or_default())?;
+    }
+    for url in [&mut bot.branch, &mut bot.board_item].into_iter().flatten() {
+        *url = source_url(url).map_err(ConnectorError::invalid)?;
+    }
+    Ok(bot)
 }
 
 /// Ask `connector` whose account the credential belongs to. The account is
@@ -451,6 +483,11 @@ fn checked(
     remote: RemoteItem,
 ) -> ConnectorResult<Item> {
     let credential = target.credential.expose();
+    let bot = remote.bot.as_ref();
+    let bot_fields = bot
+        .into_iter()
+        .flat_map(|b| [&b.priority, &b.why, &b.news, &b.branch, &b.board_item])
+        .flatten();
     let echoed = [
         &remote.remote_id,
         &remote.key,
@@ -461,7 +498,8 @@ fn checked(
         &remote.action,
         &remote.updated_at,
     ]
-    .iter()
+    .into_iter()
+    .chain(bot_fields)
     .any(|field| field.contains(credential));
     if echoed {
         return Err(ConnectorError::invalid(
@@ -730,6 +768,7 @@ mod tests {
             action: action.into(),
             updated_at: "2026-10-12T00:00:00Z".into(),
             reasons: vec![],
+            bot: None,
         }
     }
     /// An item a previous sync stored.
