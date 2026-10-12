@@ -1,8 +1,10 @@
-//! The connectors: Jira, GitLab and GitHub built in, sharing URL rules and an
+//! The connectors: Jira, GitLab, GitHub and Fedora Forge (Forgejo) built in,
+//! sharing URL rules and an
 //! HTTP client that keeps TLS verification, refuses redirects and never
 //! surfaces a remote response body; and third-party plugins run out of
 //! process.
 
+mod forgejo;
 mod github;
 mod gitlab;
 mod jira;
@@ -63,25 +65,27 @@ pub const PLUGINS_DIR: &str = "plugins";
 
 /// What built-in connectors keep between calls in one service process, for
 /// every connection: GitHub's answers for conditional requests and its rate
-/// limits. Never a credential.
+/// limits, and how long Forgejo asked to wait. Never a credential.
 #[derive(Clone, Default)]
 pub struct Shared {
     github: Arc<github::Memory>,
+    forgejo: Arc<forgejo::Memory>,
 }
 
-/// The connector for a provider: built in for Jira, GitLab and GitHub,
-/// otherwise the plugin named after the provider in `plugins`, if there is
-/// one.
+/// The connector for a provider: built in for Jira, GitLab, GitHub and
+/// Fedora Forge, otherwise the plugin named after the provider in
+/// `plugins`, if there is one.
 pub fn for_provider(provider: &str, plugins: &Path, shared: &Shared) -> Result<Box<dyn Connector>> {
     Ok(match provider {
         "jira" => Box::new(jira::Jira::new()?),
         p if is_gitlab(p) => Box::new(gitlab::GitLab::new()?),
         "github" => Box::new(github::GitHub::new(shared.github.clone())?),
+        "fedora" => Box::new(forgejo::Forgejo::new(shared.forgejo.clone())?),
         p if valid_provider(p) => {
             let program = std::path::absolute(plugins.join(p))?;
             if !program.exists() {
                 bail!(
-                    "Live connection currently supports Jira Data Center, GitLab and GitHub, and connector plugins such as {}",
+                    "Live connection currently supports Jira Data Center, GitLab, GitHub and Fedora Forge, and connector plugins such as {}",
                     program.display()
                 )
             }
@@ -316,7 +320,7 @@ mod tests {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
         // A plugin can serve a known source without a built-in connector,
         // but neither replace a built-in one nor add an unknown source.
-        for name in ["errata", "jira", "github", "bugzilla"] {
+        for name in ["errata", "jira", "github", "fedora", "bugzilla"] {
             std::fs::copy(&script, plugins.path().join(name)).unwrap();
         }
         for (provider, kind) in [
@@ -325,7 +329,7 @@ mod tests {
             ("gitlab-public", Some("gitlab")),
             ("errata", Some("errata")),
             ("github", Some("github")),
-            ("fedora", None),
+            ("fedora", Some("fedora")),
             ("bugzilla", None),
         ] {
             assert_eq!(
@@ -337,9 +341,11 @@ mod tests {
                 "{provider}"
             );
         }
-        // The built-in GitHub connector, which counts what it sends, and
-        // not the plugin of that name.
-        let github = for_provider("github", plugins.path(), &Shared::default()).unwrap();
-        assert!(github.requests().is_some());
+        // The built-in GitHub and Forgejo connectors, which count what they
+        // send, and not the plugins of those names.
+        for provider in ["github", "fedora"] {
+            let connector = for_provider(provider, plugins.path(), &Shared::default()).unwrap();
+            assert!(connector.requests().is_some(), "{provider}");
+        }
     }
 }

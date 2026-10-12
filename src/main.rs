@@ -36,9 +36,10 @@ enum Command {
         #[arg(long)]
         demo: bool,
     },
-    /// Connect Jira Data Center, a GitLab instance, GitHub, or a source
-    /// served by a connector plugin, using a personal token. GitHub is only
-    /// ever read: requests that could change it are refused.
+    /// Connect Jira Data Center, a GitLab instance, GitHub, Fedora Forge,
+    /// or a source served by a connector plugin, using a personal token.
+    /// GitHub and Fedora Forge are only ever read: requests that could
+    /// change them are refused.
     Connect {
         #[arg(value_parser=["jira","gitlab-internal","gitlab-public","github","fedora","errata"])]
         provider: String,
