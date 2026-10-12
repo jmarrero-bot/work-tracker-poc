@@ -861,6 +861,32 @@ h1 {
   overflow-wrap: anywhere;
   margin-top: 5px;
 }
+.zone-tag {
+  font-style: normal;
+  font-size: 0.65rem;
+  font-weight: 400;
+  color: #919eb1;
+  background: #242c38;
+  border-radius: 4px;
+  padding: 2px 6px;
+  margin-left: 8px;
+}
+.zone-tag.external {
+  color: #afcbb8;
+  background: #26392e;
+}
+.zone-choice {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 0.75rem;
+  color: #aeb8c9;
+  line-height: 1.7;
+  margin: 14px 0;
+}
+.zone-choice input {
+  margin-top: 4px;
+}
 .connected-account p {
   font-size: 0.75rem;
   color: #aeb8c9;

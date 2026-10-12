@@ -148,6 +148,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         account_name: name,
         last_sync: None,
         error: None,
+        zone: input.zone,
     };
     let path = db.root.join("secrets").join(&c.id);
     db::write_secret(&path, target.credential.expose())?;
@@ -261,6 +262,7 @@ async fn manual(State(app): State<App>, Json(input): Json<ManualInput>) -> ApiRe
         effort_id: None,
         abandoned_at: None,
         demo: false,
+        zone: Zone::Internal,
     };
     // Manual outcomes are explicit; the status text never implies one.
     item.set_outcome((input.outcome, input.outcome.manual_reason().into()));

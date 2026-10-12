@@ -24,6 +24,9 @@ import "./style.css";
 
 type Provider =
   "jira" | "gitlab-internal" | "gitlab-public" | "github" | "fedora" | "errata";
+// Internal work is shown only on the machine that syncs it; external work
+// may also be shown on the hub.
+type Zone = "internal" | "external";
 type Outcome =
   | "open"
   | "delivered"
@@ -46,6 +49,7 @@ type Item = {
   effort_id: string | null;
   abandoned_at: string | null;
   demo: boolean;
+  zone: Zone;
 };
 type Connection = {
   id: string;
@@ -56,6 +60,7 @@ type Connection = {
   account_name: string;
   last_sync: string | null;
   error: string | null;
+  zone: Zone;
 };
 type Progress = {
   delivered: number;
@@ -354,6 +359,7 @@ function App() {
           label: form.label ?? providers[connectProvider].name,
           base_url: form.url,
           token: form.token,
+          zone: form.zone === "external" ? "external" : "internal",
         });
       if (modal === "manual")
         await api("items", {
@@ -974,7 +980,12 @@ function App() {
                       {connections.length ? (
                         connections.map((c) => (
                           <div className="connected-account" key={c.id}>
-                            <strong>{c.account_name}</strong>
+                            <strong>
+                              {c.account_name}
+                              <em className={`zone-tag ${c.zone}`}>
+                                {c.zone === "external" ? "External" : "Internal"}
+                              </em>
+                            </strong>
                             <span>{c.base_url}</span>
                             <p>
                               {c.error ??
@@ -1083,6 +1094,12 @@ function App() {
                 : detailItem.connection_id
                   ? "Synced from source"
                   : "Manual source link"}
+            </dd>
+            <dt>Zone</dt>
+            <dd>
+              {detailItem.zone === "external"
+                ? "External: may also be shown on the hub"
+                : "Internal: shown only on this machine"}
             </dd>
             <dt>Last source update</dt>
             <dd>
@@ -1257,9 +1274,11 @@ function App() {
                     Service
                     <select
                       value={connectProvider}
-                      onChange={(e) =>
-                        setConnectProvider(e.target.value as Provider)
-                      }
+                      onChange={(e) => {
+                        setConnectProvider(e.target.value as Provider);
+                        // A new source starts internal again.
+                        setForm((f) => ({ ...f, zone: "internal" }));
+                      }}
                     >
                       {names
                         .filter((p) => providers[p].live)
@@ -1288,6 +1307,24 @@ function App() {
                       : "https://gitlab.example.com/",
                   )}
                   {field("token", "Personal access token", "password", true)}
+                  <label className="zone-choice">
+                    <input
+                      type="checkbox"
+                      checked={form.zone === "external"}
+                      onChange={(e) =>
+                        setForm((f) => ({
+                          ...f,
+                          zone: e.target.checked ? "external" : "internal",
+                        }))
+                      }
+                    />
+                    <span>
+                      External: its work may also be shown away from this
+                      machine, on the hub. Leave this off for internal work
+                      such as Jira, internal GitLab or Errata. It can't be
+                      changed later.
+                    </span>
+                  </label>
                   <p className="token-note">
                     Stored in a private file on the service machine. Never
                     returned to the browser. Use a dedicated tracking token

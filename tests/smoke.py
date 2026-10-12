@@ -61,6 +61,8 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         snapshot = json.loads(body)
         assert len(snapshot['items']) == 7 and len(snapshot['efforts']) == 1
         assert len({i['provider'] for i in snapshot['items']}) == 6
+        # Manual items have no connection to make them external.
+        assert all(i['zone'] == 'internal' for i in snapshot['items'])
         # Three next actions, a review, and the closed unmerged change, which needs a decision.
         assert len(json.loads(subprocess.check_output(command + ['next','--json']))) == 5
         without_home = {k:v for k,v in os.environ.items() if k != 'HOME'}

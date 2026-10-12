@@ -1,4 +1,7 @@
-pub use crate::outcome::{Outcome, Progress};
+pub use crate::{
+    outcome::{Outcome, Progress},
+    zone::Zone,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,6 +14,10 @@ pub struct Connection {
     pub account_name: String,
     pub last_sync: Option<String>,
     pub error: Option<String>,
+    /// Chosen when connecting. Connections made before zones existed are
+    /// internal.
+    #[serde(default)]
+    pub zone: Zone,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +42,10 @@ pub struct Item {
     #[serde(default)]
     pub abandoned_at: Option<String>,
     pub demo: bool,
+    /// Its connection's zone, set when reading it. Manual items have no
+    /// connection and are internal.
+    #[serde(default)]
+    pub zone: Zone,
 }
 
 impl Item {
@@ -76,6 +87,9 @@ pub struct ConnectInput {
     pub label: String,
     pub base_url: String,
     pub token: String,
+    /// Internal unless the person explicitly chooses external.
+    #[serde(default)]
+    pub zone: Zone,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -5,6 +5,7 @@ use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -29,7 +30,7 @@ pub fn write_secret(path: &Path, value: &str) -> Result<()> {
 
 /// The schema version this build writes, kept in SQLite's `user_version`.
 /// Version 0 is the prototype's schema, whose items only had a `terminal` flag.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 fn schema_version(sql: &Sqlite) -> Result<i32> {
     let version = sql.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -55,6 +56,9 @@ fn migrate(sql: &mut Sqlite, root: &Path) -> Result<()> {
     let version = schema_version(&tx)?;
     if version < 1 {
         migrate_outcomes(&tx).context("Cannot upgrade stored items to outcomes")?;
+    }
+    if version < 2 {
+        migrate_zones(&tx).context("Cannot add zones to stored connections")?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -118,6 +122,28 @@ fn migrate_outcomes(tx: &Transaction) -> Result<()> {
         }
         tx.execute(
             "UPDATE items SET body=?1 WHERE id=?2",
+            params![serde_json::to_string(&v)?, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Version 2: every connection has a zone. Connections made before zones
+/// existed may hold internal work, so they become internal; external is
+/// only ever a person's explicit choice.
+fn migrate_zones(tx: &Transaction) -> Result<()> {
+    let rows: Vec<(String, String)> = tx
+        .prepare("SELECT id,body FROM connections")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, body) in rows {
+        let mut v: Value = serde_json::from_str(&body)
+            .with_context(|| format!("Stored connection {id} is not JSON"))?;
+        v.as_object_mut()
+            .with_context(|| format!("Stored connection {id} is not an object"))?
+            .insert("zone".into(), serde_json::to_value(Zone::Internal)?);
+        tx.execute(
+            "UPDATE connections SET body=?1 WHERE id=?2",
             params![serde_json::to_string(&v)?, id],
         )?;
     }
@@ -194,6 +220,13 @@ impl Db {
         Ok(value)
     }
     pub fn items(&self) -> Result<Vec<Item>> {
+        // An item's zone is always its connection's, never what its row
+        // says; anything without a known connection is internal.
+        let zones: HashMap<String, Zone> = self
+            .connections()?
+            .into_iter()
+            .map(|c| (c.id, c.zone))
+            .collect();
         let mut s = self
             .sql
             .prepare("SELECT body,effort_id,abandoned_at FROM items ORDER BY id")?;
@@ -208,6 +241,11 @@ impl Db {
             let (body, effort, abandoned) = v?;
             let mut i: Item = serde_json::from_str(&body)?;
             i.effort_id = effort;
+            i.zone = i
+                .connection_id
+                .as_ref()
+                .and_then(|c| zones.get(c).copied())
+                .unwrap_or_default();
             // A person's decision outranks the source's outcome.
             if let Some(at) = &abandoned {
                 let reason = format!(
@@ -429,6 +467,7 @@ impl Db {
                 effort_id: None,
                 abandoned_at: None,
                 demo: true,
+                zone: Zone::Internal,
             })?;
         }
         self.create_effort(EffortInput {title:"Ship the bootc storage fix".into(),note:"Example effort linking upstream work, a RHEL backport and an advisory. All items are illustrative.".into(),item_ids:[0,1,2,3,6].map(|n|format!("demo-{n}")).to_vec()})?;
@@ -674,6 +713,113 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    fn connection(id: &str, zone: Zone) -> Connection {
+        Connection {
+            id: id.into(),
+            provider: "gitlab-public".into(),
+            label: format!("GitLab {id}"),
+            base_url: "https://gitlab.com/".into(),
+            account_id: "1".into(),
+            account_name: "me".into(),
+            last_sync: None,
+            error: None,
+            zone,
+        }
+    }
+
+    #[test]
+    fn zones_persist_and_items_take_their_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("db");
+        let external = connection("c0ffee00-0000-4000-8000-00000000000e", Zone::External);
+        let internal = connection("c0ffee00-0000-4000-8000-000000000001", Zone::Internal);
+        {
+            let mut db = Db::open(&root).unwrap();
+            db.seed().unwrap();
+            db.save_connection(&external).unwrap();
+            db.save_connection(&internal).unwrap();
+            let template = db.items().unwrap().remove(0);
+            let items: Vec<_> = [&external, &internal]
+                .into_iter()
+                .map(|c| Item {
+                    id: format!("{}:gitlab:7:4", c.id),
+                    connection_id: Some(c.id.clone()),
+                    demo: false,
+                    // What a row says about its zone is never trusted.
+                    zone: Zone::External,
+                    ..template.clone()
+                })
+                .collect();
+            db.sync_items(&items).unwrap();
+        }
+        // Open it again, as after a restart.
+        let db = Db::open(&root).unwrap();
+        let zones: HashMap<_, _> = db
+            .connections()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.id, c.zone))
+            .collect();
+        assert_eq!(zones[&external.id], Zone::External);
+        assert_eq!(zones[&internal.id], Zone::Internal);
+        let items = db.items().unwrap();
+        assert_eq!(items.len(), 9);
+        for i in items {
+            let expected = if i.connection_id.as_ref() == Some(&external.id) {
+                Zone::External
+            } else {
+                // Internal connections and manual items.
+                Zone::Internal
+            };
+            assert_eq!(i.zone, expected, "{}", i.id);
+        }
+    }
+
+    #[test]
+    fn migrates_existing_connections_to_the_internal_zone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("db");
+        drop(Db::open(&root).unwrap());
+        // A connection as schema version 1 stored it, without a zone.
+        let legacy = serde_json::json!({
+            "id": "c1", "provider": "gitlab-public", "label": "GitLab",
+            "base_url": "https://gitlab.com/", "account_id": "1", "account_name": "me",
+            "last_sync": null, "error": null,
+        });
+        {
+            let sql = Sqlite::open(root.join("work.sqlite")).unwrap();
+            sql.execute(
+                "INSERT INTO connections VALUES('c1',?1)",
+                [legacy.to_string()],
+            )
+            .unwrap();
+            sql.pragma_update(None, "user_version", 1).unwrap();
+        }
+        for _ in 0..2 {
+            let db = Db::open(&root).unwrap();
+            let version: i32 = db
+                .sql
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            let body: String = db
+                .sql
+                .query_row("SELECT body FROM connections WHERE id='c1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let stored: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(stored["zone"], "internal");
+            assert_eq!(stored["label"], "GitLab");
+            assert_eq!(db.connection("c1").unwrap().zone, Zone::Internal);
+        }
+        let backup = Sqlite::open(root.join("work.v1.sqlite")).unwrap();
+        let body: String = backup
+            .query_row("SELECT body FROM connections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), legacy);
     }
 
     #[test]

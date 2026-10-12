@@ -445,6 +445,7 @@ mod tests {
             account_name: "me".into(),
             last_sync: None,
             error: None,
+            zone: Zone::Internal,
         }
     }
     #[test]
