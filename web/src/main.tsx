@@ -509,15 +509,44 @@ function progressText(p: Progress) {
   ].filter(Boolean);
   return parts.length ? parts.join(" · ") : "Nothing remaining";
 }
+// How the service signs browsers in, and who this one is.
+type AuthStatus = {
+  github_app: boolean;
+  pairing: boolean;
+  sign_in: string | null;
+  user: { id: number; login: string } | null;
+};
+async function authStatus(): Promise<AuthStatus | null> {
+  const response = await fetch("/auth/status", { credentials: "same-origin" });
+  return response.ok ? ((await response.json()) as AuthStatus) : null;
+}
+// A sign-in step of the hub's GitHub App; the browser sends its origin.
+async function authStep(path: string): Promise<Record<string, string>> {
+  const response = await fetch(`/auth/${path}`, {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  const data = await response.json();
+  if (!response.ok)
+    throw new Error(data.error ?? `Request failed (${response.status})`);
+  return data;
+}
+// The header of the page's own refreshes, which a hub doesn't count as a
+// use of the session, so an open page left alone still goes idle.
+const BACKGROUND = { "X-Workboard-Background": "1" };
 async function api<T>(
   path: string,
   body?: unknown,
   method?: string,
+  background = false,
 ): Promise<T> {
   const response = await fetch(`/api/${path}`, {
     method: method ?? (body === undefined ? "GET" : "POST"),
     credentials: "same-origin",
-    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    headers: {
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      ...(background ? BACKGROUND : {}),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await response.json();
@@ -842,6 +871,7 @@ function App() {
   );
   const [loading, setLoading] = useState(true);
   const [paired, setPaired] = useState(false);
+  const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [query, setQuery] = useState("");
@@ -912,14 +942,14 @@ function App() {
     detailItem?.action,
     detailItem?.outcome,
   ]);
-  async function reload() {
+  async function reload(background = false) {
     const [next, waiting] = await Promise.all([
-      api<Snapshot>("snapshot"),
-      api<MineView>("mine"),
+      api<Snapshot>("snapshot", undefined, undefined, background),
+      api<MineView>("mine", undefined, undefined, background),
     ]);
     // Only the bot's section is unavailable if its view fails, not the
     // page; it keeps what it last had.
-    const bot = await api<BotView[]>("bot").then(
+    const bot = await api<BotView[]>("bot", undefined, undefined, background).then(
       (b) => {
         setBotsError("");
         return b;
@@ -952,6 +982,7 @@ function App() {
               "Pairing expired. Reopen the URL printed by the service.",
             );
         }
+        setAuth(await authStatus().catch(() => null));
         await reload();
       } catch (e) {
         setError((e as Error).message);
@@ -963,7 +994,7 @@ function App() {
     // stale, never as current.
     const poll = () => {
       setNow(Date.now());
-      reload().catch(() =>
+      reload(true).catch(() =>
         setOfflineSince((since) => since ?? Date.now()),
       );
     };
@@ -1194,6 +1225,38 @@ function App() {
         <h1>Opening your work…</h1>
       </div>
     );
+  async function signIn() {
+    try {
+      const { url } = await authStep("github/login");
+      location.assign(url);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  async function signOut() {
+    try {
+      await authStep("logout");
+      location.reload();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  if (!paired && auth?.github_app) {
+    const here = auth.sign_in === `${location.origin}/`;
+    return (
+      <div className="pair-screen">
+        <div className="brand-symbol">w</div>
+        <h1>Sign in to the hub</h1>
+        <p>Sign in with the GitHub account this hub allows.</p>
+        {here ? (
+          <button onClick={signIn}>Sign in with GitHub</button>
+        ) : (
+          <a href={auth.sign_in ?? "/"}>Open {auth.sign_in} to sign in</a>
+        )}
+        <p className="muted">{error}</p>
+      </div>
+    );
+  }
   if (!paired)
     return (
       <div className="pair-screen">
@@ -1217,6 +1280,14 @@ function App() {
           <div>
             <strong>My workspace</strong>
             <span>Personal · {hub ? "Hub" : "Local"}</span>
+            {auth?.user && (
+              <span>
+                Signed in as {auth.user.login} ·{" "}
+                <button className="link-button" onClick={signOut}>
+                  Sign out
+                </button>
+              </span>
+            )}
           </div>
         </div>
         <div className="nav-caption">WORKSPACE</div>

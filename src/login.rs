@@ -1,0 +1,1042 @@
+//! Signing in to a hub with a GitHub App: GitHub's web flow for a browser,
+//! which gives it a session.
+//!
+//! Who signed in is the numeric GitHub user ID that `GET /user` answers
+//! with the new user token, read through the read-only client. Only IDs on
+//! the hub's allowlist get in; a login is never compared, since logins can
+//! be renamed and then taken by someone else.
+//!
+//! Secrets are never kept as given where a hash will do: sessions and
+//! pending sign-ins are looked up by the SHA-256 of what the client
+//! presents, so a lookup's timing gives none away. The user token the web flow gets is kept
+//! in a private file for posting commands as the user later (#13).
+
+use crate::{
+    clock::{Clock, Timestamp},
+    connector::{Credential, Target},
+    connectors, db,
+    oauth::{OAuthError, Refused, Site, TokenClient, UserToken},
+    server::{matches_token, new_token, replace_secret},
+};
+use anyhow::{bail, Context, Result};
+use axum::http::{HeaderMap, StatusCode};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeSet, HashMap, VecDeque},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::{Duration, SystemTime},
+};
+use url::Url;
+
+/// Where GitHub sends the browser back, on the hub's name.
+pub const CALLBACK_PATH: &str = "/auth/github/callback";
+/// The browser session's cookie. `__Host-` makes browsers keep it to the
+/// hub's exact name, over HTTPS, for every path.
+pub const SESSION_COOKIE: &str = "__Host-workboard_user";
+/// The cookie that binds a sign-in to the browser that started it.
+pub const LOGIN_COOKIE: &str = "__Host-workboard_login";
+/// How long a browser has to come back from GitHub.
+pub const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
+/// A session ends after this long unused; each use renews it.
+pub const SESSION_IDLE: Duration = Duration::from_secs(12 * 60 * 60);
+/// A session ends this long after sign-in, however much it is used.
+pub const SESSION_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Most sign-ins waiting for their browser, and sessions.
+const MAX_PENDING: usize = 16;
+const MAX_SESSIONS: usize = 64;
+/// Most sign-in attempts in [`ATTEMPT_WINDOW`] from one peer, and from all
+/// of them together, a backstop.
+const PEER_ATTEMPTS: usize = 10;
+const ALL_ATTEMPTS: usize = 100;
+const ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+/// Most peers whose attempts are counted apart; past it, only the backstop
+/// counts a new one's.
+const MAX_PEERS: usize = 1024;
+/// Longest peer address kept.
+const MAX_PEER: usize = 64;
+/// The peer of a request that came straight to the loopback port, not
+/// through the front.
+const DIRECT: &str = "this machine";
+/// How often expired sessions and sign-ins are swept away.
+pub const SWEEP: Duration = Duration::from_secs(60);
+/// The App's client secret, in the data directory.
+pub const SECRET_FILE: &str = "github-app.secret";
+/// Where the user tokens are kept, one private file per user ID.
+const USERS_DIR: &str = "github-users";
+/// Longest client ID accepted.
+const MAX_CLIENT_ID: usize = 64;
+/// Longest authorization code accepted from a callback.
+const MAX_CODE: usize = 512;
+
+/// The GitHub App a hub signs people in with.
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub client_id: String,
+    /// Where GitHub sends the browser back: HTTPS on one of the hub's
+    /// names, at [`CALLBACK_PATH`].
+    pub callback: Url,
+    /// The numeric GitHub user IDs allowed in.
+    pub users: BTreeSet<u64>,
+}
+
+/// `url`'s host, lowercase, with its port unless it is the scheme's.
+fn authority(url: &Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+impl AppConfig {
+    /// The App's settings, checked against `hosts`, the hub's names.
+    pub fn new(client_id: &str, callback: &str, users: &[u64], hosts: &[String]) -> Result<Self> {
+        let client_id = client_id.trim();
+        if client_id.is_empty()
+            || client_id.len() > MAX_CLIENT_ID
+            || !client_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.')
+        {
+            bail!("Give the GitHub App's client ID, as its settings page shows it (such as Iv23li...)")
+        }
+        let shape = format!(
+            "Give the callback URL as https://NAME{CALLBACK_PATH}, NAME being one of the hub's --allowed-host names"
+        );
+        let callback = Url::parse(callback.trim()).context(shape.clone())?;
+        if callback.scheme() != "https"
+            || !callback.username().is_empty()
+            || callback.password().is_some()
+            || callback.query().is_some()
+            || callback.fragment().is_some()
+            || callback.path() != CALLBACK_PATH
+            || !authority(&callback).is_some_and(|host| hosts.contains(&host))
+        {
+            bail!("{shape}")
+        }
+        if users.is_empty() || users.contains(&0) {
+            bail!("Allow at least one GitHub user, by numeric ID (--github-user); a login is never enough")
+        }
+        Ok(Self {
+            client_id: client_id.into(),
+            callback,
+            users: users.iter().copied().collect(),
+        })
+    }
+    /// The hub's name that people sign in on: the callback's.
+    pub fn host(&self) -> String {
+        authority(&self.callback).expect("invariant: the callback was checked to have a host")
+    }
+}
+
+/// The App's client secret, from its private file in the data directory.
+pub fn read_secret(root: &Path) -> Result<Credential> {
+    let path = root.join(SECRET_FILE);
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "Cannot read the GitHub App's client secret at {}; set it with `workboard github-app set-secret`",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            bail!(
+                "{} can be read by others; make it private with chmod 600",
+                path.display()
+            )
+        }
+    }
+    Credential::new(&text).map_err(|_| anyhow::anyhow!("{} holds no client secret", path.display()))
+}
+
+/// Keep the App's client secret in its private file, replacing any before.
+pub fn save_secret(root: &Path, value: &str) -> Result<()> {
+    let secret = Credential::new(value).map_err(|_| anyhow::anyhow!("Give a client secret"))?;
+    db::private_dir(root)?;
+    replace_secret(&root.join(SECRET_FILE), secret.expose())
+}
+
+/// The SHA-256 of a secret, as what it is looked up and kept by.
+fn hashed(secret: &str) -> String {
+    URL_SAFE_NO_PAD.encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        secret.as_bytes(),
+    ))
+}
+
+/// The PKCE challenge of `verifier`: its SHA-256, base64url-encoded.
+fn pkce_challenge(verifier: &str) -> String {
+    hashed(verifier)
+}
+
+/// How long ago `then` was; no time at all if the wall clock stepped back
+/// past it, so a small correction doesn't sign everyone out. That only
+/// lengthens a lifetime by the step.
+fn elapsed(now: SystemTime, then: SystemTime) -> Duration {
+    now.duration_since(then).unwrap_or_default()
+}
+
+/// Who sent a request, as the hub's front says: the last `X-Forwarded-For`
+/// entry. `tailscale serve` sets that header itself, to the tailnet address
+/// of the peer, dropping any copy the peer sent, and a proxy that keeps a
+/// peer's copy appends its own entry after it, so a peer can't pass for
+/// another. A request straight to the loopback port has none.
+pub fn peer(headers: &HeaderMap) -> String {
+    let last = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .rfind(|s| !s.is_empty());
+    let mut peer = last.unwrap_or(DIRECT).to_string();
+    peer.truncate(MAX_PEER);
+    peer
+}
+
+/// Drop the attempts in `attempts` older than [`ATTEMPT_WINDOW`].
+fn prune(now: SystemTime, attempts: &mut VecDeque<SystemTime>) {
+    while attempts
+        .front()
+        .is_some_and(|&t| elapsed(now, t) >= ATTEMPT_WINDOW || t > now)
+    {
+        attempts.pop_front();
+    }
+}
+
+/// Sign-in attempts in the last [`ATTEMPT_WINDOW`], by peer and in all.
+#[derive(Default)]
+struct Limiter {
+    peers: HashMap<String, VecDeque<SystemTime>>,
+    all: VecDeque<SystemTime>,
+}
+
+impl Limiter {
+    /// Count an attempt `peer` made `now`, or refuse it past
+    /// [`PEER_ATTEMPTS`] of that peer's or [`ALL_ATTEMPTS`] in all.
+    fn attempt(&mut self, now: SystemTime, peer: &str) -> Result<(), LoginError> {
+        self.peers.retain(|_, attempts| {
+            prune(now, attempts);
+            !attempts.is_empty()
+        });
+        prune(now, &mut self.all);
+        let peers = self
+            .peers
+            .get(peer)
+            .filter(|a| a.len() >= PEER_ATTEMPTS)
+            .and_then(|a| a.front());
+        let all = Some(&self.all)
+            .filter(|a| a.len() >= ALL_ATTEMPTS)
+            .and_then(|a| a.front());
+        if let Some(&first) = peers.or(all) {
+            return Err(LoginError {
+                retry_after: Some(ATTEMPT_WINDOW.saturating_sub(elapsed(now, first))),
+                ..LoginError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many sign-in attempts; try again in a minute",
+                )
+            });
+        }
+        self.all.push_back(now);
+        if self.peers.len() < MAX_PEERS || self.peers.contains_key(peer) {
+            self.peers.entry(peer.into()).or_default().push_back(now);
+        }
+        Ok(())
+    }
+}
+
+/// Forget the user tokens kept for sessions, as a service does when it
+/// starts: sessions don't outlive the process, so neither do they.
+pub fn forget_user_tokens(root: &Path) -> Result<()> {
+    let users = root.join(USERS_DIR);
+    match std::fs::remove_dir_all(&users) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("Cannot remove {}", users.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Who signed in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Identity {
+    /// GitHub's numeric user ID, which is what is allowed.
+    pub id: u64,
+    /// The login at sign-in, for showing only.
+    pub login: String,
+}
+
+/// Why a sign-in step was refused, as the person is told. Never carries a
+/// token or code.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LoginError {
+    pub status: StatusCode,
+    pub message: String,
+    /// For a rate limit, when to try again.
+    pub retry_after: Option<Duration>,
+}
+
+impl LoginError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+    fn expired() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "This sign-in expired, or was started in another browser; start again",
+        )
+    }
+    fn mismatch() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "This sign-in doesn't match the one this browser started; start again",
+        )
+    }
+    fn not_allowed() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "That GitHub account isn't allowed on this hub",
+        )
+    }
+    fn internal(what: &str) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot {what}"))
+    }
+    fn from_oauth(error: OAuthError) -> Self {
+        let status = match &error {
+            OAuthError::Refused(Refused::Denied) => StatusCode::FORBIDDEN,
+            OAuthError::Refused(Refused::Expired) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::BAD_GATEWAY,
+        };
+        Self::new(status, error.to_string())
+    }
+}
+
+/// A sign-in waiting for its browser to come back from GitHub.
+struct Pending {
+    /// The `state` sent to GitHub, which must come back.
+    state: String,
+    /// The PKCE verifier its challenge was made from.
+    verifier: String,
+    started: SystemTime,
+}
+
+struct Session {
+    user: Identity,
+    started: SystemTime,
+    seen: SystemTime,
+}
+
+#[derive(Default)]
+struct State {
+    /// By the hash of the browser's login cookie.
+    pending: HashMap<String, Pending>,
+    /// By the hash of the session cookie.
+    sessions: HashMap<String, Session>,
+    /// The browsers' attempts: sign-in starts, and callbacks without a
+    /// sign-in to finish.
+    web: Limiter,
+}
+
+/// A hub's sign-ins: its GitHub App and its sessions.
+pub struct Logins {
+    config: AppConfig,
+    secret: Credential,
+    oauth: TokenClient,
+    clock: Arc<dyn Clock>,
+    root: PathBuf,
+    state: Mutex<State>,
+}
+
+impl Logins {
+    pub fn new(
+        config: AppConfig,
+        secret: Credential,
+        site: Site,
+        clock: Arc<dyn Clock>,
+        root: &Path,
+    ) -> Result<Self> {
+        forget_user_tokens(root)?;
+        Ok(Self {
+            config,
+            secret,
+            oauth: TokenClient::new(site)?,
+            clock,
+            root: root.to_path_buf(),
+            state: Mutex::default(),
+        })
+    }
+    pub fn config(&self) -> &AppConfig {
+        &self.config
+    }
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn now(&self) -> SystemTime {
+        self.clock.now()
+    }
+    /// Start a browser's sign-in: the value of its login cookie, and the
+    /// GitHub page to send it to, with a fresh `state` and PKCE challenge.
+    pub fn start(&self, peer: &str) -> Result<(String, Url), LoginError> {
+        let mut state = self.state();
+        let now = self.now();
+        state.web.attempt(now, peer)?;
+        state
+            .pending
+            .retain(|_, p| elapsed(now, p.started) < LOGIN_TTL);
+        if state.pending.len() >= MAX_PENDING {
+            let oldest = state
+                .pending
+                .iter()
+                .min_by_key(|(_, p)| p.started)
+                .map(|(k, _)| k.clone());
+            state.pending.retain(|k, _| Some(k) != oldest.as_ref());
+        }
+        let (binding, csrf, verifier) = (new_token(), new_token(), new_token());
+        let mut url = self.oauth.site().authorize().clone();
+        url.query_pairs_mut()
+            .append_pair("client_id", &self.config.client_id)
+            .append_pair("redirect_uri", self.config.callback.as_str())
+            .append_pair("state", &csrf)
+            .append_pair("code_challenge", &pkce_challenge(&verifier))
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("allow_signup", "false");
+        state.pending.insert(
+            hashed(&binding),
+            Pending {
+                state: csrf,
+                verifier,
+                started: now,
+            },
+        );
+        Ok((binding, url))
+    }
+
+    /// Finish a browser's sign-in when GitHub sends it back: check it is
+    /// the one this browser started, exchange the code, find out who it is,
+    /// and give them a session. Each sign-in is finished at most once.
+    pub async fn finish(
+        &self,
+        peer: &str,
+        binding: Option<&str>,
+        callback: &Callback,
+    ) -> Result<(String, Identity), LoginError> {
+        let pending = {
+            let mut state = self.state();
+            let found = binding.and_then(|b| state.pending.remove(&hashed(b)));
+            // Only a callback with nothing to finish counts, so the
+            // browser that started a sign-in can always finish it.
+            if found.is_none() {
+                let now = self.now();
+                state.web.attempt(now, peer)?;
+            }
+            found
+        };
+        let pending = pending
+            .filter(|p| elapsed(self.now(), p.started) < LOGIN_TTL)
+            .ok_or_else(LoginError::expired)?;
+        if !callback
+            .state
+            .as_deref()
+            .is_some_and(|s| matches_token(s, &pending.state))
+        {
+            return Err(LoginError::mismatch());
+        }
+        if let Some(error) = &callback.error {
+            let refused = match error.as_str() {
+                "access_denied" => Refused::Denied,
+                _ => Refused::Other("authorization_failed".into()),
+            };
+            return Err(LoginError::from_oauth(OAuthError::Refused(refused)));
+        }
+        let code = callback
+            .code
+            .as_deref()
+            .filter(|c| !c.is_empty() && c.len() <= MAX_CODE)
+            .ok_or_else(|| LoginError::new(StatusCode::BAD_REQUEST, "GitHub sent no code back"))?;
+        let token = self
+            .oauth
+            .exchange_code(
+                &self.config.client_id,
+                &self.secret,
+                code,
+                &self.config.callback,
+                &pending.verifier,
+            )
+            .await
+            .map_err(LoginError::from_oauth)?;
+        let user = self.identify(&token.access).await?;
+        let session = self
+            .open_session(user.clone(), &token)
+            .map_err(|_| LoginError::internal("keep the GitHub token"))?;
+        Ok((session, user))
+    }
+
+    /// Who `token` belongs to, from GitHub's `GET /user`, if they are
+    /// allowed: by numeric ID, whatever their login is now.
+    async fn identify(&self, token: &Credential) -> Result<Identity, LoginError> {
+        let target = Target {
+            base_url: self.oauth.site().web().clone(),
+            credential: token.clone(),
+        };
+        let account = connectors::github_account(&target).await.map_err(|e| {
+            LoginError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("Cannot tell who signed in: {e}"),
+            )
+        })?;
+        let id = account.id.parse().map_err(|_| {
+            LoginError::new(StatusCode::BAD_GATEWAY, "GitHub's user ID isn't a number")
+        })?;
+        if !self.config.users.contains(&id) {
+            return Err(LoginError::not_allowed());
+        }
+        Ok(Identity {
+            id,
+            login: account.name,
+        })
+    }
+
+    fn token_path(&self, user: u64) -> PathBuf {
+        self.root.join(USERS_DIR).join(format!("{user}.json"))
+    }
+
+    /// Keep `user`'s token, and its refresh token, in a private file, for
+    /// posting commands as them later. Replaces the one before.
+    fn keep_token(&self, user: &Identity, token: &UserToken) -> Result<()> {
+        db::private_dir(&self.root.join(USERS_DIR))?;
+        let kept = serde_json::json!({
+            "id": user.id,
+            "login": user.login,
+            "access_token": token.access.expose(),
+            "expires_at": token.expires_at,
+            "refresh_token": token.refresh.as_ref().map(Credential::expose),
+            "refresh_expires_at": token.refresh_expires_at,
+            "kept_at": Timestamp::of(self.now()),
+        });
+        replace_secret(&self.token_path(user.id), &kept.to_string())
+    }
+
+    /// End the sessions `ended` picks, and forget the token of each user
+    /// left with none.
+    fn end_sessions(&self, state: &mut State, ended: impl Fn(&str, &Session) -> bool) {
+        let mut users = BTreeSet::new();
+        state.sessions.retain(|key, s| {
+            let end = ended(key, s);
+            if end {
+                users.insert(s.user.id);
+            }
+            !end
+        });
+        for user in users {
+            if !state.sessions.values().any(|s| s.user.id == user) {
+                // Best effort: a restart forgets it anyway.
+                let _ = db::remove_if_there(&self.token_path(user));
+            }
+        }
+    }
+
+    /// A new session for `user`, as its cookie's value, with their token
+    /// kept. Under one lock, so a logout can't forget the token between.
+    fn open_session(&self, user: Identity, token: &UserToken) -> Result<String> {
+        let now = self.now();
+        let mut state = self.state();
+        self.end_sessions(&mut state, |_, s| !self.live(s, now));
+        if state.sessions.len() >= MAX_SESSIONS {
+            let oldest = state
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| s.seen)
+                .map(|(k, _)| k.clone());
+            self.end_sessions(&mut state, |key, _| Some(key) == oldest.as_deref());
+        }
+        self.keep_token(&user, token)?;
+        let id = new_token();
+        state.sessions.insert(
+            hashed(&id),
+            Session {
+                user,
+                started: now,
+                seen: now,
+            },
+        );
+        Ok(id)
+    }
+
+    fn live(&self, session: &Session, now: SystemTime) -> bool {
+        elapsed(now, session.seen) < SESSION_IDLE
+            && elapsed(now, session.started) < SESSION_MAX
+            && self.config.users.contains(&session.user.id)
+    }
+
+    /// Who the session with cookie value `id` is, if it is live. A use by
+    /// the person (`renew`) renews it; the page's own refreshes don't, so
+    /// an open page left alone still goes idle.
+    pub fn session(&self, id: &str, renew: bool) -> Option<Identity> {
+        let now = self.now();
+        let key = hashed(id);
+        let mut state = self.state();
+        let live = state.sessions.get(&key).is_some_and(|s| self.live(s, now));
+        if !live {
+            self.end_sessions(&mut state, |k, _| k == key);
+            return None;
+        }
+        let session = state.sessions.get_mut(&key)?;
+        if renew {
+            session.seen = now;
+        }
+        Some(session.user.clone())
+    }
+
+    /// End the sessions and drop the sign-ins that expired, forgetting the
+    /// token of each user left with no session. The service does this
+    /// every [`SWEEP`], so a token goes soon after its last session, even
+    /// with no request to notice.
+    pub fn sweep(&self) {
+        let now = self.now();
+        let mut state = self.state();
+        self.end_sessions(&mut state, |_, s| !self.live(s, now));
+        state
+            .pending
+            .retain(|_, p| elapsed(now, p.started) < LOGIN_TTL);
+    }
+
+    /// End the session with cookie value `id`, and forget its user's token
+    /// once none of their sessions is left.
+    pub fn logout(&self, id: &str) -> Result<()> {
+        let mut state = self.state();
+        let Some(ended) = state.sessions.remove(&hashed(id)) else {
+            return Ok(());
+        };
+        if !state.sessions.values().any(|s| s.user.id == ended.user.id) {
+            db::remove_if_there(&self.token_path(ended.user.id))?;
+        }
+        Ok(())
+    }
+}
+
+/// What GitHub sends a browser back with.
+#[derive(Debug, Default, Deserialize)]
+pub struct Callback {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use crate::{
+        clock::ManualClock,
+        oauth::tests::{fake_github, Shared, CLIENT_ID, CODE, SECRET},
+    };
+
+    pub const TAILNET: &str = "hub.example.ts.net";
+    /// The tailnet address sign-ins come from.
+    pub const PEER: &str = "100.64.0.1";
+    /// The allowed user, and someone else.
+    pub const ALLOWED: u64 = 1001;
+    pub const OTHER: u64 = 2002;
+
+    pub fn config() -> AppConfig {
+        AppConfig::new(
+            CLIENT_ID,
+            &format!("https://{TAILNET}{CALLBACK_PATH}"),
+            &[ALLOWED],
+            &[TAILNET.into()],
+        )
+        .unwrap()
+    }
+
+    /// A hub's sign-ins against a fake GitHub, on a clock the test moves,
+    /// and that GitHub, which knows the allowed user's token and another's.
+    pub async fn logins(root: &Path) -> (Arc<Logins>, Shared, Arc<ManualClock>) {
+        let (site, fake) = fake_github().await;
+        {
+            let mut fake = fake.lock().unwrap();
+            fake.users
+                .insert("ghu_allowed".into(), (ALLOWED, "jmarrero".into()));
+            fake.users
+                .insert("ghu_other".into(), (OTHER, "someone".into()));
+        }
+        let clock = Arc::new(ManualClock::at(Timestamp::from_unix(1_791_763_200)));
+        let secret = Credential::new(SECRET).unwrap();
+        let logins = Logins::new(config(), secret, site, clock.clone(), root).unwrap();
+        (Arc::new(logins), fake, clock)
+    }
+
+    /// Sign in through the fake GitHub as the owner of `token`: the
+    /// session's cookie value, or why not.
+    pub async fn sign_in(
+        logins: &Logins,
+        fake: &Shared,
+        token: &str,
+    ) -> Result<(String, Identity), LoginError> {
+        let (binding, url) = logins.start(PEER)?;
+        let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        {
+            let mut fake = fake.lock().unwrap();
+            fake.challenge = Some(query["code_challenge"].clone());
+            fake.token = token.into();
+        }
+        let callback = Callback {
+            code: Some(CODE.into()),
+            state: Some(query["state"].clone()),
+            error: None,
+        };
+        logins.finish(PEER, Some(&binding), &callback).await
+    }
+
+    #[test]
+    fn app_settings_are_checked() {
+        let hosts = [TAILNET.to_string(), "hub.example.ts.net:8443".to_string()];
+        let callback = format!("https://{TAILNET}{CALLBACK_PATH}");
+        // (client ID, callback, users, valid)
+        let cases: &[(&str, &str, &[u64], bool)] = &[
+            (CLIENT_ID, &callback, &[ALLOWED], true),
+            (
+                CLIENT_ID,
+                "https://HUB.example.ts.net/auth/github/callback",
+                &[ALLOWED],
+                true,
+            ),
+            (
+                CLIENT_ID,
+                "https://hub.example.ts.net:8443/auth/github/callback",
+                &[ALLOWED],
+                true,
+            ),
+            ("", &callback, &[ALLOWED], false),
+            ("Iv23 x", &callback, &[ALLOWED], false),
+            (CLIENT_ID, &callback, &[], false),
+            (CLIENT_ID, &callback, &[0], false),
+            (
+                CLIENT_ID,
+                "http://hub.example.ts.net/auth/github/callback",
+                &[ALLOWED],
+                false,
+            ),
+            (
+                CLIENT_ID,
+                "https://other.example.ts.net/auth/github/callback",
+                &[ALLOWED],
+                false,
+            ),
+            (
+                CLIENT_ID,
+                "https://hub.example.ts.net/elsewhere",
+                &[ALLOWED],
+                false,
+            ),
+            (
+                CLIENT_ID,
+                "https://hub.example.ts.net/auth/github/callback?x=1",
+                &[ALLOWED],
+                false,
+            ),
+            (
+                CLIENT_ID,
+                "https://me:x@hub.example.ts.net/auth/github/callback",
+                &[ALLOWED],
+                false,
+            ),
+            (
+                CLIENT_ID,
+                "https://hub.example.ts.net:9/auth/github/callback",
+                &[ALLOWED],
+                false,
+            ),
+        ];
+        for (client_id, callback, users, valid) in cases {
+            let got = AppConfig::new(client_id, callback, users, &hosts);
+            assert_eq!(
+                got.is_ok(),
+                *valid,
+                "{client_id} {callback} {users:?}: {got:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_client_secret_is_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        assert!(read_secret(root.path()).is_err());
+        save_secret(root.path(), " test-only-secret\n").unwrap();
+        save_secret(root.path(), "test-only-secret").unwrap();
+        assert_eq!(
+            read_secret(root.path()).unwrap().expose(),
+            "test-only-secret"
+        );
+        let path = root.path().join(SECRET_FILE);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_secret(root.path())
+            .unwrap_err()
+            .to_string()
+            .contains("chmod 600"));
+        assert!(save_secret(root.path(), "  ").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_allowed_user_signs_in_by_numeric_id() {
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, _) = logins(root.path()).await;
+        let (session, user) = sign_in(&logins, &fake, "ghu_allowed").await.unwrap();
+        assert_eq!(
+            user,
+            Identity {
+                id: ALLOWED,
+                login: "jmarrero".into()
+            }
+        );
+        assert_eq!(logins.session(&session, true), Some(user));
+        // The token is kept in a private file, and the session isn't it.
+        let kept = root.path().join(USERS_DIR).join(format!("{ALLOWED}.json"));
+        let text = std::fs::read_to_string(&kept).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            (v["access_token"].as_str(), v["refresh_token"].as_str()),
+            (Some("ghu_allowed"), Some("ghr_test-only-refresh"))
+        );
+        assert!(v["expires_at"].is_string());
+        assert!(!session.contains("ghu_"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // A renamed login is the same user; another user under the old
+        // login is not.
+        fake.lock()
+            .unwrap()
+            .users
+            .insert("ghu_renamed".into(), (ALLOWED, "renamed".into()));
+        let (_, renamed) = sign_in(&logins, &fake, "ghu_renamed").await.unwrap();
+        assert_eq!(
+            renamed,
+            Identity {
+                id: ALLOWED,
+                login: "renamed".into()
+            }
+        );
+        fake.lock()
+            .unwrap()
+            .users
+            .insert("ghu_squatter".into(), (OTHER, "jmarrero".into()));
+        for token in ["ghu_squatter", "ghu_other"] {
+            let refused = sign_in(&logins, &fake, token).await.unwrap_err();
+            assert_eq!(refused, LoginError::not_allowed(), "{token}");
+            assert!(!root
+                .path()
+                .join(USERS_DIR)
+                .join(format!("{OTHER}.json"))
+                .exists());
+        }
+        // A token GitHub doesn't know never makes a session.
+        let unknown = sign_in(&logins, &fake, "ghu_unknown").await.unwrap_err();
+        assert_eq!(unknown.status, StatusCode::BAD_GATEWAY, "{unknown:?}");
+    }
+
+    #[tokio::test]
+    async fn sign_ins_are_bound_to_their_browser_and_state_and_used_once() {
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = logins(root.path()).await;
+        let (binding, url) = logins.start(PEER).unwrap();
+        let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(url.path(), "/login/oauth/authorize");
+        assert_eq!(query["client_id"], CLIENT_ID);
+        assert_eq!(
+            query["redirect_uri"],
+            format!("https://{TAILNET}{CALLBACK_PATH}")
+        );
+        assert_eq!(query["code_challenge_method"], "S256");
+        assert_eq!(query["code_challenge"].len(), 43);
+        assert!(query["state"].len() >= 32 && query["state"] != binding);
+        fake.lock().unwrap().challenge = Some(query["code_challenge"].clone());
+        fake.lock().unwrap().token = "ghu_allowed".into();
+        let back = |state: &str| Callback {
+            code: Some(CODE.into()),
+            state: Some(state.into()),
+            error: None,
+        };
+        let mismatch = logins.finish(PEER, Some(&binding), &back("forged")).await;
+        assert_eq!(mismatch.unwrap_err(), LoginError::mismatch());
+        // Used up by the refusal: the right state doesn't work after it.
+        let replay = logins
+            .finish(PEER, Some(&binding), &back(&query["state"]))
+            .await;
+        assert_eq!(replay.unwrap_err(), LoginError::expired());
+        // Another browser, or none, can't finish this browser's sign-in.
+        let (binding, url) = logins.start(PEER).unwrap();
+        let state = url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .to_string();
+        for cookie in [None, Some("another-browser")] {
+            let got = logins.finish(PEER, cookie, &back(&state)).await;
+            assert_eq!(got.unwrap_err(), LoginError::expired());
+        }
+        // Declined on GitHub.
+        let declined = Callback {
+            error: Some("access_denied".into()),
+            ..back(&state)
+        };
+        assert_eq!(
+            logins
+                .finish(PEER, Some(&binding), &declined)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        // Too late.
+        let (binding, url) = logins.start(PEER).unwrap();
+        let state = url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .to_string();
+        clock.advance(LOGIN_TTL);
+        let late = logins.finish(PEER, Some(&binding), &back(&state)).await;
+        assert_eq!(late.unwrap_err(), LoginError::expired());
+        // No session came of any of it, and GitHub was never asked.
+        assert!(logins.state().sessions.is_empty());
+        assert!(fake.lock().unwrap().seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sessions_expire_unused_and_after_a_week_and_end_at_logout() {
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = logins(root.path()).await;
+        let (session, _) = sign_in(&logins, &fake, "ghu_allowed").await.unwrap();
+        // Each use renews it.
+        for _ in 0..3 {
+            clock.advance(SESSION_IDLE - Duration::from_secs(1));
+            assert!(logins.session(&session, true).is_some());
+        }
+        clock.advance(SESSION_IDLE);
+        assert_eq!(logins.session(&session, true), None, "idle too long");
+        // Its token goes with its user's last session.
+        let kept = root.path().join(USERS_DIR).join(format!("{ALLOWED}.json"));
+        assert!(!kept.exists());
+        // However much it is used, a week is the most.
+        let (session, _) = sign_in(&logins, &fake, "ghu_allowed").await.unwrap();
+        let hour = Duration::from_secs(3600);
+        let mut used = Duration::ZERO;
+        while used + hour < SESSION_MAX {
+            clock.advance(hour);
+            used += hour;
+            assert!(logins.session(&session, true).is_some());
+        }
+        clock.advance(hour);
+        assert_eq!(logins.session(&session, true), None, "past its lifetime");
+        // Logging out ends it, and forgets the token once no session is left.
+        let (first, _) = sign_in(&logins, &fake, "ghu_allowed").await.unwrap();
+        clock.advance(ATTEMPT_WINDOW);
+        let (second, _) = sign_in(&logins, &fake, "ghu_allowed").await.unwrap();
+        logins.logout(&first).unwrap();
+        assert_eq!(logins.session(&first, true), None);
+        assert!(logins.session(&second, true).is_some() && kept.exists());
+        logins.logout(&second).unwrap();
+        assert!(!kept.exists());
+        // A restart signs everyone out, and forgets the tokens.
+        sign_in(&logins, &fake, "ghu_allowed").await.unwrap();
+        assert!(kept.exists());
+        let _restarted = self::logins(root.path()).await;
+        assert!(!kept.exists());
+        logins.logout("never-a-session").unwrap();
+        assert_eq!(logins.session("never-a-session", true), None);
+    }
+
+    #[tokio::test]
+    async fn sign_in_attempts_are_rate_limited_by_peer_and_in_all() {
+        let root = tempfile::tempdir().unwrap();
+        let (logins, _, clock) = logins(root.path()).await;
+        for _ in 0..PEER_ATTEMPTS {
+            logins.start(PEER).unwrap();
+        }
+        let limited = logins.start(PEER).unwrap_err();
+        assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.retry_after.is_some_and(|d| d <= ATTEMPT_WINDOW));
+        // Callbacks with nothing to finish count too.
+        let callback = logins.finish(PEER, Some("x"), &Callback::default()).await;
+        assert_eq!(callback.unwrap_err().status, StatusCode::TOO_MANY_REQUESTS);
+        // Another peer isn't held up by this one, until all of them
+        // together reach the backstop.
+        logins.start("100.64.0.2").unwrap();
+        for n in 0..ALL_ATTEMPTS - PEER_ATTEMPTS - 1 {
+            logins.start(&format!("100.64.1.{n}")).unwrap();
+        }
+        let backstop = logins.start("100.64.0.3").unwrap_err();
+        assert_eq!(backstop.status, StatusCode::TOO_MANY_REQUESTS);
+        clock.advance(ATTEMPT_WINDOW);
+        logins.start(PEER).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_pages_own_refreshes_dont_keep_a_session_and_sweeps_forget_its_token() {
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = logins(root.path()).await;
+        let (session, _) = sign_in(&logins, &fake, "ghu_allowed").await.unwrap();
+        let kept = root.path().join(USERS_DIR).join(format!("{ALLOWED}.json"));
+        clock.advance(SESSION_IDLE - Duration::from_secs(1));
+        assert!(
+            logins.session(&session, false).is_some(),
+            "a refresh still reads"
+        );
+        clock.advance(Duration::from_secs(1));
+        assert!(kept.exists());
+        // No request needed: the sweep ends it and forgets the token.
+        logins.sweep();
+        assert!(!kept.exists());
+        assert_eq!(logins.session(&session, true), None);
+        // A sign-in left unfinished is swept too.
+        logins.start(PEER).unwrap();
+        clock.advance(LOGIN_TTL);
+        logins.sweep();
+        assert!(logins.state().pending.is_empty());
+    }
+
+    #[test]
+    fn the_peer_is_the_fronts_last_forwarded_address() {
+        let headers = |values: &[&str]| {
+            let mut h = HeaderMap::new();
+            for v in values {
+                h.append("x-forwarded-for", v.parse().unwrap());
+            }
+            h
+        };
+        // (X-Forwarded-For headers, the peer)
+        for (values, expected) in [
+            (&[][..], DIRECT),
+            (&["100.64.0.7"][..], "100.64.0.7"),
+            // A peer's own copy can't pass for another peer: the front's
+            // entry comes last.
+            (&["100.64.0.1, 100.64.0.7"][..], "100.64.0.7"),
+            (&["100.64.0.1", "100.64.0.7"][..], "100.64.0.7"),
+            (&["100.64.0.7, "][..], "100.64.0.7"),
+        ] {
+            assert_eq!(peer(&headers(values)), expected, "{values:?}");
+        }
+        assert_eq!(peer(&headers(&[&"9".repeat(500)])).len(), MAX_PEER);
+    }
+}

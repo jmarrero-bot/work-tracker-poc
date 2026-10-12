@@ -7,6 +7,7 @@ its internal work ever reaches the hub: not in what it sends, not in any
 hub answer, not in the hub's data directory."""
 import json
 import os
+import stat
 from pathlib import Path
 import secrets
 import shutil
@@ -18,6 +19,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'target/debug/workboard').resolve())
@@ -328,7 +330,54 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         assert hub.call('/api/export/external', token=companion_token)[0] == 401
         assert hub.call('/api/export/external', token=rotated)[0] == 200
         proxy.shutdown()
-        print('PASS: hub mode refusals, tailnet name and origins, the companion token, a companion pulling read-only GETs, the merged board and Mine view, duplicates, read-only hub work, no internal work at the hub, staleness with the hub down, mode persistence, and pairing only with --pairing')
+
+        # A hub with its GitHub App, as far as it goes without GitHub: it
+        # needs the App's secret in a private file, pairs no browser, takes
+        # the CLI's token on loopback only, and checks where sign-in steps
+        # come from.
+        app_root = Path(folder) / 'app'
+        callback = f'https://{TAILNET}/auth/github/callback'
+        app_args = ['--hub', '--allowed-host', TAILNET, '--github-app-client-id', 'Iv23test', '--github-app-callback', callback, '--github-user', '1001']
+        app_command = [binary, '--data-dir', str(app_root), '--port', str(free_port()), 'serve']
+        refused(app_command + app_args, 'set-secret')
+        set_secret = subprocess.run([binary, '--data-dir', str(app_root), 'github-app', 'set-secret', '--token-stdin'], input='test-only-secret', capture_output=True, text=True)
+        assert set_secret.returncode == 0, set_secret
+        assert stat.S_IMODE((app_root / 'github-app.secret').stat().st_mode) == 0o600
+        refused(app_command + app_args + ['--pairing'], 'cannot be used with')
+        refused(app_command + app_args[:-4] + ['--github-app-callback', 'https://other.example.ts.net/auth/github/callback', '--github-user', '1001'], 'callback URL')
+        refused(app_command + app_args[:-2], '--github-user')
+        app = Service(app_root, *app_args)
+        services.append(app)
+        assert app.call('/api/session', 'POST')[0] == 403
+        assert app.call('/api/snapshot')[0] == 200
+        assert app.call('/api/snapshot', host=TAILNET)[0] == 401
+        status = json.loads(app.call('/auth/status', token=None, host=TAILNET)[2])
+        assert status == {'github_app': True, 'pairing': False, 'sign_in': f'https://{TAILNET}/', 'user': None}, status
+        page = dict(token=None, host=TAILNET, origin=f'https://{TAILNET}')
+        assert app.call('/auth/github/login', 'POST', token=None, host=TAILNET)[0] == 403, 'no origin'
+        assert app.call('/auth/github/login', 'POST', token=None, origin=f'http://127.0.0.1:{app.port}')[0] == 403, 'not on its name'
+        status, headers, body = app.call('/auth/github/login', 'POST', **page)
+        assert status == 200, body
+        started = headers['Set-Cookie']
+        assert all(flag in started for flag in ['__Host-workboard_login=', 'HttpOnly', 'Secure', 'SameSite=Lax', 'Path=/']), started
+        url = urlsplit(json.loads(body)['url'])
+        query = {k: v[0] for k, v in parse_qs(url.query).items()}
+        assert (url.scheme, url.netloc, url.path) == ('https', 'github.com', '/login/oauth/authorize'), url
+        assert (query['client_id'], query['redirect_uri'], query['code_challenge_method']) == ('Iv23test', callback, 'S256'), query
+        assert len(query['code_challenge']) == 43 and len(query['state']) >= 32, query
+        back = f"/auth/github/callback?code=test-only-code&state={query['state']}"
+        status, _, body = app.call(back, token=None, host=TAILNET)
+        assert status == 400 and b'another browser' in body, body
+        status, _, body = app.call('/auth/github/callback?code=x&state=forged', token=None, host=TAILNET, cookie=started.split(';')[0])
+        assert status == 400, body
+        # Ten attempts a minute: the start and the callback without a
+        # sign-in to finish, then eight. A callback that has one isn't
+        # counted, so its browser can always finish.
+        for _ in range(8):
+            assert app.call('/auth/github/login', 'POST', **page)[0] == 200
+        status, headers, _ = app.call('/auth/github/login', 'POST', **page)
+        assert status == 429 and headers['Retry-After'], headers
+        print('PASS: hub mode refusals, tailnet name and origins, pairing only with --pairing, the companion token, a companion pulling read-only GETs, the merged board and Mine view, duplicates, read-only hub work, no internal work at the hub, staleness with the hub down, mode persistence, and a hub with its GitHub App: its private secret, no pairing, the CLI on loopback only, and checked sign-in steps')
     finally:
         for service in services:
             service.stop()

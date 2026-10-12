@@ -2,9 +2,10 @@
 # that can send any other method is refused here, in the service and in the
 # GNOME app alike. Each use is an explicit exception with a reason: the
 # CLI's and the GNOME app's calls to their own local service, and the
-# one send of each read-only client, which checks every request first:
-# GitHub's and Forgejo's, and the companion's client of its hub, which only
-# GETs the hub's export.
+# one send of each checked client, which checks every request first:
+# GitHub's and Forgejo's read-only clients, the companion's client of its
+# hub, which only GETs the hub's export, and the client of GitHub's OAuth
+# endpoints, which only POSTs a hub's sign-in forms to github.com/login.
 #
 # A reqwest request goes out through `Client::execute`, the tower `Service`
 # that `Client` and `&Client` implement, or `RequestBuilder::send`. The first
@@ -20,4 +21,8 @@ disallowed-methods = [
   { path = "tower_service::Service::call", reason = "sources are read-only; reqwest's Client sends a request of any method through it" },
   { path = "reqwest::RequestBuilder::from_parts", reason = "sources are read-only; it sends a request of any method" },
   { path = "reqwest::Request::method_mut", reason = "sources are read-only" },
+  # Tests drive the router in process with it; it would send a reqwest
+  # Client's request as well. Only a dev-dependency, so not every build has
+  # the path.
+  { path = "tower::util::ServiceExt::oneshot", reason = "sources are read-only; reqwest's Client sends a request of any method through it", allow-invalid = true },
 ]
