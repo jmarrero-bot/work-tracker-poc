@@ -1,8 +1,7 @@
 //! The connectors: Jira, GitLab, GitHub and Fedora Forge (Forgejo) built in,
-//! sharing URL rules and an
-//! HTTP client that keeps TLS verification, refuses redirects and never
-//! surfaces a remote response body; and third-party plugins run out of
-//! process.
+//! sharing URL rules and an HTTP client that keeps TLS verification,
+//! refuses redirects and never surfaces a remote response body; and
+//! third-party plugins run out of process.
 
 mod forgejo;
 mod github;
