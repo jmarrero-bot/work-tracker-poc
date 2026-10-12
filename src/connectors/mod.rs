@@ -248,6 +248,7 @@ fn test_connection() -> crate::model::Connection {
         error: None,
         zone: crate::model::Zone::Internal,
         error_kind: None,
+        watch_user: None,
     }
 }
 

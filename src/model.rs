@@ -23,6 +23,11 @@ pub struct Connection {
     /// leave this machine.
     #[serde(default)]
     pub error_kind: Option<ErrorKind>,
+    /// Another GitHub user whose activity, as far as this connection's
+    /// token can see it, the connection also watches, a setting of its own:
+    /// what it finds is theirs, never this account's.
+    #[serde(default)]
+    pub watch_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +108,23 @@ pub struct ConnectInput {
     /// Internal unless the person explicitly chooses external.
     #[serde(default)]
     pub zone: Zone,
+    /// Another GitHub user to watch as well.
+    #[serde(default)]
+    pub watch_user: Option<String>,
+}
+
+/// The items a connection found by watching another user, as of its last
+/// sync. They wait on that user, never on the connection's account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchList {
+    pub connection_id: String,
+    /// Who is watched.
+    pub login: String,
+    pub items: Vec<Item>,
+    /// Why the last sync couldn't update the list, which then is what an
+    /// earlier sync found. Never the account's own sync error.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -131,6 +153,42 @@ pub struct ManualInput {
 pub fn is_gitlab(provider: &str) -> bool {
     matches!(provider, "gitlab-internal" | "gitlab-public")
 }
+/// Whether `login` can be a GitHub login: letters, digits and hyphens, not
+/// at either end. Anything else could change the searches it goes into.
+pub fn valid_github_login(login: &str) -> bool {
+    (1..=39).contains(&login.len())
+        && !login.starts_with('-')
+        && !login.ends_with('-')
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 pub fn valid_provider(provider: &str) -> bool {
     is_gitlab(provider) || matches!(provider, "jira" | "github" | "fedora" | "errata")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_logins() {
+        let (longest, too_long) = ("a".repeat(39), "a".repeat(40));
+        for (login, valid) in [
+            ("jmarrero", true),
+            ("jmarrero-bot", true),
+            ("a", true),
+            (longest.as_str(), true),
+            (too_long.as_str(), false),
+            ("", false),
+            ("-a", false),
+            ("a-", false),
+            ("a b", false),
+            ("a is:closed", false),
+            ("a,b", false),
+            ("@me", false),
+            ("a_b", false),
+        ] {
+            assert_eq!(valid_github_login(login), valid, "{login}");
+        }
+    }
 }

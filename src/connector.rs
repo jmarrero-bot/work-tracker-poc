@@ -9,7 +9,7 @@
 
 use crate::{
     connectors::source_url,
-    model::{Connection, Item, Outcome},
+    model::{Connection, Item, Outcome, WatchList},
     outcome,
 };
 use serde::{Deserialize, Serialize};
@@ -294,6 +294,21 @@ pub trait Connector: Send + Sync {
         account: &'a Account,
         tracked: &'a [Tracked],
     ) -> BoxFuture<'a, ConnectorResult<Vec<Refreshed>>>;
+    /// The open items of another user's activity that this account's
+    /// credential can see, for watching someone whose own credential isn't
+    /// connected.
+    /// Their reasons are the watched user's, never the account's.
+    fn watch<'a>(
+        &'a self,
+        _target: &'a Target,
+        _login: &'a str,
+    ) -> BoxFuture<'a, ConnectorResult<Vec<RemoteItem>>> {
+        Box::pin(async {
+            Err(ConnectorError::invalid(
+                "This source can't watch another user",
+            ))
+        })
+    }
     /// What it has sent to its source, if it counts.
     fn requests(&self) -> Option<Requests> {
         None
@@ -392,6 +407,97 @@ pub async fn verify(connector: &dyn Connector, target: &Target) -> ConnectorResu
     Ok(account)
 }
 
+/// `remote` as an item of connection `c`, unless it repeats the credential
+/// or fails the checks of [`to_item`].
+fn checked(
+    connector: &dyn Connector,
+    target: &Target,
+    c: &Connection,
+    remote: RemoteItem,
+) -> ConnectorResult<Item> {
+    let credential = target.credential.expose();
+    let echoed = [
+        &remote.remote_id,
+        &remote.key,
+        &remote.title,
+        &remote.url,
+        &remote.status,
+        &remote.outcome_reason,
+        &remote.action,
+        &remote.updated_at,
+    ]
+    .iter()
+    .any(|field| field.contains(credential));
+    if echoed {
+        return Err(ConnectorError::invalid(
+            "The connector returned an item containing the credential",
+        ));
+    }
+    to_item(c, connector.kind(), remote)
+}
+
+/// The open items of `login` that connection `c`'s account can see, for
+/// watching a person whose own credential isn't connected. Call it after
+/// [`sync`] checked the account. The items are checked like listed ones,
+/// and carry no attention category: they wait on `login`, never on the
+/// account.
+pub async fn watch(
+    connector: &dyn Connector,
+    target: &Target,
+    c: &Connection,
+    login: &str,
+) -> ConnectorResult<Vec<Item>> {
+    let mut all = BTreeMap::<String, Item>::new();
+    let found = connector
+        .watch(target, login)
+        .await
+        .map_err(|e| e.redact(&target.credential))?;
+    for mut remote in found {
+        remote.action.clear();
+        let item = checked(connector, target, c, remote)?;
+        if all.insert(item.id.clone(), item).is_some() {
+            return Err(ConnectorError::invalid(
+                "The connector listed the same item twice",
+            ));
+        }
+    }
+    Ok(all.into_values().collect())
+}
+
+/// Sync connection `c` and, if it watches another user, what watching
+/// finds. Watching is a separate list: if it fails, the account's own items
+/// are still synced, and the list keeps what `last` found for the same user,
+/// with the error.
+pub async fn sync_and_watch(
+    connector: &dyn Connector,
+    target: &Target,
+    c: &Connection,
+    old: &[Item],
+    last: Option<&WatchList>,
+) -> ConnectorResult<(Vec<Item>, Option<WatchList>)> {
+    let items = sync(connector, target, c, old).await?;
+    let Some(login) = &c.watch_user else {
+        return Ok((items, None));
+    };
+    let list = |found, error| WatchList {
+        connection_id: c.id.clone(),
+        login: login.clone(),
+        items: found,
+        error,
+    };
+    let watched = match watch(connector, target, c, login).await {
+        Ok(found) => list(found, None),
+        Err(e) => {
+            let kept = last
+                .filter(|l| l.connection_id == c.id && l.login == *login)
+                .map(|l| l.items.clone())
+                .unwrap_or_default();
+            list(kept, Some(format!("Watching {login}: {}", e.message)))
+        }
+    };
+    Ok((items, Some(watched)))
+}
+
 /// Sync connection `c`: check that the credential still belongs to its
 /// account, list the account's items, and fetch tracked items the listing no
 /// longer has, so a merge or a finished ticket can advance its effort. An
@@ -423,31 +529,10 @@ async fn sync_checked(
             "Credential belongs to another account; create a separate connection",
         ));
     }
-    let kind = connector.kind();
-    let checked = |remote: RemoteItem| {
-        let credential = target.credential.expose();
-        let echoed = [
-            &remote.remote_id,
-            &remote.key,
-            &remote.title,
-            &remote.url,
-            &remote.status,
-            &remote.outcome_reason,
-            &remote.action,
-            &remote.updated_at,
-        ]
-        .iter()
-        .any(|field| field.contains(credential));
-        if echoed {
-            return Err(ConnectorError::invalid(
-                "The connector returned an item containing the credential",
-            ));
-        }
-        to_item(c, kind, remote)
-    };
+    let check = |remote| checked(connector, target, c, remote);
     let mut all = BTreeMap::<String, Item>::new();
     for remote in connector.list(target, &account).await? {
-        let item = checked(remote)?;
+        let item = check(remote)?;
         if all.insert(item.id.clone(), item).is_some() {
             return Err(ConnectorError::invalid(
                 "The connector listed the same item twice",
@@ -498,7 +583,7 @@ async fn sync_checked(
                 // the account.
                 remote.action = FOLLOW_UP.into();
                 remote.reasons.clear();
-                checked(remote)?
+                check(remote)?
             }
             (None, Some(e)) if e.kind == ErrorKind::Inaccessible => {
                 check_text("error", &e.message)?;
@@ -591,6 +676,7 @@ mod tests {
             error: None,
             zone: Zone::External,
             error_kind: None,
+            watch_user: None,
         }
     }
     fn target() -> Target {
@@ -878,6 +964,54 @@ mod tests {
             items[0].outcome_reason
         );
         assert!(items[0].outcome_reason.contains("[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_watch_never_fails_the_accounts_sync() {
+        let fake = Fake::new(vec![remote("mine", Outcome::Open, "next")], vec![]);
+        let c = Connection {
+            watch_user: Some("someone".into()),
+            ..connection()
+        };
+        let last = |login: &str| WatchList {
+            connection_id: c.id.clone(),
+            login: login.into(),
+            items: vec![stored("theirs", Outcome::Open)],
+            error: None,
+        };
+        // The fake can't watch: its own items still sync, and the list
+        // found before for the same user stays, with the error.
+        for (last, kept) in [
+            (Some(last("someone")), 1),
+            (Some(last("someone-else")), 0),
+            (None, 0),
+        ] {
+            let (items, watched) = sync_and_watch(&fake, &target(), &c, &[], last.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(items.len(), 1);
+            let watched = watched.unwrap();
+            assert_eq!(
+                (watched.login.as_str(), watched.items.len()),
+                ("someone", kept)
+            );
+            let error = watched.error.unwrap();
+            assert!(error.starts_with("Watching someone: "), "{error}");
+        }
+        // Without a watch, there is no list.
+        let (_, watched) = sync_and_watch(&fake, &target(), &connection(), &[], None)
+            .await
+            .unwrap();
+        assert!(watched.is_none());
+    }
+
+    #[tokio::test]
+    async fn watching_needs_a_source_that_can() {
+        let fake = Fake::new(vec![], vec![]);
+        let error = watch(&fake, &target(), &connection(), "someone")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Invalid, "{error}");
     }
 
     #[test]
