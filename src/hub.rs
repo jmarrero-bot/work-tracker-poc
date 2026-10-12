@@ -191,6 +191,19 @@ impl Pull for HubClient {
     }
 }
 
+/// The set of `ids`, if each is there once, and none is empty or overlong.
+/// A set, so checking what each item refers to stays linear: a hub could
+/// send lists of up to [`MAX_COUNT`] each.
+fn unique_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<HashSet<&'a str>> {
+    let mut set = HashSet::new();
+    for id in ids {
+        if id.is_empty() || id.len() > MAX_ID || !set.insert(id) {
+            return None;
+        }
+    }
+    Some(set)
+}
+
 /// What a hub sent, if all of it is external and well formed: every object
 /// says it is external, items belong to connections it sent and efforts
 /// to efforts it sent, links are HTTP(S), and nothing is out of bounds.
@@ -209,18 +222,13 @@ pub fn checked(s: ExternalSnapshot) -> ConnectorResult<ExternalSnapshot> {
     {
         return fail("is too large");
     }
-    let unique = |ids: Vec<&str>| {
-        let set: HashSet<_> = ids.iter().collect();
-        set.len() == ids.len() && ids.iter().all(|id| !id.is_empty() && id.len() <= MAX_ID)
-    };
-    let connections: Vec<_> = s.connections.iter().map(|c| c.id.as_str()).collect();
-    let efforts: Vec<_> = s.efforts.iter().map(|e| e.id.as_str()).collect();
-    if !unique(connections.clone())
-        || !unique(efforts.clone())
-        || !unique(s.items.iter().map(|i| i.id.as_str()).collect())
-    {
+    let (Some(connections), Some(efforts), Some(_)) = (
+        unique_ids(s.connections.iter().map(|c| c.id.as_str())),
+        unique_ids(s.efforts.iter().map(|e| e.id.as_str())),
+        unique_ids(s.items.iter().map(|i| i.id.as_str())),
+    ) else {
         return fail("has missing, overlong or repeated IDs");
-    }
+    };
     let text_ok = |fields: &[&str]| fields.iter().all(|f| f.len() <= MAX_FIELD);
     for c in &s.connections {
         if !valid_provider(&c.provider)
@@ -833,7 +841,7 @@ pub mod tests {
     #[test]
     fn exports_are_checked_whole() {
         type Break = fn(&mut ExternalSnapshot);
-        let cases: [(&str, Break); 10] = [
+        let cases: [(&str, Break); 11] = [
             ("snapshot zone", |s| s.zone = Zone::Internal),
             ("connection zone", |s| {
                 s.connections[0].zone = Zone::Internal
@@ -852,6 +860,9 @@ pub mod tests {
                 s.items[0].effort_id = Some("elsewhere".into())
             }),
             ("repeated item", |s| s.items[1].id = s.items[0].id.clone()),
+            ("repeated connection", |s| {
+                s.connections.push(s.connections[0].clone())
+            }),
             ("empty ID", |s| s.efforts[0].id = String::new()),
             ("overlong title", |s| {
                 s.items[0].title = "x".repeat(MAX_FIELD + 1)
