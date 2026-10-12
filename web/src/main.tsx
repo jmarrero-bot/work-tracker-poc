@@ -96,7 +96,7 @@ const providers: Record<
     color: "#eab36c",
     live: true,
   },
-  github: { name: "GitHub", short: "GH", color: "#c6cdd9", live: false },
+  github: { name: "GitHub", short: "GH", color: "#c6cdd9", live: true },
   fedora: { name: "Fedora Forge", short: "FE", color: "#79bbea", live: false },
 };
 const names = Object.keys(providers) as Provider[];
@@ -341,7 +341,7 @@ function App() {
         setNotice(
           r.results.length
             ? "Connected sources are up to date."
-            : "Connect Jira or GitLab to start syncing.",
+            : "Connect Jira, GitLab or GitHub to start syncing.",
         );
     } catch (e) {
       setError((e as Error).message);
@@ -798,7 +798,7 @@ function App() {
                       <p>
                         {data.items.length
                           ? "Try another source, attention filter, or search."
-                          : "Connect Jira or GitLab, then sync to bring in your work."}
+                          : "Connect Jira, GitLab or GitHub, then sync to bring in your work."}
                       </p>
                       <button
                         className="quiet"
@@ -977,8 +977,8 @@ function App() {
               <div className="connection-intro">
                 <Plug size={20} />
                 <p>
-                  Connect a personal account to sync Jira or GitLab. Other
-                  sources can be tracked with manual links while their
+                  Connect a personal account to sync Jira, GitLab or GitHub.
+                  Other sources can be tracked with manual links while their
                   connectors are added.
                 </p>
                 <button className="quiet" onClick={sync} disabled={syncing}>
@@ -1035,6 +1035,8 @@ function App() {
                             ? "Jira Data Center with a personal access token."
                             : p.includes("gitlab")
                               ? "Connect the instance URL and a token with API read access."
+                              : p === "github"
+                                ? "github.com or GitHub Enterprise Server, with a token. Workboard only reads: it refuses any request that could change GitHub."
                               : p === "errata"
                                 ? "Track advisory links now. Live sync awaits your Errata API details."
                                 : "Keep source links in your inbox. Live sync is not implemented yet."}
@@ -1331,7 +1333,9 @@ function App() {
                     true,
                     connectProvider === "jira"
                       ? "https://jira.example.com/"
-                      : "https://gitlab.example.com/",
+                      : connectProvider === "github"
+                        ? "https://github.com/"
+                        : "https://gitlab.example.com/",
                   )}
                   {field("token", "Personal access token", "password", true)}
                   <label className="zone-choice">

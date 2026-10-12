@@ -259,6 +259,19 @@ impl Refreshed {
     }
 }
 
+/// What a connector sent to its source, so a person can check that it only
+/// read. Only connectors that count report it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Requests {
+    /// Requests sent, by what they were: an HTTP method, or a GraphQL query.
+    pub sent: BTreeMap<String, u64>,
+    /// Requests the source answered with "not modified", from what an
+    /// earlier one returned.
+    pub not_modified: u64,
+    /// Requests refused before they were sent, because they could write.
+    pub refused: u64,
+}
+
 /// A source of work items. Each call gets the target account and its
 /// credential; a connector keeps no credential between calls.
 pub trait Connector: Send + Sync {
@@ -281,6 +294,10 @@ pub trait Connector: Send + Sync {
         account: &'a Account,
         tracked: &'a [Tracked],
     ) -> BoxFuture<'a, ConnectorResult<Vec<Refreshed>>>;
+    /// What it has sent to its source, if it counts.
+    fn requests(&self) -> Option<Requests> {
+        None
+    }
 }
 
 fn check_text(field: &str, value: &str) -> ConnectorResult<()> {

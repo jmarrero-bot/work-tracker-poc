@@ -14,7 +14,10 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(version, about = "Your work across Jira, GitLab and release systems")]
+#[command(
+    version,
+    about = "Your work across Jira, GitLab, GitHub and release systems"
+)]
 struct Args {
     /// Private local data directory. Use a separate directory for demo data.
     #[arg(long, global = true)]
@@ -32,8 +35,9 @@ enum Command {
         #[arg(long)]
         demo: bool,
     },
-    /// Connect Jira Data Center, a GitLab instance, or a source served by a
-    /// connector plugin, using a personal token.
+    /// Connect Jira Data Center, a GitLab instance, GitHub, or a source
+    /// served by a connector plugin, using a personal token. GitHub is only
+    /// ever read: requests that could change it are refused.
     Connect {
         #[arg(value_parser=["jira","gitlab-internal","gitlab-public","github","fedora","errata"])]
         provider: String,

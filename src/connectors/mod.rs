@@ -1,7 +1,9 @@
-//! The connectors: Jira and GitLab built in, sharing URL rules and an HTTP
-//! client that keeps TLS verification, refuses redirects and never surfaces
-//! a remote response body; and third-party plugins run out of process.
+//! The connectors: Jira, GitLab and GitHub built in, sharing URL rules and an
+//! HTTP client that keeps TLS verification, refuses redirects and never
+//! surfaces a remote response body; and third-party plugins run out of
+//! process.
 
+mod github;
 mod gitlab;
 mod jira;
 #[cfg(unix)]
@@ -16,7 +18,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use url::Url;
 
 pub fn base_url(raw: &str) -> Result<String> {
@@ -59,17 +61,27 @@ pub fn client() -> Result<Client> {
 /// provider, named after it.
 pub const PLUGINS_DIR: &str = "plugins";
 
-/// The connector for a provider: built in for Jira and GitLab, otherwise the
-/// plugin named after the provider in `plugins`, if there is one.
-pub fn for_provider(provider: &str, plugins: &Path) -> Result<Box<dyn Connector>> {
+/// What built-in connectors keep between calls in one service process, for
+/// every connection: GitHub's answers for conditional requests and its rate
+/// limits. Never a credential.
+#[derive(Clone, Default)]
+pub struct Shared {
+    github: Arc<github::Memory>,
+}
+
+/// The connector for a provider: built in for Jira, GitLab and GitHub,
+/// otherwise the plugin named after the provider in `plugins`, if there is
+/// one.
+pub fn for_provider(provider: &str, plugins: &Path, shared: &Shared) -> Result<Box<dyn Connector>> {
     Ok(match provider {
         "jira" => Box::new(jira::Jira::new()?),
         p if is_gitlab(p) => Box::new(gitlab::GitLab::new()?),
+        "github" => Box::new(github::GitHub::new(shared.github.clone())?),
         p if valid_provider(p) => {
             let program = std::path::absolute(plugins.join(p))?;
             if !program.exists() {
                 bail!(
-                    "Live connection currently supports Jira Data Center and GitLab, and connector plugins such as {}",
+                    "Live connection currently supports Jira Data Center, GitLab and GitHub, and connector plugins such as {}",
                     program.display()
                 )
             }
@@ -272,7 +284,7 @@ mod tests {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
         // A plugin can serve a known source without a built-in connector,
         // but neither replace a built-in one nor add an unknown source.
-        for name in ["errata", "jira", "bugzilla"] {
+        for name in ["errata", "jira", "github", "bugzilla"] {
             std::fs::copy(&script, plugins.path().join(name)).unwrap();
         }
         for (provider, kind) in [
@@ -280,11 +292,12 @@ mod tests {
             ("gitlab-internal", Some("gitlab")),
             ("gitlab-public", Some("gitlab")),
             ("errata", Some("errata")),
-            ("github", None),
+            ("github", Some("github")),
+            ("fedora", None),
             ("bugzilla", None),
         ] {
             assert_eq!(
-                for_provider(provider, plugins.path())
+                for_provider(provider, plugins.path(), &Shared::default())
                     .ok()
                     .map(|c| c.kind().to_string())
                     .as_deref(),
@@ -292,5 +305,9 @@ mod tests {
                 "{provider}"
             );
         }
+        // The built-in GitHub connector, which counts what it sends, and
+        // not the plugin of that name.
+        let github = for_provider("github", plugins.path(), &Shared::default()).unwrap();
+        assert!(github.requests().is_some());
     }
 }
