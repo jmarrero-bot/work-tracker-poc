@@ -20,7 +20,11 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use url::Url;
 
 pub fn base_url(raw: &str) -> Result<String> {
@@ -57,6 +61,17 @@ pub fn client() -> Result<Client> {
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
+}
+
+/// The longest wait a source can ask for before more requests that is
+/// honored. A rate limit frees up within an hour on GitHub, and a longer or
+/// absurd `retry-after` from a proxy would otherwise hold a token for the
+/// life of the process, or overflow the clock.
+pub const MAX_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// When a wait of `wait` from `now` ends, at most [`MAX_WAIT`] later.
+pub fn wait_until(now: SystemTime, wait: Duration) -> SystemTime {
+    now.checked_add(wait.min(MAX_WAIT)).unwrap_or(now)
 }
 
 /// Where a data directory keeps connector plugins: one executable per
@@ -313,6 +328,15 @@ mod tests {
             "https://example.com/jira/"
         );
         assert!(source_url("javascript:alert(1)").is_err());
+    }
+    #[test]
+    fn waits_are_capped() {
+        let now = SystemTime::now();
+        let second = Duration::from_secs(1);
+        assert_eq!(wait_until(now, second), now + second);
+        for wait in [MAX_WAIT + second, Duration::MAX] {
+            assert_eq!(wait_until(now, wait), now + MAX_WAIT);
+        }
     }
     #[test]
     fn connectors_by_provider() {

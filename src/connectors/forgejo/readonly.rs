@@ -10,7 +10,7 @@
 
 use crate::{
     connector::{ConnectorError, ConnectorResult, ErrorKind, Requests, Target},
-    connectors::{client, http_error, parse_json, read_body},
+    connectors::{client, http_error, parse_json, read_body, wait_until},
 };
 use reqwest::{
     header::{self, HeaderMap, HeaderValue},
@@ -125,9 +125,9 @@ impl Memory {
 }
 
 /// Until when an answer asks for no more requests: a 429, for its
-/// `retry-after` or [`DEFAULT_WAIT`], or a 503 that names a `retry-after`.
-/// Forgejo has no API rate limit of its own, but a proxy in front of it
-/// can.
+/// `retry-after` or [`DEFAULT_WAIT`], or a 503 that names a `retry-after`,
+/// never more than [`crate::connectors::MAX_WAIT`] away. Forgejo has no API
+/// rate limit of its own, but a proxy in front of it can.
 fn used_up(answer: &Answer) -> Option<SystemTime> {
     let retry_after = answer
         .headers
@@ -139,7 +139,7 @@ fn used_up(answer: &Answer) -> Option<SystemTime> {
         StatusCode::SERVICE_UNAVAILABLE => retry_after?,
         _ => return None,
     };
-    Some(SystemTime::now() + wait)
+    Some(wait_until(SystemTime::now(), wait))
 }
 
 fn rate_limited(until: SystemTime) -> ConnectorError {
@@ -534,6 +534,26 @@ pub mod tests {
                 next.unwrap();
                 assert_eq!(seen.load(Ordering::SeqCst), 3, "{status}");
             }
+        }
+    }
+
+    #[test]
+    fn absurd_waits_are_capped() {
+        let max = crate::connectors::MAX_WAIT;
+        for retry_after in [u64::MAX.to_string(), "7200".into()] {
+            let answer = Answer {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers: [(header::RETRY_AFTER, retry_after.parse().unwrap())]
+                    .into_iter()
+                    .collect(),
+                body: vec![],
+            };
+            let before = SystemTime::now();
+            let wait = used_up(&answer).unwrap().duration_since(before).unwrap();
+            assert!(
+                wait <= max + Duration::from_secs(1) && wait >= max - Duration::from_secs(1),
+                "{retry_after}: {wait:?}"
+            );
         }
     }
 
