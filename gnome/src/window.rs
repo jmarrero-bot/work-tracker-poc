@@ -207,6 +207,8 @@ impl Window {
             .width_request(360)
             .height_request(400)
             .content(&split)
+            // Notifications keep coming while the window is closed.
+            .hide_on_close(true)
             .build();
         let breakpoint = adw::Breakpoint::new(
             adw::BreakpointCondition::parse(NARROW)
