@@ -147,7 +147,7 @@ const providers: Record<
     live: true,
   },
   github: { name: "GitHub", short: "GH", color: "#c6cdd9", live: true },
-  fedora: { name: "Fedora Forge", short: "FE", color: "#79bbea", live: false },
+  fedora: { name: "Fedora Forge", short: "FE", color: "#79bbea", live: true },
 };
 const names = Object.keys(providers) as Provider[];
 const outcomes: Record<Outcome, string> = {
@@ -1238,6 +1238,8 @@ function App() {
                               ? "Connect the instance URL and a token with API read access."
                               : p === "github"
                                 ? "github.com or GitHub Enterprise Server, with a token. Workboard only reads: it refuses any request that could change GitHub."
+                              : p === "fedora"
+                                ? "forge.fedoraproject.org, with a Forgejo access token (read:user, read:issue and read:repository are enough). Workboard only reads: it refuses any request that could change it. Package dist-git on src.fedoraproject.org takes source links for now."
                               : p === "errata"
                                 ? "Track advisory links now. Live sync awaits your Errata API details."
                                 : "Keep source links in your inbox. Live sync is not implemented yet."}
@@ -1536,7 +1538,9 @@ function App() {
                       ? "https://jira.example.com/"
                       : connectProvider === "github"
                         ? "https://github.com/"
-                        : "https://gitlab.example.com/",
+                        : connectProvider === "fedora"
+                          ? "https://forge.fedoraproject.org/"
+                          : "https://gitlab.example.com/",
                   )}
                   {field("token", "Personal access token", "password", true)}
                   {connectProvider === "github" && (
