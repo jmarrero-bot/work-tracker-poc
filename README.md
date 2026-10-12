@@ -13,7 +13,7 @@ This is jmarrero's Workboard prototype from his handoff, now built and tested by
 3. [GitHub connector (read-only) and the Mine view](https://github.com/jmarrero-bot/work-tracker-poc/issues/4) (done)
 4. [Fedora Forge discovery and a Forgejo connector](https://github.com/jmarrero-bot/work-tracker-poc/issues/5) (done), and an [Errata investigation](https://github.com/jmarrero-bot/work-tracker-poc/issues/6)
 5. [Scheduled sync with checkpoints and backoff](https://github.com/jmarrero-bot/work-tracker-poc/issues/7) (done)
-6. [Hub mode: an external-only store on the tailnet](https://github.com/jmarrero-bot/work-tracker-poc/issues/8)
+6. [Hub mode: an external-only store on the tailnet](https://github.com/jmarrero-bot/work-tracker-poc/issues/8) (done)
 7. [Bot plugin: the Workstream board, fork PRs and the heartbeat](https://github.com/jmarrero-bot/work-tracker-poc/issues/9)
 8. [GitHub App login: web on the hub, device flow on the companion](https://github.com/jmarrero-bot/work-tracker-poc/issues/12)
 9. [Commands posted as jmarrero to a control repository](https://github.com/jmarrero-bot/work-tracker-poc/issues/13)
@@ -32,7 +32,11 @@ Fedora Forge is forge.fedoraproject.org, which runs Forgejo, and it is connected
 
 The service keeps every connection fresh on its own, with no model involved: each syncs on its own schedule, backs off when its source fails, waits out rate limits, and stops when its credential is rejected until you verify it again. Everything shows how fresh it is, and stale data is marked as such.
 
-Every connection is in the internal or the external zone, internal unless marked external when connecting. Internal work stays on the machine that syncs it. Work leaves only through the external export (`workboard export --external`), which the hub will read and which carries external work alone. Connectors are plugins behind one interface: Jira, GitLab, GitHub and Fedora Forge are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
+Every connection is in the internal or the external zone, internal unless marked external when connecting. Internal work stays on the machine that syncs it. Work leaves a machine only through the external export (`workboard export --external`), which carries external work alone.
+
+The hub (`serve --hub`) keeps external work only, refusing anything else at every write, and is meant to be reached over the tailnet through `tailscale serve`. The companion on the work laptop keeps the internal work, pulls the hub's export, read-only, and shows both on one board; it never sends the hub anything but that read. See [docs/hub.md](docs/hub.md).
+
+Connectors are plugins behind one interface: Jira, GitLab, GitHub and Fedora Forge are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
 
 ## Run
 
@@ -85,7 +89,7 @@ workboard connections
 
 Each new connection syncs right away, then every 5 minutes; you don't need to run `workboard sync`. See [Synchronization behavior](#synchronization-behavior).
 
-Each connection is **internal** unless you add `--external` (or turn on **External** in the connection dialog). Internal work, such as Jira, internal GitLab or Errata, is never exported; external work, such as gitlab.com or Fedora Forge, is what `workboard export --external` prints for the hub. A connection's zone can't be changed later; disconnect and connect again instead. Manual source links are internal. An effort with external work is exported with that work only, and its note never; its title only once you share it (`workboard share-title EFFORT_ID`, or the switch on the effort), since a title can name internal work. Until then the hub sees a neutral label.
+Each connection is **internal** unless you add `--external` (or turn on **External** in the connection dialog). Internal work, such as Jira, internal GitLab or Errata, is never exported; external work, such as gitlab.com or Fedora Forge, is what `workboard export --external` prints, and what a hub serves to its companions. A connection's zone can't be changed later; disconnect and connect again instead. Manual source links are internal. An effort with external work is exported with that work only, and its note never; its title only once you share it (`workboard share-title EFFORT_ID`, or the switch on the effort), since a title can name internal work. Until then the export shows a neutral label.
 
 `--token-stdin` also accepts a token from standard input. Tokens are never accepted as CLI argument values. Each connection is verified against the instance's current-user endpoint before saving it. Multiple accounts on an instance are separate connections; no username-based cross-service identity matching is performed.
 
@@ -145,7 +149,7 @@ workboard link ITEM_ID                         # ungroup
 workboard add --provider errata --key ADVISORY --title 'Ship advisory' --url https://errata.example.com/advisory/123 --status 'Needs validation' --action next
 workboard update ITEM_ID --status Released --outcome delivered
 workboard abandon ITEM_ID                      # synced, closed without delivery or unknown; --undo reverts
-workboard share-title EFFORT_ID                # let the hub show this effort's title; --undo stops it
+workboard share-title EFFORT_ID                # let this effort's title leave in the export; --undo stops it
 workboard export --external                    # the external zone only, as JSON
 workboard disconnect CONNECTION_ID
 ```
@@ -160,9 +164,9 @@ A new version may upgrade the database when the service starts. Upgrades are one
 
 The web client never receives provider credentials in API responses. Credentials entered in the connection dialog travel only to the local backend, are cleared from the form after saving/closing, and are not put in browser storage. The CLI calls the same API and reads a private service credential from the same data directory.
 
-Each service start rotates the local application credential. Pairing establishes an HttpOnly, SameSite=Strict browser cookie. API routes require authentication, check the request host, and require a matching Origin for cookie-authenticated mutations. No CORS access is enabled. Provider API requests use HTTPS, do not follow redirects, and do not expose remote error bodies or tokens. Source hyperlinks are restricted to HTTP(S).
+Each service start rotates the local application credential. Pairing establishes an HttpOnly, SameSite=Strict browser cookie, also Secure under a hub's tailnet name. This bearer token and cookie are the interim authentication, which GitHub App login ([#12](https://github.com/jmarrero-bot/work-tracker-poc/issues/12)) replaces; a hub also keeps a companion token that only reads its external export (see [docs/hub.md](docs/hub.md)). API routes require authentication, check the request host, and require a matching Origin for cookie-authenticated mutations. No CORS access is enabled. Provider API requests use HTTPS, do not follow redirects, and do not expose remote error bodies or tokens. Source hyperlinks are restricted to HTTP(S).
 
-The service is intentionally local-only. Multi-user ownership/ACLs, hosted OAuth/OIDC login, encrypted server credential storage, and scoped agent access are future work. Do not expose this server through a public reverse proxy. Use one service per data directory.
+The service listens on loopback only. A hub is reached on the tailnet through `tailscale serve`, and a local service not at all from elsewhere. Multi-user ownership/ACLs, encrypted server credential storage, and scoped agent access are future work. Do not expose either through a public reverse proxy, or Tailscale Funnel. Use one service per data directory.
 
 The credential handling follows the separation established in `jmarrero/atomic-setup`: credentials belong to the coordinator/service, not disposable jobs. No existing bot token, model credential or host login has been imported. No agents are executed by this prototype.
 
@@ -197,9 +201,10 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 python3 tests/smoke.py target/debug/workboard
+python3 tests/hub_smoke.py target/debug/workboard
 ```
 
-The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone, the external export and the Mine view, scheduled sync with backoff, a stopped connection and freshness, sync state across a restart, and secret file permissions. The scheduler's own tests use a clock they control and fake connectors, so they never wait. GitHub and Fedora Forge are tested against recorded answers in `cargo test`, since CI has no token for either. An ignored test reads a public repository on the real Fedora Forge without a token, and prints counts: `cargo test -- --ignored --nocapture live_fedora_forge`, or `workboard-tests --ignored --nocapture live_fedora_forge` with the test binary CI uploads next to `workboard`.
+The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone, the external export and the Mine view, scheduled sync with backoff, a stopped connection and freshness, sync state across a restart, and secret file permissions. The hub smoke test runs a hub and a companion as two processes on loopback, the companion pulling through a logging proxy, and checks that the companion shows both parts, that it sent the hub only GETs of the export, that nothing of its internal work reaches any hub answer or the hub's data directory, and that the hub's work goes stale on the companion once the hub stops. The scheduler's own tests use a clock they control and fake connectors, so they never wait. GitHub and Fedora Forge are tested against recorded answers in `cargo test`, since CI has no token for either. An ignored test reads a public repository on the real Fedora Forge without a token, and prints counts: `cargo test -- --ignored --nocapture live_fedora_forge`, or `workboard-tests --ignored --nocapture live_fedora_forge` with the test binary CI uploads next to `workboard`.
 
 See `docs/architecture.md` for the next implementation boundaries.
 

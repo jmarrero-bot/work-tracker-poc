@@ -11,6 +11,7 @@ flowchart TD
   API --> GitHub["GitHub connector (read only)"]
   API --> Fedora["Fedora Forge connector (Forgejo, read only)"]
   API --> Plugins["Connector plugins"]
+  API --> Hub["A hub's external export (companion, read only)"]
 ```
 
 Both clients operate on the same API. The CLI is not a second database writer. The service enforces URL validation, credentials, grouping and synchronization. UI summaries are computed from the same source data returned to the CLI.
@@ -20,6 +21,8 @@ Both clients operate on the same API. The CLI is not a second database writer. T
 - **Connection:** UUID, provider, canonical base URL, stable remote account ID, display name, zone, its own sync interval if it has one, and for GitHub, optionally another user it watches. The secret is separate from this record, and so is its sync state.
 - **Sync state:** per connection, in its own table: when its last successful sync started, its last attempt, when its next scheduled sync is due, its failures in a row, the kind and message of its last error, and until when its source asked to wait. It is written in the same transaction as what a sync found.
 - **Item:** local ID namespaced by connection, remote identity, source URL, unmodified source status, derived outcome and the reason for it, attention category, the reasons it waits on the account (if it does), source update time, optional effort, and its connection's zone. When shown, a synced item also carries its connection's last success and whether that is stale. Manually added items have no connection and are internal.
+- **Settings:** the data directory's mode, local or hub, recorded the first time a service opens it.
+- **Hub link:** on a companion, the hub's address, its companion token (a credential file like a connection's), the state of its pulls (in the sync state table) and the last export they read.
 - **Watch list:** what a GitHub connection found by watching another user, as of its last sync. It is stored apart from items, in its own table, so it never reaches the inbox, efforts or the external export.
 - **Effort:** a manually named outcome with notes and linked items spanning services and hosts. It persists independently of agent sessions. Progress counts only delivered linked items. Closed-without-delivery and unknown items need attention, and abandoned items leave the total.
 - **Outcome:** open, delivered, closed without delivery, abandoned or unknown, derived per connector in `src/outcome.rs`: GitLab from the merge request or issue state, Jira from the status category and the resolution, GitHub from whether a pull request merged and an issue's `state_reason` (completed is delivered; not planned, duplicate or no reason is closed without delivery), Fedora Forge (Forgejo) from whether a pull request merged, with every closed issue closed without delivery since Forgejo records no reason, manual items from an explicit choice. Abandoned is a person's decision; for synced items it is kept in its own column, so syncs preserve it like effort links.
@@ -34,7 +37,7 @@ Every connection has a zone, internal or external, chosen when it is connected (
 
 An item's zone is always read from its connection, never from what its own row says, and an item without a known connection is internal.
 
-`zone::external_only` is the boundary, and every path that could take work off this machine goes through it. Today that is `GET /api/export/external` and `workboard export --external`, which the hub will read. It passes only what is positively external: external connections; items that are external and belong to one of them; and efforts with at least one such item, with their progress over those items only. Each exported object is built field by field from an allowlist, and a test pins the keys of each, so a field added later stays behind until someone decides otherwise. Internal items and connections and their URLs never pass. Of an external connection's sync state, only its freshness (`last_success`, and `stale`, which is set unless the connection is known to be fresh) and its error's kind (auth, transient, inaccessible, invalid) do, since a message can name local paths. An effort's title and note are free text that may describe internal work: the note never passes, and the title only when a person shared it (`workboard share-title`, the API's `share_title`, or the switch on the effort); otherwise the hub sees "Effort" and the start of its random ID. An effort that mixes zones is exported with its external items alone, with no count or placeholder for the internal ones.
+`zone::external_only` is the boundary, and every path that could take work off this machine goes through it. That is `GET /api/export/external` and `workboard export --external`; a hub serves it to its companions. A companion's own export is built from its own work alone, never from what it pulled from its hub. It passes only what is positively external: external connections; items that are external and belong to one of them; and efforts with at least one such item, with their progress over those items only. Each exported object is built field by field from an allowlist, and a test pins the keys of each, so a field added later stays behind until someone decides otherwise. Internal items and connections and their URLs never pass. Of an external connection's sync state, only its freshness (`last_success`, and `stale`, which is set unless the connection is known to be fresh) and its error's kind (auth, transient, inaccessible, invalid) do, since a message can name local paths. An effort's title and note are free text that may describe internal work: the note never passes, and the title only when a person shared it (`workboard share-title`, the API's `share_title`, or the switch on the effort); otherwise the hub sees "Effort" and the start of its random ID. An effort that mixes zones is exported with its external items alone, with no count or placeholder for the internal ones.
 
 ## Connectors
 
@@ -74,13 +77,25 @@ Listings page with `limit` and `page` up to Forgejo's `x-total-count`, at most 1
 - **One sync per connection:** a connection never syncs alongside itself. A sync asked for while one runs (`workboard sync`, `POST /api/sync`, the page) joins it and gets its result, marked `coalesced`. A per-connection lock also keeps a change of what it watches, a new credential and a disconnect from overlapping its sync, and a sync whose connection was disconnected meanwhile saves nothing.
 - **Backoff:** after a failure the next sync is due a minute later, doubling after each further failure, up to an hour. A source's rate-limit hold (GitHub's and Forgejo's clients say until when, in the error) makes it due no sooner than the hold's end. A rejected credential (`auth`) makes it due never: scheduled syncs stop, and the connection shows that it needs the person, until `workboard verify` (`POST /api/connections/:id/verify`) checks the credential again or replaces it with one for the same account. An explicit sync still runs.
 - **Checkpoints:** a sync loads the previous items and state, fetches and checks everything, and only then saves the items, what watching found, and the new state, in one SQLite transaction (`Db::save_sync`). A failure saves only the new state. A sync cut short by a crash or a stop saves nothing, so the previous data and state stay, and since its state still says it is due, it runs again after a restart: nothing is skipped. Every sync fetches the complete lists, so there is no cursor that could move past unsaved data. If the state itself can't be saved, the scheduler waits the first backoff before trying that connection again.
-- **Freshness:** a connection is stale when it never synced, or its last success is more than three intervals old. Items carry their connection's last success and stale flag, and a Mine row the oldest of its connections'. A watch list keeps the time of the sync that found it, saved with it, and goes stale on that, since a failed watch keeps its list while the account's own syncs succeed. Anything whose freshness wasn't worked out counts as stale. The page works staleness out again as time passes from each connection's last success and interval, and marks everything synced stale, with a notice, while it can't reach the service.
+- **Freshness:** a connection is stale when it never synced, or its last success is more than three intervals old. Items carry their connection's last success and stale flag, and a Mine row the oldest of its connections', with each account on it carrying its own connection's, so the page ages each by its own interval. A watch list keeps the time of the sync that found it, saved with it, and goes stale on that, since a failed watch keeps its list while the account's own syncs succeed. Anything whose freshness wasn't worked out counts as stale. The page works staleness out again as time passes from each connection's last success and interval, and marks everything synced stale, with a notice, while it can't reach the service.
+
+- **The hub:** a companion's pulls from its hub are scheduled like a connection's syncs, on the service's interval, with the same backoff and the same stop after a refused token, and `workboard sync` pulls too. A pull saves what it read and its state in one transaction; a failed one keeps the last export. The hub's work is stale as soon as a pull fails.
 
 The scheduler's tests run it with a clock they move by hand and fake connectors, so they check the schedule, the jitter's bounds, backoff, rate-limit holds, the stop after a rejected credential, that a connection never syncs alongside itself, joining a running sync, a sync cut short before it saved, and freshness, without waiting.
 
+## Hub mode
+
+`serve --hub` runs a hub, which keeps external work only; [hub.md](hub.md) covers its setup, its trust model and what crosses between it and its companion. In code:
+
+- **Mode:** `Db::open_as` records the data directory's mode the first time it is opened (`settings`, schema version 6), and refuses to open it as the other. A directory from before modes were recorded becomes a hub only while empty. A hub checks its database holds nothing but external work before it starts.
+- **Writes:** the SQL connection is private to `Db`, and each write method states what it writes as a `Write`, which `Db::admit` checks first. On a hub it passes only what is shown to be external: an external connection, what a sync of a stored external connection found if every item and watch list belongs to it and says external, efforts and links over its external items, and writes that add no work (sync state, decisions, disconnecting). Manual links, the demo and pulling from a hub are refused. The match lists every kind, so a new one has to be decided.
+- **Access:** `Access` in `src/server.rs` checks every API request: its Host must be the loopback address or one of the hub's `--allowed-host` names, it needs the application token (bearer, or the cookie paired with it) or, only for `GET /api/export/external`, a hub's companion token, and a browser's change needs the origin of the name it came by, HTTPS under a hub's names. A session cookie set under those names is Secure.
+- **Pulls:** `src/hub.rs` is the companion's only way to its hub. Its one send passes a `GET` of the export at the hub's exact address without a body, and refuses everything else before it is sent, counting it; redirects are never followed, and clippy refuses the other ways to send. What comes back is checked whole (`hub::checked`) before anything is kept.
+- **Board:** `hub::merge` adds the hub's connections, items and efforts to what the companion shows, under IDs starting with `hub:`, marked `from_hub`, read-only, and leaves out a hub connection to an account the companion connects too, with its items. It is only for showing: the snapshot and Mine view use it, the export never does.
+
 ## Mine
 
-The Mine view (`workboard mine`, `GET /api/mine`, the Mine tab) lists the open items that wait on the account behind each connection, with why: review requested (directly or through a team), assigned, mentioned, or the account's own change needs action (changes requested or failing checks), plus GitLab's other to-do items. Each row shows the source's status, the outcome, the zone and the link, and each account it waits on with that account's own reasons. An item found by several listings or connections shows once, and counts as internal if any of its connections is. It is a local view; the external export carries each external item's reasons, so the hub can build its own from external work.
+The Mine view (`workboard mine`, `GET /api/mine`, the Mine tab) lists the open items that wait on the account behind each connection, with why: review requested (directly or through a team), assigned, mentioned, or the account's own change needs action (changes requested or failing checks), plus GitLab's other to-do items. Each row shows the source's status, the outcome, the zone and the link, and each account it waits on with that account's own reasons. An item found by several listings or connections shows once, and counts as internal if any of its connections is. It is a local view; the external export carries each external item's reasons, so a companion shows the hub's external work in its own Mine view, as the hub's account's.
 
 Where the reasons come from:
 
@@ -93,13 +108,18 @@ A GitHub connection can also watch another login's activity (`connect --watch-us
 
 ## API
 
-All `/api` routes require the local application's bearer credential or paired browser session. JSON responses never serialize provider credentials.
+All `/api` routes require the local application's bearer credential or paired browser session; a hub's companion token reads `GET /api/export/external` and nothing else. JSON responses never serialize provider credentials.
 
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /api/session` | Establish a browser cookie using the pairing credential |
-| `GET /api/snapshot` | Connections, items, efforts |
-| `GET /api/export/external` | The external zone only, for the hub |
+| `GET /api/snapshot` | Connections, items, efforts, the service's mode, and on a companion the hub's work and how its pulls go |
+| `GET /api/export/external` | The external zone only, as a hub serves it to its companions |
+| `GET /api/hub` | The hub a companion pulls from, and how its pulls go |
+| `PUT /api/hub` | Pull from a hub (`url`, `token`), once a first pull works |
+| `DELETE /api/hub` | Stop pulling from the hub, and forget its token and work |
+| `GET /api/companion-token` | A hub's companion token |
+| `POST /api/companion-token` | Replace a hub's companion token |
 | `GET /api/mine` | What waits on each connection's account, and apart from it what watching found |
 | `POST /api/connections` | Verify an account and store its credential |
 | `PATCH /api/connections/:id` | Watch another GitHub user from a connection, or stop; change how often it syncs (`sync_interval` in seconds, null for the default) |
@@ -107,13 +127,13 @@ All `/api` routes require the local application's bearer credential or paired br
 | `DELETE /api/connections/:id` | Disconnect and remove cached source items/credential |
 | `POST /api/sync` | Sync all connected sources now, or one (`connection`), joining syncs already running |
 | `POST /api/efforts` | Create an effort and attach selected items transactionally |
-| `PATCH /api/efforts/:id` | Share an effort's title with the hub, or stop |
+| `PATCH /api/efforts/:id` | Let an effort's title leave in the external export, or stop |
 | `POST /api/links` | Assign or unassign an item to an effort |
 | `POST /api/items` | Add a manual source link |
 | `PATCH /api/items/:id` | Update a manual link’s status, attention and outcome |
 | `POST /api/items/:id/abandon` | Mark a synced item abandoned, or undo it |
 
-Live source requests only read: GET, and for GitHub, GraphQL queries checked as described above. No comments, merges, ticket updates or agent dispatches occur.
+Live source requests only read: GET, and for GitHub, GraphQL queries checked as described above. No comments, merges, ticket updates or agent dispatches occur. A companion's requests to its hub are GETs of its export, and nothing else.
 
 ## Next slices
 
