@@ -20,7 +20,10 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         port = sock.getsockname()[1]
     base = f'http://127.0.0.1:{port}'
     command = [binary, '--data-dir', str(root), '--port', str(port)]
-    process = subprocess.Popen(command + ['serve', '--demo'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    runtime = Path(folder) / 'runtime'
+    runtime.mkdir(mode=0o700)
+    process = subprocess.Popen(command + ['serve', '--demo'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               env=dict(os.environ, XDG_RUNTIME_DIR=str(runtime)))
     def call(path, method='GET', body=None, token=None, cookie=None, origin=None, host=None):
         headers = {}
         if token is not None: headers['Authorization'] = 'Bearer ' + token
@@ -48,6 +51,11 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
             time.sleep(.05)
         else: raise RuntimeError('Service did not start')
         token = (root / 'service.token').read_text().strip()
+        # A copy in the session's runtime directory, by port, for sandboxed
+        # clients, as private as the data directory's.
+        published = runtime / 'workboard' / f'service-{port}.token'
+        assert published.read_text().strip() == token
+        assert published.stat().st_mode & 0o777 == 0o600 and published.parent.stat().st_mode & 0o777 == 0o700
         assert call('/api/snapshot')[0] == 401
         assert call('/api/snapshot', token='invalid')[0] == 401
         assert call('/api/snapshot', token=token, host='attacker.example')[0] == 403
