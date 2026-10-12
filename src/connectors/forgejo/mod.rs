@@ -756,11 +756,13 @@ mod tests {
             .map(|found| Tracked {
                 remote_id: found[0].remote_id.clone(),
                 key: found[0].key.clone(),
+                bot: None,
             })
             .collect();
         tracked.push(Tracked {
             remote_id: "0".into(),
             key: format!("{REPOSITORY}#999999"),
+            bot: None,
         });
         let refreshed = forgejo.tracked(&target, &tracked).await.unwrap();
         let (missing, found) = refreshed.split_last().unwrap();
