@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, future::Future, pin::Pin};
 use url::Url;
 
+/// The plugin protocol version this build speaks. A change that an existing
+/// plugin or host could misread takes a new version; adding an optional
+/// field does not.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Longest credential accepted, in bytes.
 const MAX_CREDENTIAL: usize = 16384;
 /// Longest text field accepted from a connector, in bytes.

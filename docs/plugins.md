@@ -18,6 +18,28 @@ Why not just one of them:
 
 A separate process is isolation from crashes, hangs and the service's memory, not a sandbox: a plugin runs as the same user as the service and can read what that user can. Install only plugins you trust.
 
+## Installing a plugin
+
+A plugin serves one of the sources that has no built-in connector yet (`github`, `fedora` or `errata`). Put an executable named after the source in the `plugins` directory of the data directory, such as `~/.local/share/workboard/plugins/errata`, then connect as with any other source:
+
+```sh
+workboard connect errata --url https://errata.example.com/ --label Errata --token-env WORKBOARD_ERRATA_TOKEN
+```
+
+Jira and GitLab always use their built-in connectors. `tests/plugins/fake-forge` is a small plugin in Python, used by the tests.
+
+Workboard runs a plugin:
+
+- only if it is a regular file, not a symbolic link, owned by the user running Workboard and not writable by its group or others, in a directory that is the same. On Linux, Workboard opens the file, checks it through the open descriptor, and runs that descriptor (`/proc/self/fd/N`), so the file checked is the file run even if the path is replaced in between. Elsewhere it runs the path again, and only those ownership checks keep it from being swapped;
+- by its absolute path, never one looked up in `PATH`;
+- with no arguments, `/` as its working directory, and an environment of only `PATH=/usr/local/bin:/usr/bin:/bin` and `LANG=C.UTF-8`. There is no `HOME`, no proxy variables such as `HTTPS_PROXY`, and no CA bundle variables such as `SSL_CERT_FILE`, so a plugin that needs them has to find them on its own for now;
+- with its standard error discarded, since a plugin's own diagnostics could echo the credential;
+- in a process group of its own, which is killed when the call ends, so a helper it started can't outlive the call;
+- for at most 120 seconds per call. After that it is killed and the call fails as `transient`;
+- reading at most 16 MiB of its answer.
+
+An error message from a plugin is shown after the plugin's name, with any copy of the credential replaced by `[redacted]`, without control characters, and cut at 500 characters. An item that contains the credential is refused.
+
 ## Zones are not the plugin's business
 
 Each connection has a zone, internal or external, chosen by the person connecting it (see `docs/architecture.md`). A plugin never sees or reports a zone; the items it returns take their connection's zone. A plugin can't move an item out of the internal zone.

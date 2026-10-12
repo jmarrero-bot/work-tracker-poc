@@ -32,9 +32,10 @@ enum Command {
         #[arg(long)]
         demo: bool,
     },
-    /// Connect Jira Data Center or a GitLab instance using a personal token.
+    /// Connect Jira Data Center, a GitLab instance, or a source served by a
+    /// connector plugin, using a personal token.
     Connect {
-        #[arg(value_parser=["jira","gitlab-internal","gitlab-public"])]
+        #[arg(value_parser=["jira","gitlab-internal","gitlab-public","github","fedora","errata"])]
         provider: String,
         #[arg(long)]
         url: String,
