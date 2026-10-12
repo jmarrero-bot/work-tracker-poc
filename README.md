@@ -8,8 +8,8 @@ This is an initial single-user prototype for Linux and macOS, not a hosted team 
 
 This is jmarrero's Workboard prototype from his handoff, now built and tested by CI on every pull request. The goal is one board for internal and external work: internal items stay on the work laptop, and a hub serves the external part. The hub is meant to be reached over the tailnet, which depends on Tailscale being allowed on the work laptop; that is still to be confirmed, and the hub's design is revisited if it isn't. The app also becomes the control plane for jmarrero-bot, while the work itself stays public on the forge. The epic is [jmarrero-forge/tracker#8](https://github.com/jmarrero-forge/tracker/issues/8); the slices below are its sub-issues, in order.
 
-1. [Outcome semantics: closed is not delivered](https://github.com/jmarrero-bot/work-tracker-poc/issues/2)
-2. [Connector plugins with per-connection zones](https://github.com/jmarrero-bot/work-tracker-poc/issues/3)
+1. [Outcome semantics: closed is not delivered](https://github.com/jmarrero-bot/work-tracker-poc/issues/2) (done)
+2. [Connector plugins with per-connection zones](https://github.com/jmarrero-bot/work-tracker-poc/issues/3) (done)
 3. [GitHub connector (read-only) and the Mine view](https://github.com/jmarrero-bot/work-tracker-poc/issues/4)
 4. [Fedora Forge discovery and a Forgejo connector](https://github.com/jmarrero-bot/work-tracker-poc/issues/5), and an [Errata investigation](https://github.com/jmarrero-bot/work-tracker-poc/issues/6)
 5. [Scheduled sync with checkpoints and backoff](https://github.com/jmarrero-bot/work-tracker-poc/issues/7)
@@ -25,6 +25,8 @@ This is jmarrero's Workboard prototype from his handoff, now built and tested by
 Approvals and DCO sign-offs stay on GitHub, tied to jmarrero's review of the exact head of a pull request. The app may show them and link to them, but never records one itself. Commands to the bot are posted as jmarrero with his own GitHub App user token, so the bot checks them the same way it checks his comments today.
 
 Live Jira, internal GitLab and Errata tests aren't possible from the bot, so those connectors are tested with recorded fixtures until jmarrero connects them from his laptop.
+
+Every connection is in the internal or the external zone, internal unless marked external when connecting. Internal work stays on the machine that syncs it. Work leaves only through the external export (`workboard export --external`), which the hub will read and which carries external work alone. Connectors are plugins behind one interface: Jira and GitLab are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
 
 ## Run
 
@@ -74,6 +76,8 @@ workboard connections
 workboard sync
 ```
 
+Each connection is **internal** unless you add `--external` (or turn on **External** in the connection dialog). Internal work, such as Jira, internal GitLab or Errata, is never exported; external work, such as gitlab.com, is what `workboard export --external` prints for the hub. A connection's zone can't be changed later; disconnect and connect again instead. Manual source links are internal. An effort with external work is exported with that work only, and its note never; its title only once you share it (`workboard share-title EFFORT_ID`, or the switch on the effort), since a title can name internal work. Until then the hub sees a neutral label.
+
 `--token-stdin` also accepts a token from standard input. Tokens are never accepted as CLI argument values. Each connection is verified against the instance's current-user endpoint before saving it. Multiple accounts on an instance are separate connections; no username-based cross-service identity matching is performed.
 
 Current live connectors:
@@ -82,10 +86,11 @@ Current live connectors:
 | --- | --- | --- |
 | Jira Data Center | Personal access token, Bearer authentication | Active issues assigned to the authenticated user |
 | Internal/public GitLab | Personal API token via `PRIVATE-TOKEN`; `read_api` is recommended | Open MRs authored by you, assigned to you, or requesting your review |
+| GitHub, Fedora Forge or Errata through a connector plugin | Whatever the plugin uses; the token reaches it on standard input only | Whatever the plugin lists ([docs/plugins.md](docs/plugins.md)) |
 
 Internal instances require network/VPN reachability from the machine running the service. TLS certificate verification stays enabled; there is no insecure TLS switch. Jira Cloud OAuth/API-token authentication is not implemented.
 
-GitHub, Fedora Forge and Errata are supported as **manual source links**, not live connectors. Errata's live adapter requires the actual instance, API contract and supported authentication method. GitHub CLI, GitLab CLI and OS keychain credential reuse are planned; this version uses explicitly supplied tokens.
+Without a plugin, GitHub, Fedora Forge and Errata are supported as **manual source links**, not live connectors. A plugin is an executable named after the source in the data directory's `plugins` directory, such as `~/.local/share/workboard/plugins/errata`; it has to be owned by you and not writable by others, and runs with a minimal environment and a time limit, but as your user, so install only plugins you trust. Errata's live adapter requires the actual instance, API contract and supported authentication method. GitHub CLI, GitLab CLI and OS keychain credential reuse are planned; this version uses explicitly supplied tokens.
 
 ## Efforts and source links
 
@@ -115,6 +120,8 @@ workboard link ITEM_ID                         # ungroup
 workboard add --provider errata --key ADVISORY --title 'Ship advisory' --url https://errata.example.com/advisory/123 --status 'Needs validation' --action next
 workboard update ITEM_ID --status Released --outcome delivered
 workboard abandon ITEM_ID                      # synced, closed without delivery or unknown; --undo reverts
+workboard share-title EFFORT_ID                # let the hub show this effort's title; --undo stops it
+workboard export --external                    # the external zone only, as JSON
 workboard disconnect CONNECTION_ID
 ```
 
@@ -150,7 +157,7 @@ cargo test
 python3 tests/smoke.py target/debug/workboard
 ```
 
-The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation and secret file permissions.
+The smoke test creates and removes its own temporary data directory. It checks unauthorized access, browser pairing, cross-origin mutations, CLI access, outcomes and effort progress, persistent grouping, source-link validation, a plugin connection in each zone and the external export, and secret file permissions.
 
 See `docs/architecture.md` for the next implementation boundaries.
 
