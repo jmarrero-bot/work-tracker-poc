@@ -1,23 +1,23 @@
 # The hub's GitHub App
 
-A hub signs people in with GitHub, through a GitHub App that jmarrero creates under his own account. A GitHub App, not a classic OAuth App, because its user tokens can only reach the repositories it is installed on, with the permissions it was given, and they expire.
+A hub signs people in with GitHub, through a GitHub App that whoever runs the hub creates under their own account. A GitHub App, not a classic OAuth App, because its user tokens can only reach the repositories it is installed on, with the permissions it was given, and they expire.
 
 - **In a browser**, the hub uses GitHub's web flow: "Sign in with GitHub" sends the browser to GitHub, and GitHub sends it back to the hub's callback URL with a code, which the hub exchanges for a user token.
 - **On the companion**, `workboard hub login` uses GitHub's device flow: it shows a code to enter on github.com, and waits.
 
 Either way, who signed in is the numeric GitHub user ID that `GET /user` answers with the new token. Only the IDs on the hub's allowlist get in. A login is never compared, since logins can be renamed and then registered by someone else.
 
-Nothing here could be tested live yet: the App doesn't exist until jmarrero creates it. The flows are tested against a fake GitHub (see "Testing" below).
+Nothing here could be tested live yet: this repository's own hub has no App yet. The flows are tested against a fake GitHub (see "Testing" below).
 
 ## Create the App
 
-On github.com, open **Settings → Developer settings → GitHub Apps → New GitHub App** (<https://github.com/settings/apps/new>), signed in as jmarrero, and set:
+On github.com, open **Settings → Developer settings → GitHub Apps → New GitHub App** (<https://github.com/settings/apps/new>), signed in as the account that runs the hub, and set:
 
 | Setting | Value |
 | --- | --- |
-| GitHub App name | Any free name, such as `workboard-jmarrero`. It is shown on GitHub's authorization page. |
-| Homepage URL | `https://github.com/jmarrero-bot/work-tracker-poc` |
-| Callback URL | `https://HUB-NAME/auth/github/callback`, HUB-NAME being the hub's tailnet name, the one given to `--allowed-host`, such as `https://bot.tail1234.ts.net/auth/github/callback`. Only the browser follows it, so GitHub doesn't need to reach the tailnet. |
+| GitHub App name | Any free name, such as `workboard-YOUR-LOGIN`. It is shown on GitHub's authorization page. |
+| Homepage URL | Where your Workboard's code is, such as this repository, `https://github.com/jmarrero-bot/work-tracker-poc` |
+| Callback URL | `https://HUB-NAME/auth/github/callback`, HUB-NAME being the hub's tailnet name, the one given to `--allowed-host`, such as `https://hub.example.ts.net/auth/github/callback`. Only the browser follows it, so GitHub doesn't need to reach the tailnet. |
 | Expire user authorization tokens | On (the default). User tokens then last 8 hours, with a refresh token. |
 | Request user authorization (OAuth) during installation | On. Installing the App then signs the installer in too. |
 | Enable Device Flow | On. The companion's `workboard hub login` needs it. |
@@ -32,38 +32,38 @@ Then, on the App's **General** page:
 - **Generate a new client secret**, and copy it once; GitHub won't show it again;
 - leave the private keys alone: the hub never acts as the App itself, only as the signed-in user.
 
-Find jmarrero's numeric user ID, which the hub allows:
+Find the numeric user ID of each person the hub allows:
 
 ```sh
-gh api users/jmarrero --jq .id
+gh api users/YOUR-LOGIN --jq .id
 ```
 
 ### Permissions
 
 **Signing in needs none.** `GET /user` answers with the account of any user token, whatever the App may do, so the App is created with no repository, organization or account permissions.
 
-**Later, for commands posted as jmarrero ([#13](https://github.com/jmarrero-bot/work-tracker-poc/issues/13)), a separate step:** the hub will post each command as an issue or comment in jmarrero-bot/work-tracker-poc with his user token. Then the App gets:
+**Later, for commands posted as the signed-in user ([#13](https://github.com/jmarrero-bot/work-tracker-poc/issues/13)), a separate step:** the hub will post each command as an issue or comment in one control repository, CONTROL-OWNER/CONTROL-REPO, with that user's token. Then the App gets:
 
 - Repository permissions: **Issues: Read and write**, and Metadata: Read-only, which GitHub adds with any repository permission;
-- installed on **only** jmarrero-bot/work-tracker-poc ("Only select repositories").
+- installed on **only** that repository ("Only select repositories").
 
-A user token can do only what both the user and the App's installation may, so his token then reaches that one repository's issues, and nothing else. That repository belongs to the jmarrero-bot account, so the installation has to be made there, which an App installable "Only on this account" (jmarrero's) can't be; #13 settles how.
+A user token can do only what both the user and the App's installation may, so their token then reaches that one repository's issues, and nothing else. An App installable "Only on this account" can only be installed on the account that owns it, so the control repository has to be that account's, or the App installable elsewhere; #13 settles how.
 
 ## Configure the hub
 
 Keep the client secret in the hub's data directory, in a file only its owner can read. It is read from standard input or an environment variable, never from the command line:
 
 ```sh
-export WB='workboard --data-dir ~/.local/share/workboard-hub'
+export WB="workboard --data-dir $HOME/.local/share/workboard-hub"
 $WB github-app set-secret --token-stdin    # paste the client secret
 ```
 
 That writes `github-app.secret` (mode `0600`) in the data directory; the hub refuses to start if others can read it. Then start the hub with the App's client ID, its callback URL, and the allowed user IDs:
 
 ```sh
-$WB serve --hub --allowed-host bot.tail1234.ts.net \
+$WB serve --hub --allowed-host hub.example.ts.net \
   --github-app-client-id Iv23li... \
-  --github-app-callback https://bot.tail1234.ts.net/auth/github/callback \
+  --github-app-callback https://hub.example.ts.net/auth/github/callback \
   --github-user 1234567
 ```
 
@@ -76,7 +76,7 @@ With "Request user authorization (OAuth) during installation" on, GitHub sends t
 On the companion, sign in to the hub instead of pasting its companion token:
 
 ```sh
-workboard hub login https://bot.tail1234.ts.net/
+workboard hub login https://hub.example.ts.net/
 ```
 
 It prints a code and `https://github.com/login/device`; enter the code there, as an allowed user, and the companion starts pulling.
@@ -127,4 +127,4 @@ Each must be form-encoded, without an `Authorization` or `Cookie` header, every 
 
 `cargo test` runs both flows against a fake GitHub on loopback, which serves the token and device-code endpoints and `GET /user`, and checks the PKCE verifier against the challenge it was given: the web flow through the hub's routes, from the login start to a session that reads and changes the board, and the device flow from the companion's `hub login` to its pulls. They also cover the allowlist by numeric ID, a renamed login and a login taken by another ID, sessions expiring unused and after a week, renewal, logout, the cookies' flags, refused CSRF and `state` mismatches, rate limits, and the OAuth client refusing any other URL, method, field or header. `tests/hub_smoke.py` checks a hub with an App configured, as far as it goes without GitHub: the refused pairing, the CLI token on loopback only, the sign-in start's checks and its cookie, and a callback without its browser.
 
-A live test waits for jmarrero to create the App and configure the hub.
+A live test waits for this repository's own hub to get its App.

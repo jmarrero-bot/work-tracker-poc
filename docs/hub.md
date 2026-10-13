@@ -2,8 +2,8 @@
 
 One board, in two parts:
 
-- **The hub** runs on the bot machine and is reachable from anywhere on jmarrero's tailnet. It holds and syncs external sources only (GitHub, Fedora Forge, and the bot's board, fork pull requests and heartbeat; see [connectors/bot.md](connectors/bot.md)), and serves the web UI.
-- **The companion** runs on the GNOME work laptop, a toolbox with VPN access. It holds the internal sources (Jira, internal GitLab, Errata), pulls the hub's external work, and shows one board with both.
+- **The hub** runs on a machine that is always on, such as the one a harness bot runs on, and is reachable from anywhere on your tailnet. It holds and syncs external sources only (GitHub, Fedora Forge, and the bot's board, fork pull requests and heartbeat; see [connectors/bot.md](connectors/bot.md)), and serves the web UI.
+- **The companion** runs on your work laptop, in GNOME or a toolbox there, with VPN access. It holds the internal sources (Jira, internal GitLab, Errata), pulls the hub's external work, and shows one board with both.
 
 Internal work never leaves the companion. Away from the laptop, the hub shows external work only, with no placeholder for anything internal: it never had any.
 
@@ -11,15 +11,15 @@ Both are the same `workboard` binary. The hub is `serve --hub`; the companion is
 
 ## Set up the hub
 
-On the bot machine, in a data directory of its own:
+On the hub's machine, in a data directory of its own:
 
 ```sh
-workboard --data-dir ~/.local/share/workboard-hub serve --hub --allowed-host bot.tail1234.ts.net \
-  --github-app-client-id Iv23li... --github-app-callback https://bot.tail1234.ts.net/auth/github/callback \
+workboard --data-dir ~/.local/share/workboard-hub serve --hub --allowed-host hub.example.ts.net \
+  --github-app-client-id Iv23li... --github-app-callback https://hub.example.ts.net/auth/github/callback \
   --github-user 1234567
 ```
 
-People sign in to the hub with GitHub, through a GitHub App that jmarrero creates; [github-app.md](github-app.md) lists its settings and how to give the hub its client secret. Until the App exists, start the hub with `--pairing` instead of the three `--github-...` options, to pair browsers through the URL it prints, as a local service does. Pairing is off once the App is configured.
+People sign in to the hub with GitHub, through a GitHub App that you create; [github-app.md](github-app.md) lists its settings and how to give the hub its client secret. Until the App exists, start the hub with `--pairing` instead of the three `--github-...` options, to pair browsers through the URL it prints, as a local service does. Pairing is off once the App is configured.
 
 The hub listens on `127.0.0.1:8421` only, like any Workboard service. [`tailscale serve`](https://tailscale.com/kb/1312/serve) is the intended front: it serves the hub over HTTPS on the tailnet, with a certificate for the machine's tailnet name, and proxies to the loopback port.
 
@@ -34,14 +34,14 @@ Give that name to `--allowed-host`, once per name the hub is reached by. The hub
 Then connect its sources, always as external, with the same CLI on the same data directory:
 
 ```sh
-export WB='workboard --data-dir ~/.local/share/workboard-hub'
-$WB connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user YOUR_LOGIN
+export WB="workboard --data-dir $HOME/.local/share/workboard-hub"
+$WB connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user YOUR-LOGIN
 $WB connect fedora --url https://forge.fedoraproject.org/ --external --token-env FEDORA_TOKEN
 $WB connect bot --url https://github.com/ --external --token-env GH_TOKEN --board orgs/ORG/NUMBER \
   --tracker OWNER/REPO --heartbeat ISSUE --bot-login BOT_LOGIN --forge-org FORGE_ORG
 ```
 
-Open `https://bot.tail1234.ts.net/` and sign in with GitHub (or, with `--pairing`, open the pairing URL the hub printed for its tailnet name). Without the App, print the companion token for the laptop:
+Open `https://hub.example.ts.net/` and sign in with GitHub (or, with `--pairing`, open the pairing URL the hub printed for its tailnet name). Without the App, print the companion token for the laptop:
 
 ```sh
 $WB companion-token
@@ -51,7 +51,7 @@ Upgrade the companions before the hub. A companion checks the hub's export whole
 
 ## Run the hub from its image
 
-CI publishes the hub's image, `ghcr.io/jmarrero-bot/work-tracker-poc`, for each `v*` tag ([release.md](release.md)). On jmarrero's bot machine it runs from the quadlet in jmarrero/atomic-setup, `bot/workboard-hub/`, which pins the image by digest and holds only the wiring: the volume, the secrets and the port. The hub's code and its image stay here, and moving the pin is an atomic-setup pull request that jmarrero merges.
+CI publishes the hub's image, `ghcr.io/jmarrero-bot/work-tracker-poc`, for each `v*` tag ([release.md](release.md)). Run it from a quadlet, or any container runner, that pins the image by digest and holds only the wiring: the volume, the secrets and the port. The hub's code and its image stay here, and moving the pin is a change you review in your own deployment.
 
 The image runs `workboard serve --hub` as an unprivileged user, from a distroless base with no shell. Its data directory is the volume at `/var/lib/workboard`, which the CLI finds without `--data-dir` (the image sets `XDG_DATA_HOME`). Its health check is an authenticated `workboard connections`, which reads the service's token from that directory.
 
@@ -60,14 +60,14 @@ The hub still listens on `127.0.0.1:8421` only, inside the container. Publish th
 ```sh
 podman run -d --name workboard-hub --volume workboard-hub:/var/lib/workboard \
   --network pasta:--host-lo-to-ns-lo --publish 127.0.0.1:8421:8421 --cap-drop all --security-opt no-new-privileges --read-only \
-  --secret jmarrero-bot-gh-token,type=env,target=GH_TOKEN \
+  --secret workboard-gh-token,type=env,target=GH_TOKEN \
   ghcr.io/jmarrero-bot/work-tracker-poc@sha256:DIGEST \
-  serve --hub --allowed-host bot.tail1234.ts.net \
-  --github-app-client-id Iv23li... --github-app-callback https://bot.tail1234.ts.net/auth/github/callback \
+  serve --hub --allowed-host hub.example.ts.net \
+  --github-app-client-id Iv23li... --github-app-callback https://hub.example.ts.net/auth/github/callback \
   --github-user 1234567
 ```
 
-The GitHub App's options go on the `serve` line, so in atomic-setup's `bot/workboard-hub/` they belong in the drop-in's `Exec=`, after `--allowed-host`: `--github-app-client-id`, `--github-app-callback` and one `--github-user` per allowed numeric user ID ([github-app.md](github-app.md)). The client secret is read from the data directory when the hub starts, not from a flag, and a hub started with the App's options but no secret stops at once and says so in its log. So put it in the volume from the podman secret first, with a one-off container of the same image, and start (or restart) the hub after:
+The GitHub App's options go on the `serve` line, so in a quadlet they belong in its `Exec=`, after `--allowed-host`: `--github-app-client-id`, `--github-app-callback` and one `--github-user` per allowed numeric user ID ([github-app.md](github-app.md)). The client secret is read from the data directory when the hub starts, not from a flag, and a hub started with the App's options but no secret stops at once and says so in its log. So put it in the volume from the podman secret first, with a one-off container of the same image, and start (or restart) the hub after:
 
 ```sh
 podman run --rm --volume workboard-hub:/var/lib/workboard \
@@ -80,7 +80,7 @@ Do the same after rotating the client secret on GitHub, then restart the hub. Th
 The CLI runs in the container, where a secret given as an environment variable is what `--token-env` reads:
 
 ```sh
-podman exec workboard-hub workboard connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user jmarrero
+podman exec workboard-hub workboard connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user YOUR-LOGIN
 podman exec workboard-hub workboard companion-token
 ```
 
@@ -89,10 +89,10 @@ A connection keeps its own copy of the token in the data directory. After replac
 Check through `tailscale serve` that the hub takes its tailnet name:
 
 ```sh
-curl -sS https://bot.tail1234.ts.net/api/snapshot
+curl -sS https://hub.example.ts.net/api/snapshot
 ```
 
-`` {"error":"Sign in first: with GitHub on a hub that has its App, otherwise with the pairing URL `workboard serve` printed"} `` means the name got through and the hub wants a sign-in; `{"error":"Unexpected host"}` means it isn't one of the `--allowed-host` names. `curl -sS https://bot.tail1234.ts.net/auth/status` says whether the App is configured (`"github_app":true`) and pairing is off.
+`` {"error":"Sign in first: with GitHub on a hub that has its App, otherwise with the pairing URL `workboard serve` printed"} `` means the name got through and the hub wants a sign-in; `{"error":"Unexpected host"}` means it isn't one of the `--allowed-host` names. `curl -sS https://hub.example.ts.net/auth/status` says whether the App is configured (`"github_app":true`) and pairing is off.
 
 ## Set up the companion
 
@@ -101,11 +101,11 @@ On the laptop, run Workboard as usual, connect the internal sources, and sign in
 ```sh
 workboard serve
 workboard connect jira --url https://jira.example.com/ --label 'Work Jira' --token-env WORKBOARD_JIRA_TOKEN
-workboard hub login https://bot.tail1234.ts.net/   # enter the code it shows on github.com
+workboard hub login https://hub.example.ts.net/   # enter the code it shows on github.com
 workboard hub show
 ```
 
-`hub login` runs GitHub's device flow through the hub, which gives the laptop a credential that only reads its export, bound to the GitHub user who entered the code. Without the App, give it the companion token instead: `workboard hub set https://bot.tail1234.ts.net/ --token-stdin`. Either pulls once to check the address and the credential before it keeps them; the credential is stored like a connection's, in a private file. From then on the companion pulls on its own schedule (every 5 minutes, or `serve --sync-interval`), with the same backoff as a connection, and `workboard sync` pulls too. `workboard hub unset` stops it and forgets the token and the hub's work.
+`hub login` runs GitHub's device flow through the hub, which gives the laptop a credential that only reads its export, bound to the GitHub user who entered the code. Without the App, give it the companion token instead: `workboard hub set https://hub.example.ts.net/ --token-stdin`. Either pulls once to check the address and the credential before it keeps them; the credential is stored like a connection's, in a private file. From then on the companion pulls on its own schedule (every 5 minutes, or `serve --sync-interval`), with the same backoff as a connection, and `workboard sync` pulls too. `workboard hub unset` stops it and forgets the token and the hub's work.
 
 A hub address is HTTPS, or plain HTTP only to the laptop's own loopback, so the token never crosses a network in the clear. A hub never pulls from another hub.
 

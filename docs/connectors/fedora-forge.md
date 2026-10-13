@@ -6,7 +6,7 @@ All checks below were anonymous HTTPS GETs from the bot machine on 2026-10-12, b
 
 ## Findings
 
-Fedora runs two forges that matter for jmarrero's work:
+Fedora runs two forges that matter for a Fedora packager's and contributor's work:
 
 | Instance | Software | What lives there |
 | --- | --- | --- |
@@ -19,12 +19,12 @@ Fedora runs two forges that matter for jmarrero's work:
 
 **pagure.io** still serves its web pages, but its API answers HTTP 404 (`/api/0/version` and `/api/0/-/version`); repositories such as `fedora-iot/ostree` now live on Fedora Forge, as `iot/ostree` with `original_url` pointing back at pagure.io. It isn't a target.
 
-### Where jmarrero's Fedora work is
+### Where a packager's Fedora work is
 
-- On src.fedoraproject.org, `GET /api/0/user/jmarrero/requests/filed?status=all` lists 18 pull requests he opened, the latest on 2026-09-10 (`rpms/rpm-ostree`, "Release 2026.3"). `/api/0/user/jmarrero/requests/actionable` lists pull requests on packages he can act on, such as Packit's `rpms/bootc` updates (10 on its first page, the latest on 2026-10-06). He is an admin of `rpms/bootc`.
-- On forge.fedoraproject.org, he has an account (`GET /api/v1/users/jmarrero`: ID 475, created 2025-08-13), one repository (`jmarrero/ci-sandbox`, a fork of `atomic/ci-sandbox`) and two public activity entries, both on 2026-07-31. Public lists don't show assignments or review requests, which need his token.
+- On src.fedoraproject.org, `GET /api/0/user/LOGIN/requests/filed?status=all` lists the pull requests a user opened, and `/api/0/user/LOGIN/requests/actionable` those on packages they can act on, such as Packit's `rpms/bootc` updates.
+- On forge.fedoraproject.org, `GET /api/v1/users/LOGIN` answers with the account and its numeric ID, and its repositories and public activity are listed too. Public lists don't show assignments or review requests, which need the user's token.
 
-So his bootc, ostree and rpm-ostree packaging work is on src.fedoraproject.org today, and moves to Forgejo with dist-git. The Atomic SIG's projects, where the bootc base images and docs live, are on Forgejo already.
+So bootc, ostree and rpm-ostree packaging work is on src.fedoraproject.org today, and moves to Forgejo with dist-git. The Atomic SIG's projects, where the bootc base images and docs live, are on Forgejo already.
 
 ## Evidence
 
@@ -67,7 +67,7 @@ Pagure, src.fedoraproject.org:
 
 Fedora Forge gets a built-in, read-only Forgejo connector, for the `fedora` source and forge.fedoraproject.org (see [architecture.md](../architecture.md)). The migration doesn't say yet whether dist-git moves onto forge.fedoraproject.org or onto a Forgejo instance of its own: in the first case the same connection sees it, in the second it is another connection with the same connector.
 
-There is no Pagure connector. src.fedoraproject.org can still be tracked with manual source links. Whether to write one before dist-git moves is a question for jmarrero; until then, this design note records what one would take:
+There is no Pagure connector. src.fedoraproject.org can still be tracked with manual source links. Whether to write one before dist-git moves is still open; until then, this design note records what one would take:
 
 - **API:** Pagure's `/api/0/` ([reference](https://src.fedoraproject.org/api/0/)). The token's account comes from `POST /api/0/-/whoami`, a POST that a read-only client would have to allow as its one exception, and it is a username: Pagure's API has no numeric user ID. `/api/0/user/USER/requests/filed` and `/requests/actionable` list pull requests a user opened and those on projects they can act on; `/api/0/rpms/NAME/pull-request/ID` fetches one.
 - **Authentication:** a Pagure API token, `Authorization: token TOKEN`, with ACLs chosen when it is made. Public pull requests are readable without one.

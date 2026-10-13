@@ -1,6 +1,6 @@
 # The bot connector
 
-The `bot` connector shows what a harness bot, such as jmarrero-bot, works on: the items on its Projects board, its open pull requests in its forge organization, and the agent runs its coordinator's heartbeat lists. It only reads, through the same read-only GitHub client as the GitHub connector (see "GitHub is read only" in [../architecture.md](../architecture.md)): REST `GET`s, and GraphQL queries for the board, which only GraphQL serves. Later slices make the work tracker the bot's control plane; this one shows its work.
+The `bot` connector shows what a harness bot works on: the items on its Projects board, its open pull requests in its forge organization, and the agent runs its coordinator's heartbeat lists. It only reads, through the same read-only GitHub client as the GitHub connector (see "GitHub is read only" in [../architecture.md](../architecture.md)): REST `GET`s, and GraphQL queries for the board, which only GraphQL serves. Later slices make the work tracker the bot's control plane; this one shows its work.
 
 ## Connect it
 

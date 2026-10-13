@@ -6,7 +6,7 @@ This is an initial single-user prototype for Linux and macOS, not a hosted team 
 
 ## Status and roadmap
 
-This is jmarrero's Workboard prototype from his handoff, now built and tested by CI on every pull request. The goal is one board for internal and external work: internal items stay on the work laptop, and a hub serves the external part. The hub is meant to be reached over the tailnet, which depends on Tailscale being allowed on the work laptop; that is still to be confirmed, and the hub's design is revisited if it isn't. The app also becomes the control plane for jmarrero-bot, while the work itself stays public on the forge. The epic is [jmarrero-forge/tracker#8](https://github.com/jmarrero-forge/tracker/issues/8); the slices below are its sub-issues, in order.
+This started as a Workboard prototype from a handoff, and is now built and tested by CI on every pull request. The goal is one board for internal and external work: internal items stay on the work laptop, and a hub serves the external part. The hub is meant to be reached over the tailnet, which depends on Tailscale being allowed on the work laptop; that is still to be confirmed, and the hub's design is revisited if it isn't. The app also becomes the control plane for a harness bot, while the work itself stays public on the forge. The epic is [jmarrero-forge/tracker#8](https://github.com/jmarrero-forge/tracker/issues/8); the slices below are its sub-issues, in order.
 
 1. [Outcome semantics: closed is not delivered](https://github.com/jmarrero-bot/work-tracker-poc/issues/2) (done)
 2. [Connector plugins with per-connection zones](https://github.com/jmarrero-bot/work-tracker-poc/issues/3) (done)
@@ -15,18 +15,18 @@ This is jmarrero's Workboard prototype from his handoff, now built and tested by
 5. [Scheduled sync with checkpoints and backoff](https://github.com/jmarrero-bot/work-tracker-poc/issues/7) (done)
 6. [Hub mode: an external-only store on the tailnet](https://github.com/jmarrero-bot/work-tracker-poc/issues/8) (done)
 7. [Bot plugin: the Workstream board, fork PRs and the heartbeat](https://github.com/jmarrero-bot/work-tracker-poc/issues/9) (done)
-8. [GitHub App login: web on the hub, device flow on the companion](https://github.com/jmarrero-bot/work-tracker-poc/issues/12) (code done; a live sign-in waits for jmarrero to create the App, see [docs/github-app.md](docs/github-app.md))
-9. [Commands posted as jmarrero to a control repository](https://github.com/jmarrero-bot/work-tracker-poc/issues/13)
+8. [GitHub App login: web on the hub, device flow on the companion](https://github.com/jmarrero-bot/work-tracker-poc/issues/12) (code done; a live sign-in waits for this repository's hub to get its App, see [docs/github-app.md](docs/github-app.md))
+9. [Commands posted as the signed-in user to a control repository](https://github.com/jmarrero-bot/work-tracker-poc/issues/13)
 10. [A bot-board backend over the app's API](https://github.com/jmarrero-bot/work-tracker-poc/issues/14)
 11. [Conversations in the app](https://github.com/jmarrero-bot/work-tracker-poc/issues/15)
 12. [GNOME companion app in GTK4 and libadwaita](https://github.com/jmarrero-bot/work-tracker-poc/issues/10)
 13. [Publish the hub image and deploy it from atomic-setup](https://github.com/jmarrero-bot/work-tracker-poc/issues/11)
 
-Approvals and DCO sign-offs stay on GitHub, tied to jmarrero's review of the exact head of a pull request. The app may show them and link to them, but never records one itself. Commands to the bot are posted as jmarrero with his own GitHub App user token, so the bot checks them the same way it checks his comments today.
+Approvals and DCO sign-offs stay on GitHub, tied to the operator's review of the exact head of a pull request. The app may show them and link to them, but never records one itself. Commands to the bot are posted as the operator with their own GitHub App user token, so the bot checks them the same way it checks their comments today.
 
-Live Jira, internal GitLab and Errata tests aren't possible from the bot, so those connectors are tested with recorded fixtures until jmarrero connects them from his laptop.
+Live Jira, internal GitLab and Errata tests aren't possible from the bot, so those connectors are tested with recorded fixtures until someone connects them from a work laptop.
 
-GitHub is connected read-only, enforced in code: one client is the only way to GitHub, and it refuses any request that could change it (see [docs/architecture.md](docs/architecture.md)). Live tests use the bot's token, so a GitHub connection can also watch jmarrero's activity, as far as that token can see it; that is listed as his, never as the bot's. The Mine view lists what waits on each connected account, and why.
+GitHub is connected read-only, enforced in code: one client is the only way to GitHub, and it refuses any request that could change it (see [docs/architecture.md](docs/architecture.md)). Live tests use the bot's token, so a GitHub connection can also watch another user's activity, as far as that token can see it; that is listed as theirs, never as the bot's. The Mine view lists what waits on each connected account, and why.
 
 Fedora Forge is forge.fedoraproject.org, which runs Forgejo, and it is connected read-only the same way. Fedora's package dist-git, where the bootc, ostree and rpm-ostree packaging pull requests are, is still Pagure on src.fedoraproject.org while Fedora moves it to Forgejo, and takes manual source links until then. [docs/connectors/fedora-forge.md](docs/connectors/fedora-forge.md) has the evidence. The bot has no Fedora account, so the Fedora Forge connector was tested live only without a token, on a public repository.
 
@@ -36,7 +36,7 @@ Every connection is in the internal or the external zone, internal unless marked
 
 The hub (`serve --hub`) keeps external work only, refusing anything else at every write, and is meant to be reached over the tailnet through `tailscale serve`. The companion on the work laptop keeps the internal work, pulls the hub's export, read-only, and shows both on one board; it never sends the hub anything but that read. See [docs/hub.md](docs/hub.md).
 
-A harness bot's work, such as jmarrero-bot's, is connected read-only too, through the same GitHub client: the items on its board, its open fork pull requests, and its coordinator's heartbeat, whose workers show as agent runs. Items waiting on you show in Mine as "bot waiting on you". The bot's board, tracker, heartbeat issue, login and forge organization are given when connecting, with no defaults, so anyone can connect their own bot; its heartbeat and pull requests are matched by the numeric ID of its account, not its login. "Ask the bot" is only a link: a prefilled issue in the bot's tracker, or a comment on an item, that you open in your browser and submit yourself. See [docs/connectors/bot.md](docs/connectors/bot.md).
+A harness bot's work is connected read-only too, through the same GitHub client: the items on its board, its open fork pull requests, and its coordinator's heartbeat, whose workers show as agent runs. Items waiting on you show in Mine as "bot waiting on you". The bot's board, tracker, heartbeat issue, login and forge organization are given when connecting, with no defaults, so anyone can connect their own bot; its heartbeat and pull requests are matched by the numeric ID of its account, not its login. "Ask the bot" is only a link: a prefilled issue in the bot's tracker, or a comment on an item, that you open in your browser and submit yourself. See [docs/connectors/bot.md](docs/connectors/bot.md).
 
 Connectors are plugins behind one interface: Jira, GitLab, GitHub, Fedora Forge and the bot are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
 
@@ -131,8 +131,8 @@ Without a plugin, Errata is supported as **manual source links**, not a live con
 A GitHub connection can also watch another user: their review requests, assignments and open pull requests and issues that the connection's token can see, private repositories included. It is a setting of its own, for a token that isn't theirs, such as the bot's:
 
 ```sh
-workboard connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user jmarrero
-workboard watch CONNECTION_ID jmarrero        # or --stop
+workboard connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user THEIR-LOGIN
+workboard watch CONNECTION_ID THEIR-LOGIN     # or --stop
 ```
 
 What watching finds is listed under **Watching**, with the watched login, and is never shown as yours, in the inbox, or exported. If a watch fails, for example because the login was renamed, the account's own work still syncs; Watching keeps the last list and shows the error, and `workboard sync` exits unsuccessfully.
@@ -201,7 +201,7 @@ Each service start rotates the local application credential, which the CLI uses.
 
 The service listens on loopback only. A hub is reached on the tailnet through `tailscale serve`, and a local service not at all from elsewhere. Multi-user ownership/ACLs, encrypted server credential storage, and scoped agent access are future work. Signing in to a hub is the one time Workboard sends GitHub anything but reads: the OAuth code exchange and device flow, through a client that can send nothing else. Do not expose either through a public reverse proxy, or Tailscale Funnel; requests that came through Funnel are refused. Use one service per data directory.
 
-The credential handling follows the separation established in `jmarrero/atomic-setup`: credentials belong to the coordinator/service, not disposable jobs. No existing bot token, model credential or host login has been imported. No agents are executed by this prototype.
+Credentials belong to the service, not to disposable jobs. No existing bot token, model credential or host login has been imported. No agents are executed by this prototype.
 
 ## Synchronization behavior
 
@@ -252,4 +252,4 @@ See `docs/architecture.md` for the next implementation boundaries.
 
 ## Container image
 
-`Containerfile` builds the hub's release image: the web UI and a release build of the service, on a distroless base, as an unprivileged user, with its data directory as a volume. CI builds it and runs `tests/image_smoke.py` against it on every pull request, and publishes it to `ghcr.io/jmarrero-bot/work-tracker-poc` on `v*` tags. [docs/hub.md](docs/hub.md#run-the-hub-from-its-image) says how to run it, and [docs/release.md](docs/release.md) how to release it and move atomic-setup's pin.
+`Containerfile` builds the hub's release image: the web UI and a release build of the service, on a distroless base, as an unprivileged user, with its data directory as a volume. CI builds it and runs `tests/image_smoke.py` against it on every pull request, and publishes it to `ghcr.io/jmarrero-bot/work-tracker-poc` on `v*` tags. [docs/hub.md](docs/hub.md#run-the-hub-from-its-image) says how to run it, and [docs/release.md](docs/release.md) how to release it and move a deployment's pin.
