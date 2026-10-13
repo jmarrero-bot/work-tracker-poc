@@ -114,6 +114,20 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert call('/api/snapshot', cookie=cookie)[0] == 200
         assert call('/api/efforts', 'POST', {'title':'CSRF'}, cookie=cookie, origin='https://attacker.example')[0] == 403
         assert call('/api/efforts', 'POST', {'title':'Missing origin'}, cookie=cookie)[0] == 403
+        # Rotating the application token ends it, every paired browser and
+        # every pairing URL not yet used, without a restart.
+        [unused] = subprocess.check_output(command + ['pair'], text=True).split()
+        rotated = subprocess.run(command + ['app-token', '--rotate'], capture_output=True, text=True)
+        assert rotated.returncode == 0 and 'pair again' in rotated.stdout, rotated
+        fresh = (root / 'service.token').read_text().strip()
+        assert fresh != token and fresh not in rotated.stdout
+        assert call('/api/snapshot', token=token)[0] == 401 and call('/api/snapshot', token=fresh)[0] == 200
+        assert call('/api/snapshot', cookie=cookie)[0] == 401
+        assert pair(unused.removeprefix(f'{base}/#pair='))[0] == 400
+        assert call('/api/app-token', 'POST', {}, token=token)[0] == 401
+        token = fresh
+        [again] = subprocess.check_output(command + ['pair'], text=True).split()
+        cookie = pair(again.removeprefix(f'{base}/#pair='))[1]['Set-Cookie'].split(';')[0]
         status, _, body = call('/api/snapshot', token=token)
         snapshot = json.loads(body)
         assert len(snapshot['items']) == 7 and len(snapshot['efforts']) == 1

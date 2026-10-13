@@ -87,6 +87,9 @@ const EXPORT_PATH: &str = "/api/export/external";
 const SESSION_COOKIE: &str = "workboard_session";
 /// Where a hub keeps its companion token, in the data directory.
 const COMPANION_TOKEN: &str = "companion.token";
+/// Where the service keeps its application token, in the data directory,
+/// for HTTP clients on loopback.
+const APP_TOKEN: &str = "service.token";
 
 /// Who may use the service, from where: the CLI with the application
 /// token, a browser signed in with the hub's GitHub App or, without one, a
@@ -98,8 +101,9 @@ struct Access {
     /// Other names a hub is reached by, such as its tailnet name, always
     /// through an HTTPS front such as `tailscale serve`.
     hosts: Vec<String>,
-    /// The application credential: full access. Rotated on each start.
-    token: String,
+    /// The application credential: full access. Rotated on each start, and
+    /// by `workboard app-token --rotate`.
+    token: RwLock<AppToken>,
     /// A hub's companion token, which reads the external export and
     /// nothing else. Kept across restarts.
     companion: Option<RwLock<String>>,
@@ -172,12 +176,29 @@ fn make_way(map: &mut HashMap<String, SystemTime>, max: usize) {
     }
 }
 
+/// The application token, and how many rotations it has been through
+/// since the service started.
+struct AppToken {
+    value: String,
+    generation: u64,
+}
+
+impl AppToken {
+    fn new(value: String) -> Self {
+        Self {
+            value,
+            generation: 0,
+        }
+    }
+}
+
 /// Who a request came from, once [`Access`] let it in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Caller {
     /// The CLI or the GNOME app: through the private socket, or with the
-    /// application token.
-    Local,
+    /// application token of the generation given, which stops counting
+    /// once it is rotated, even for a request let in before.
+    Local { token: Option<u64> },
     /// A browser, paired or signed in with the hub's GitHub App.
     Browser,
     /// A companion, reading the hub's export.
@@ -258,7 +279,12 @@ impl Access {
         // where it came from: the token is the CLI's, never a page's.
         let direct = self.direct(headers);
         let from_browser = BROWSER_HEADERS.iter().any(|h| headers.contains_key(*h));
-        let app_token = |v: &str| matches_token(v, &self.token) && direct && !from_browser;
+        // A copy, so the lock isn't held while a session is looked up.
+        let (token, generation) = {
+            let token = self.token.read().unwrap_or_else(PoisonError::into_inner);
+            (token.value.clone(), token.generation)
+        };
+        let app_token = |v: &str| matches_token(v, &token) && direct && !from_browser;
         let bearer_ok = bearer.is_some_and(app_token);
         // The page's own refreshes don't count as a use of a session.
         let renew = !headers.contains_key(BACKGROUND_HEADER);
@@ -294,7 +320,9 @@ impl Access {
             return Err(Denied::CrossOrigin);
         }
         Ok(if bearer_ok {
-            Caller::Local
+            Caller::Local {
+                token: Some(generation),
+            }
         } else {
             Caller::Browser
         })
@@ -302,9 +330,17 @@ impl Access {
     fn pairing(&self) -> MutexGuard<'_, Pairing> {
         self.paired.lock().unwrap_or_else(PoisonError::into_inner)
     }
-    /// A new one-time pairing code, if browsers may pair here.
-    fn pairing_code(&self) -> Option<String> {
+    /// A new one-time pairing code, if browsers may pair here, for a caller
+    /// let in with the application token of generation `token`, if it came
+    /// that way: none once it was rotated, as a rotation unpairs every
+    /// browser that holder could have paired. Under the token's lock, so a
+    /// rotation can't come between.
+    fn pairing_code(&self, token: Option<u64>) -> Option<String> {
         if !self.pairing {
+            return None;
+        }
+        let current = self.token.read().unwrap_or_else(PoisonError::into_inner);
+        if token.is_some_and(|generation| generation != current.generation) {
             return None;
         }
         let now = self.clock.now();
@@ -357,6 +393,13 @@ impl Access {
             },
         );
         Ok(session)
+    }
+    /// Unpair every browser, and spend every pairing code.
+    fn unpair_all(&self) {
+        let mut pairing = self.pairing();
+        pairing.codes.clear();
+        pairing.spent.clear();
+        pairing.sessions.clear();
     }
     /// Whether the cookie value `session` is a live paired browser's. A
     /// use by the person (`renew`) renews it; the page's own refreshes
@@ -428,7 +471,7 @@ async fn protect(State(app): State<App>, req: Request, next: Next) -> Response {
     let mut req = req;
     // The CLI and the GNOME app, as this user: full access, no token.
     if req.extensions().get::<ViaSocket>().is_some() {
-        req.extensions_mut().insert(Caller::Local);
+        req.extensions_mut().insert(Caller::Local { token: None });
         return next.run(req).await;
     }
     // Routes nested under /api see their path without it.
@@ -454,8 +497,8 @@ fn no_pairing(access: &Access) -> Response {
 }
 /// The URLs that pair a browser with the service, each under one of its
 /// names, with a new one-time code, which the first of them used spends.
-fn pairing_urls(access: &Access) -> Option<Vec<String>> {
-    let code = access.pairing_code()?;
+fn pairing_urls(access: &Access, token: Option<u64>) -> Option<Vec<String>> {
+    let code = access.pairing_code(token)?;
     let mut urls = vec![format!("http://{}/#pair={code}", access.local)];
     urls.extend(
         access
@@ -468,13 +511,16 @@ fn pairing_urls(access: &Access) -> Option<Vec<String>> {
 /// A new one-time pairing URL, for the CLI or the GNOME app alone: never
 /// for a browser, which could pair others with it.
 async fn new_pairing(State(app): State<App>, Extension(caller): Extension<Caller>) -> Response {
-    if caller != Caller::Local {
+    if !matches!(caller, Caller::Local { .. }) {
         return refused(
             StatusCode::FORBIDDEN,
             "Only the CLI and the GNOME app ask for a pairing URL",
         );
     }
-    match pairing_urls(&app.access) {
+    let Caller::Local { token } = caller else {
+        unreachable!("only the CLI and the GNOME app get here")
+    };
+    match pairing_urls(&app.access, token) {
         Some(urls) => {
             Json(json!({ "urls": urls, "expires_in": PAIRING_TTL.as_secs() })).into_response()
         }
@@ -557,6 +603,43 @@ async fn rotate_companion_token(State(app): State<App>) -> ApiResult<Value> {
         None => login::forget_companions(&root)?,
     }
     Ok(Json(json!({ "token": token })))
+}
+/// Replace the application token, for the CLI or the GNOME app alone: the
+/// old one stops working at once, and so does every pairing, since a
+/// paired browser was let in by whoever held it. HTTP clients read the new
+/// one from the data directory after a refusal; the CLI and the GNOME app
+/// use the socket, and need none.
+async fn rotate_app_token(
+    State(app): State<App>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    if !matches!(caller, Caller::Local { .. }) {
+        return refused(
+            StatusCode::FORBIDDEN,
+            "Only the CLI and the GNOME app rotate the application token",
+        );
+    }
+    let token = new_token();
+    let root = app.db.lock().unwrap().root.clone();
+    // One rotation at a time, the file, the token in use and the pairings
+    // together, so the file always holds the token in use.
+    let mut current = app
+        .access
+        .token
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    // The file first: if writing it fails, the old token stays in use.
+    if let Err(e) = replace_secret(&root.join(APP_TOKEN), &token) {
+        return refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Cannot keep the new application token, so the old one stays: {e:#}"),
+        );
+    }
+    current.value = token;
+    current.generation += 1;
+    app.access.unpair_all();
+    drop(current);
+    Json(json!({ "ok": true })).into_response()
 }
 fn only_hubs() -> anyhow::Error {
     anyhow::anyhow!("Only a hub has a companion token")
@@ -1541,7 +1624,7 @@ fn welcome(access: &Access, mode: Mode) -> String {
     if !access.pairing {
         return format!("{running}. No browser can sign in: set up its GitHub App (docs/github-app.md), or start it with --pairing. {cli}");
     }
-    let urls = pairing_urls(access).unwrap_or_default();
+    let urls = pairing_urls(access, None).unwrap_or_default();
     format!(
         "{running}. Pair your browser with this URL, which works once, in the next {} minutes:\n{}\nFor another, run `workboard pair`. {cli}",
         PAIRING_TTL.as_secs() / 60,
@@ -1583,6 +1666,7 @@ fn router(app: App) -> Router {
         .route("/bot", get(bot_view))
         .route("/export/external", get(export_external))
         .route("/pairing", post(new_pairing))
+        .route("/app-token", post(rotate_app_token))
         .route("/hub", get(get_hub).put(set_hub).delete(unset_hub))
         .route("/hub/login", post(hub_login))
         .route("/hub/login/poll", post(hub_login_poll))
@@ -1733,7 +1817,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         db.seed()?
     }
     let token = new_token();
-    let path = root.join("service.token");
+    let path = root.join(APP_TOKEN);
     if path.exists() {
         std::fs::remove_file(&path)?
     }
@@ -1761,7 +1845,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         access: Arc::new(Access {
             local: local.clone(),
             hosts,
-            token,
+            token: RwLock::new(AppToken::new(token)),
             companion,
             pairing: mode == Mode::Local || pairing,
             paired: Mutex::default(),
@@ -1862,7 +1946,7 @@ mod tests {
         Access {
             local: LOCAL.into(),
             hosts: if hub { vec![TAILNET.into()] } else { vec![] },
-            token: TOKEN.into(),
+            token: RwLock::new(AppToken::new(TOKEN.into())),
             companion: hub.then(|| RwLock::new(COMPANION.into())),
             pairing: true,
             paired: Mutex::new(pairing),
@@ -3167,6 +3251,96 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rotating_the_app_token_ends_it_and_every_pairing() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let app = test_app(root.path(), Mode::Local, LOCAL, None);
+        let tcp = router(app.clone());
+        let socket = router(app.clone()).layer(Extension(ViaSocket));
+        let paired = format!("{SESSION_COOKIE}={PAIRED}");
+        let origin = format!("http://{LOCAL}");
+        let snapshot = |router: Router, headers: Vec<(header::HeaderName, String)>| async move {
+            let headers: Vec<_> = headers
+                .iter()
+                .map(|(n, v)| (n.clone(), v.as_str()))
+                .collect();
+            call(&router, Method::GET, "/api/snapshot", &headers, None)
+                .await
+                .0
+        };
+        let as_bearer = |token: &str| {
+            vec![
+                (HOST, LOCAL.to_string()),
+                (AUTHORIZATION, format!("Bearer {token}")),
+            ]
+        };
+        let as_paired = vec![(HOST, LOCAL.to_string()), (COOKIE, paired.clone())];
+        assert_eq!(
+            snapshot(tcp.clone(), as_bearer(TOKEN)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            snapshot(tcp.clone(), as_paired.clone()).await,
+            StatusCode::OK
+        );
+        let waiting = app.access.pairing_code(None).unwrap();
+        // Let in with the token before the rotation.
+        let before = Some(0);
+        // Not from a browser, paired or not.
+        for headers in [
+            vec![
+                (HOST, LOCAL),
+                (COOKIE, paired.as_str()),
+                (ORIGIN, origin.as_str()),
+            ],
+            vec![(HOST, LOCAL)],
+        ] {
+            let (status, _, _) = call(&tcp, Method::POST, "/api/app-token", &headers, None).await;
+            assert!(
+                matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+                "{status}"
+            );
+        }
+        assert_eq!(
+            snapshot(tcp.clone(), as_bearer(TOKEN)).await,
+            StatusCode::OK
+        );
+        // From the CLI, on the socket or with the token.
+        let mut current = TOKEN.to_string();
+        for through_socket in [true, false] {
+            let bearer = format!("Bearer {current}");
+            let (router, headers) = match through_socket {
+                true => (&socket, vec![(HOST, "workboard")]),
+                false => (&tcp, vec![(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())]),
+            };
+            let (status, _, body) =
+                call(router, Method::POST, "/api/app-token", &headers, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let rotated = std::fs::read_to_string(root.path().join(APP_TOKEN)).unwrap();
+            assert!(rotated != current && !body.contains(&rotated), "{body}");
+            assert_eq!(
+                snapshot(tcp.clone(), as_bearer(&current)).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                snapshot(tcp.clone(), as_bearer(&rotated)).await,
+                StatusCode::OK
+            );
+            current = rotated;
+        }
+        // Every paired browser, and every code not yet used, is unpaired.
+        assert_eq!(
+            snapshot(tcp.clone(), as_paired).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(app.access.pair(&waiting), Err(Unpaired::Unknown));
+        // A request let in with the old token just before the rotation
+        // gets no code after it; one with the new token does.
+        assert!(app.access.pairing_code(before).is_none());
+        assert!(app.access.pairing_code(Some(2)).is_some());
     }
 
     /// The hub credential a companion keeps, from its data directory.

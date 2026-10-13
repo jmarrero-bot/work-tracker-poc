@@ -334,6 +334,14 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
+    /// Replace the service's application token, with which HTTP clients on
+    /// loopback reach it: the old one stops working at once, and every
+    /// paired browser and pairing URL with it. The CLI and the GNOME app
+    /// need none.
+    AppToken {
+        #[arg(long, required = true)]
+        rotate: bool,
+    },
     /// Set up the GitHub App a hub signs people in with.
     GithubApp {
         #[command(subcommand)]
@@ -1020,6 +1028,16 @@ async fn main() -> Result<()> {
             } else {
                 open_in_browser(&i.url)?;
             }
+        }
+        Command::AppToken { rotate: _ } => {
+            let _: serde_json::Value = request(
+                &client,
+                reqwest::Method::POST,
+                "app-token",
+                Some(serde_json::json!({})),
+            )
+            .await?;
+            println!("Rotated the application token: the data directory's service.token has the new one, the old one no longer works, and browsers pair again (`workboard pair`)");
         }
         Command::Pair { open } => {
             let v: serde_json::Value = request(

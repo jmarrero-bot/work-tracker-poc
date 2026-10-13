@@ -131,6 +131,7 @@ All `/api` routes require the service's private socket, which only its own user 
 | `GET /auth/devices` | The companions' sign-ins waiting for approval whose code the signed-in browser's account entered, and how many wait for their code |
 | `POST /auth/devices/approve` | Approve one (`id`), from the hub's page, as the GitHub account that entered its code; once only |
 | `POST /auth/devices/deny` | Deny one (`id`), from the hub's page, as the GitHub account that entered its code |
+| `POST /api/app-token` | Rotate the application token, and unpair every browser; for the CLI and the GNOME app only |
 | `POST /api/pairing` | A one-time pairing URL for each of the service's names, where pairing is on; for the CLI and the GNOME app only |
 | `GET /api/snapshot` | Connections, items, efforts, the service's mode, and on a companion the hub's work and how its pulls go |
 | `GET /api/export/external` | The external zone only, as a hub serves it to its companions |
