@@ -90,10 +90,28 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert call('/api/snapshot')[0] == 401
         assert call('/api/snapshot', token='invalid')[0] == 401
         assert call('/api/snapshot', token=token, host='attacker.example')[0] == 403
-        status, headers, body = call('/api/session', 'POST', token=token)
-        assert status == 200
+        # A browser pairs with a one-time code, which only the CLI gets,
+        # never with the token.
+        [url] = subprocess.check_output(command + ['pair'], text=True).split()
+        code = url.removeprefix(f'{base}/#pair=')
+        assert code != url and token not in url, url
+        def pair(code, origin=base):
+            return call('/auth/pair', 'POST', {'code': code}, origin=origin)
+        assert pair(code, origin='https://attacker.example')[0] == 403
+        status, headers, body = pair(code)
+        assert status == 200, body
         assert 'HttpOnly' in headers['Set-Cookie'] and 'SameSite=Strict' in headers['Set-Cookie']
         cookie = headers['Set-Cookie'].split(';')[0]
+        assert token not in cookie and code not in cookie
+        # Used once: used again, as by someone who read it too, it ends the
+        # session it opened, and says so.
+        status, _, body = pair(code)
+        assert status == 400 and b'already used' in body, body
+        assert call('/api/snapshot', cookie=cookie)[0] == 401
+        [again] = subprocess.check_output(command + ['pair'], text=True).split()
+        cookie = pair(again.removeprefix(f'{base}/#pair='))[1]['Set-Cookie'].split(';')[0]
+        assert call('/api/pairing', 'POST', {}, cookie=cookie, origin=base)[0] == 403, 'not for a browser'
+        assert call('/api/snapshot', cookie='workboard_session=' + token)[0] == 401, 'the token is no cookie'
         assert call('/api/snapshot', cookie=cookie)[0] == 200
         assert call('/api/efforts', 'POST', {'title':'CSRF'}, cookie=cookie, origin='https://attacker.example')[0] == 403
         assert call('/api/efforts', 'POST', {'title':'Missing origin'}, cookie=cookie)[0] == 403

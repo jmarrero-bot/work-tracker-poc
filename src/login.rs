@@ -174,7 +174,7 @@ pub fn save_secret(root: &Path, value: &str) -> Result<()> {
 }
 
 /// The SHA-256 of a secret, as what it is looked up and kept by.
-fn hashed(secret: &str) -> String {
+pub(crate) fn hashed(secret: &str) -> String {
     URL_SAFE_NO_PAD.encode(ring::digest::digest(
         &ring::digest::SHA256,
         secret.as_bytes(),

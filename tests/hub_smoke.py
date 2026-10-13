@@ -192,12 +192,17 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         # Reached by its tailnet name through an HTTPS front: that name is
         # accepted, its session cookie is Secure, and a browser's changes
         # need that name's HTTPS origin.
-        assert hub_call('/api/snapshot', host=TAILNET)[0] == 200
+        # The application token is taken on loopback only, not by that name.
+        assert hub_call('/api/snapshot', host=TAILNET)[0] == 401
         assert hub_call('/api/snapshot', host='other.example.ts.net')[0] == 403
-        status, headers, _ = hub_call('/api/session', 'POST', host=TAILNET)
+        def pair(host, origin):
+            code = hub.cli('pair').stdout.split()[0].split('#pair=')[1]
+            return hub_call('/auth/pair', 'POST', {'code': code}, token=None, host=host, origin=origin)
+        status, headers, _ = pair(TAILNET, f'https://{TAILNET}')
         assert status == 200 and 'Secure' in headers['Set-Cookie'] and 'HttpOnly' in headers['Set-Cookie'], headers
         cookie = headers['Set-Cookie'].split(';')[0]
-        assert 'Secure' not in hub_call('/api/session', 'POST')[1]['Set-Cookie']
+        assert 'Secure' not in pair(None, f'http://127.0.0.1:{hub.port}')[1]['Set-Cookie']
+        assert [u.split('#')[0] for u in hub.cli('pair').stdout.split()] == [f'http://127.0.0.1:{hub.port}/', f'https://{TAILNET}/']
         via = dict(token=None, cookie=cookie, host=TAILNET)
         assert hub_call('/api/efforts', 'POST', {'title': 'Via the tailnet'}, origin=f'https://{TAILNET}', **via)[0] == 200
         assert hub_call('/api/efforts', 'POST', {'title': 'Cross'}, origin=f'http://127.0.0.1:{hub.port}', **via)[0] == 403
@@ -333,7 +338,9 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         refused([binary, '--data-dir', str(companion_root), '--port', str(free_port()), 'serve', '--hub'], "isn't a hub's")
         hub = Service(hub_root, '--hub')
         services.append(hub)
-        assert hub.call('/api/session', 'POST')[0] == 403, 'no pairing without --pairing'
+        unpaired = hub.cli('pair', check=False)
+        assert unpaired.returncode != 0 and 'pairing is off' in unpaired.stderr, 'no pairing without --pairing'
+        assert hub.call('/auth/pair', 'POST', {'code': 'x'}, token=None, origin=f'http://127.0.0.1:{hub.port}')[0] == 403
         assert hub.cli('companion-token').stdout.strip() == companion_token, 'kept across restarts'
         rotated = hub.cli('companion-token', '--rotate').stdout.strip()
         assert rotated != companion_token
@@ -358,7 +365,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         refused(app_command + app_args[:-2], '--github-user')
         app = Service(app_root, *app_args)
         services.append(app)
-        assert app.call('/api/session', 'POST')[0] == 403
+        assert app.call('/api/pairing', 'POST', {})[0] == 403
         assert app.call('/api/snapshot')[0] == 200
         assert app.call('/api/snapshot', host=TAILNET)[0] == 401
         status = json.loads(app.call('/auth/status', token=None, host=TAILNET)[2])

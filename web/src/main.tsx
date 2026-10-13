@@ -1069,17 +1069,24 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const token = new URLSearchParams(location.hash.slice(1)).get("token");
-        if (token) {
-          history.replaceState(null, "", location.pathname);
-          const response = await fetch("/api/session", {
+        const fragment = new URLSearchParams(location.hash.slice(1));
+        const code = fragment.get("pair");
+        // Out of the address bar, and so of the history, at once.
+        if (location.hash) history.replaceState(null, "", location.pathname);
+        if (code) {
+          const response = await fetch("/auth/pair", {
             method: "POST",
-            headers: { Authorization: `Bearer ${token}` },
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code }),
           });
-          if (!response.ok)
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
             throw new Error(
-              "Pairing expired. Reopen the URL printed by the service.",
+              data.error ??
+                "This pairing URL was used or expired; run workboard pair for a new one.",
             );
+          }
         }
         setAuth(await authStatus().catch(() => null));
         await reload();
@@ -1361,8 +1368,11 @@ function App() {
       <div className="pair-screen">
         <div className="brand-symbol">w</div>
         <h1>Pair your browser</h1>
-        <p>Start your local service and open the private URL it prints.</p>
-        <code>workboard serve</code>
+        <p>
+          Open the one-time pairing URL the service printed when it started,
+          or get a new one, which works once, within 10 minutes:
+        </p>
+        <code>workboard pair --open</code>
         <p className="muted">{error}</p>
         <button onClick={() => location.reload()}>Try again</button>
       </div>

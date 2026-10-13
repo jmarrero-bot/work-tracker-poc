@@ -306,6 +306,12 @@ enum Command {
         #[arg(long)]
         external: bool,
     },
+    /// Print a one-time URL that pairs a browser with the service, or open
+    /// it with the system browser. It works once, within 10 minutes.
+    Pair {
+        #[arg(long)]
+        open: bool,
+    },
     /// Print a source URL, or open it with the system browser.
     Open {
         item: String,
@@ -1013,6 +1019,23 @@ async fn main() -> Result<()> {
                 println!("{}", i.url)
             } else {
                 open_in_browser(&i.url)?;
+            }
+        }
+        Command::Pair { open } => {
+            let v: serde_json::Value = request(
+                &client,
+                reqwest::Method::POST,
+                "pairing",
+                Some(serde_json::json!({})),
+            )
+            .await?;
+            let urls: Vec<String> = serde_json::from_value(v["urls"].clone())
+                .context("The service sent no pairing URL")?;
+            let local = urls.first().context("The service sent no pairing URL")?;
+            if open {
+                open_in_browser(local)?;
+            } else {
+                println!("{}", urls.join("\n"));
             }
         }
         Command::Disconnect { connection } => {

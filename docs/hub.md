@@ -41,7 +41,7 @@ $WB connect bot --url https://github.com/ --external --token-env GH_TOKEN --boar
   --tracker OWNER/REPO --heartbeat ISSUE --bot-login BOT_LOGIN --forge-org FORGE_ORG
 ```
 
-Open `https://hub.example.ts.net/` and sign in with GitHub (or, with `--pairing`, open the pairing URL the hub printed for its tailnet name). Without the App, print the companion token for the laptop:
+Open `https://hub.example.ts.net/` and sign in with GitHub (or, with `--pairing`, open a pairing URL under its tailnet name from `podman exec workboard-hub workboard pair`). Without the App, print the companion token for the laptop:
 
 ```sh
 $WB companion-token
@@ -75,7 +75,7 @@ podman run --rm --volume workboard-hub:/var/lib/workboard \
   ghcr.io/jmarrero-bot/work-tracker-poc@sha256:DIGEST github-app set-secret --token-env WORKBOARD_GITHUB_APP_SECRET
 ```
 
-Do the same after rotating the client secret on GitHub, then restart the hub. The hub itself needs no podman secret for the App. Until the App exists, start the hub with `--pairing` instead of the three `--github-...` options; the pairing URL is then in the container's log (`podman logs workboard-hub`). With neither, browsers can't sign in at all, and only the CLI and companions with the companion token get in.
+Do the same after rotating the client secret on GitHub, then restart the hub. The hub itself needs no podman secret for the App. Until the App exists, start the hub with `--pairing` instead of the three `--github-...` options; the container's log has a pairing URL then (`podman logs workboard-hub`), which works once within 10 minutes, and `podman exec workboard-hub workboard pair` prints a new one. With neither, browsers can't sign in at all, and only the CLI and companions with the companion token get in.
 
 The CLI runs in the container, where a secret given as an environment variable is what `--token-env` reads:
 
@@ -92,7 +92,7 @@ Check through `tailscale serve` that the hub takes its tailnet name:
 curl -sS https://hub.example.ts.net/api/snapshot
 ```
 
-`` {"error":"Sign in first: with GitHub on a hub that has its App, otherwise with the pairing URL `workboard serve` printed"} `` means the name got through and the hub wants a sign-in; `{"error":"Unexpected host"}` means it isn't one of the `--allowed-host` names. `curl -sS https://hub.example.ts.net/auth/status` says whether the App is configured (`"github_app":true`) and pairing is off.
+`` {"error":"Sign in first: with GitHub on a hub that has its App, otherwise with a pairing URL from `workboard pair`"} `` means the name got through and the hub wants a sign-in; `{"error":"Unexpected host"}` means it isn't one of the `--allowed-host` names. `curl -sS https://hub.example.ts.net/auth/status` says whether the App is configured (`"github_app":true`) and pairing is off.
 
 ## Set up the companion
 
@@ -129,7 +129,7 @@ If the companion connects an account the hub also connects, the hub's copy of th
 
 **People sign in with GitHub.** With its GitHub App, the hub lets in only the GitHub users on its allowlist, by numeric user ID: a browser through GitHub's web flow, which gives it a session cookie holding a random ID, never a token; a companion through GitHub's device flow, which gives it an export-only credential. [github-app.md](github-app.md) has the details: sessions, their expiry, CSRF and `state` checks, and rate limits. The CLI reaches the hub through its private Unix socket, in the data directory in the container, which only the hub's own user can connect to; the application token, rotated on every start, is taken on loopback only.
 
-**Pairing is the fallback until the App exists.** With `--pairing` and no App, a browser pairs through the printed URL: an HttpOnly, SameSite=Strict cookie holding the application token, also Secure under the hub's tailnet name. Anyone who can reach the hub on the tailnet and has the pairing URL can use it. Once the App is configured, pairing is off, and the hub won't start with `--pairing`.
+**Pairing is the fallback until the App exists.** With `--pairing` and no App, a browser pairs with a one-time code from `workboard pair`, which works once, within 10 minutes: it gets an HttpOnly, SameSite=Strict cookie holding a random session ID, never the application token, also Secure under the hub's tailnet name. Anyone who can reach the hub on the tailnet and has an unused pairing URL can use it. Once the App is configured, pairing is off, and the hub won't start with `--pairing`.
 
 **Serve nothing else under the hub's tailnet name.** Browsers scope cookies by host name, not by port. Any other service under the same name, another `tailscale serve` port or path included, would be sent the hub's session cookie, and with it the session, or with pairing the application token itself and full access to the hub. Give other services a machine of their own, or a name of their own.
 
