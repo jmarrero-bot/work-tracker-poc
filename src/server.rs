@@ -529,9 +529,13 @@ async fn bot_view(State(app): State<App>) -> ApiResult<Vec<bot::BotView>> {
 }
 /// What may leave this machine: the external zone of this machine's own
 /// work only, never the work a companion pulled from a hub. A hub serves
-/// it to its companions.
+/// it to its companions, with its efforts' titles.
 async fn export_external(State(app): State<App>) -> ApiResult<zone::ExternalSnapshot> {
-    Ok(Json(zone::external_only(&fresh_snapshot(&app)?.0)))
+    let from = match app.mode {
+        Mode::Hub => zone::Exporter::Hub,
+        Mode::Local => zone::Exporter::Local,
+    };
+    Ok(Json(zone::external_only(&fresh_snapshot(&app)?.0, from)))
 }
 /// Fail if `id` names the hub's work, which is read-only on its companion.
 fn local(id: &str) -> Result<()> {
