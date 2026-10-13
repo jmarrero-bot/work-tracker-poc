@@ -125,7 +125,7 @@ jobs:
           chown -R tester .
           runuser -u tester -- dbus-run-session -- sh tests/keyring_session.sh cargo test --locked secret_service -- --ignored --nocapture
 
-  # The GNOME app, on Fedora, as in jmarrero's toolbox: GTK 4 and
+  # The GNOME app, on Fedora, as in a Fedora toolbox: GTK 4 and
   # libadwaita as Fedora ships them, newer than Ubuntu's.
   gnome:
     runs-on: ubuntu-latest

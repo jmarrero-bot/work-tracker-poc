@@ -41,8 +41,9 @@ workboard = str(Path(sys.argv[1]).resolve())
 app = str(Path(sys.argv[2]).resolve())
 shots = Path(sys.argv[3]).resolve()
 plugin = Path(__file__).resolve().parent / 'plugins' / 'demo-forge'
-APP_ID = 'io.github.jmarrero_bot.Workboard'
-APP_PATH = '/' + APP_ID.replace('.', '/')
+# The app's ID, as it was built with (WORKBOARD_APP_ID, see gnome/Makefile).
+APP_ID = os.environ.get('WORKBOARD_APP_ID', 'io.github.jmarrero_bot.Workboard')
+APP_PATH = '/' + APP_ID.replace('.', '/').replace('-', '_')
 TOKEN_ENV = dict(os.environ, WORKBOARD_DEMO_TOKEN='demo-only-token')
 # The window's default size, and the screen's.
 WIDTH, HEIGHT = 1100, 760

@@ -24,7 +24,53 @@ use std::{
 use views::View;
 
 /// The application ID: the D-Bus name, the desktop file's and the icon's.
-pub const APP_ID: &str = "io.github.jmarrero_bot.Workboard";
+/// A build of your own takes its own from `WORKBOARD_APP_ID` at build time,
+/// as `make -C gnome APP_ID=...` and the Flatpak manifest set it (see
+/// docs/run-your-own.md); otherwise it is this repository's.
+pub const APP_ID: &str = match option_env!("WORKBOARD_APP_ID") {
+    Some(id) => id,
+    None => DEFAULT_APP_ID,
+};
+const DEFAULT_APP_ID: &str = "io.github.jmarrero_bot.Workboard";
+/// Where the About dialog sends people: a build's own homepage, from
+/// `WORKBOARD_HOMEPAGE` (`make -C gnome HOMEPAGE=...`), or this repository.
+const HOMEPAGE: &str = match option_env!("WORKBOARD_HOMEPAGE") {
+    Some(url) => url,
+    None => env!("CARGO_PKG_REPOSITORY"),
+};
+const _: () = assert!(
+    valid_app_id(APP_ID),
+    "WORKBOARD_APP_ID isn't an application ID, such as org.example.Workboard"
+);
+
+/// Whether `id` is an application ID GLib and Flatpak take: at most 255
+/// bytes, of at least two elements separated by dots, each of ASCII
+/// letters, digits, `_` and `-`, and not starting with a digit.
+const fn valid_app_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 255 {
+        return false;
+    }
+    let (mut i, mut elements, mut start) = (0, 1, true);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'.' {
+            if start {
+                return false;
+            }
+            elements += 1;
+            start = true;
+        } else if (start && b.is_ascii_digit())
+            || !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return false;
+        } else {
+            start = false;
+        }
+        i += 1;
+    }
+    !start && elements >= 2
+}
 /// How often the app asks the service again, as the web page does.
 const REFRESH_SECS: u32 = 30;
 /// Where, in the app's own state directory, the notified IDs are kept.
@@ -340,10 +386,10 @@ fn add_actions(app: &adw::Application, state: &Rc<State>) {
         let about = adw::AboutDialog::builder()
             .application_name("Workboard")
             .application_icon(APP_ID)
-            .developer_name("jmarrero-bot")
+            .developer_name("The Workboard contributors")
             .version(env!("CARGO_PKG_VERSION"))
             .license_type(gtk::License::MitX11)
-            .website("https://github.com/jmarrero-bot/work-tracker-poc")
+            .website(HOMEPAGE)
             .comments(
                 "What waits on you, from every account, as the local Workboard service has it.",
             )
@@ -513,4 +559,32 @@ fn main() -> glib::ExitCode {
     // The main loop is over: what was announced last is kept before exit.
     state.notified.finish(NOTIFIED_TIMEOUT);
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_ids_as_glib_takes_them() {
+        for (id, valid) in [
+            (DEFAULT_APP_ID, true),
+            ("org.example.Workboard", true),
+            ("org.example_team.Work-board2", true),
+            ("a.b", true),
+            ("Workboard", false),
+            ("", false),
+            (".org.example", false),
+            ("org.example.", false),
+            ("org..example", false),
+            ("org.3example", false),
+            ("org.example/Workboard", false),
+            ("org.exämple.Workboard", false),
+        ] {
+            assert_eq!(valid_app_id(id), valid, "{id}");
+            assert_eq!(gio::Application::id_is_valid(id), valid, "{id}");
+        }
+        let long = format!("org.{}", "a".repeat(252));
+        assert!(!valid_app_id(&long) && !gio::Application::id_is_valid(&long));
+    }
 }
