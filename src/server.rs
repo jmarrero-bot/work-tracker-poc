@@ -1,7 +1,7 @@
 use crate::{
     bot,
     clock::SystemClock,
-    connector::{self, Target},
+    connector::Target,
     connectors,
     db::{self, Db, Mode},
     hub::{self, DevicePoll},
@@ -558,10 +558,9 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
     if let Some(interval) = sync_interval {
         schedule::check_interval(interval)?;
     }
-    let source = app.scheduler.connector(&input.provider, bot.as_ref())?;
     let target = Target::new(&base, &input.token)?;
-    let account = connector::verify(source.as_ref(), &target).await?;
-    let (id, name) = (account.id, account.name);
+    let verified = app.scheduler.verify_new(&input, bot, &target).await?;
+    let (id, name) = (verified.account.id, verified.account.name);
     if watch_user.is_some_and(|login| login.eq_ignore_ascii_case(&name)) {
         bail_api(OWN_ACCOUNT)?
     }
@@ -583,7 +582,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         zone: input.zone,
         watch_user: watch_user.map(str::to_string),
         sync_interval: input.sync_interval,
-        bot,
+        bot: verified.bot,
         sync: SyncState::default(),
         schedule: Schedule::default(),
         from_hub: false,
