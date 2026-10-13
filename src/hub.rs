@@ -130,11 +130,27 @@ pub struct DeviceStart {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DevicePoll {
-    /// Not yet: poll again after `interval` seconds.
-    Pending { interval: u64 },
+    /// Not yet: poll again after `interval` seconds. `approve` once GitHub
+    /// has the code, and the sign-in waits for its person to approve it on
+    /// the hub's page, signed in there with GitHub.
+    Pending {
+        interval: u64,
+        #[serde(default)]
+        approve: bool,
+    },
     /// Signed in: a credential that reads the hub's export, bound to the
     /// GitHub user `login` names.
     Done { token: String, login: String },
+}
+
+impl DevicePoll {
+    /// Not yet: GitHub hasn't got the code.
+    pub fn pending(interval: std::time::Duration) -> Self {
+        Self::Pending {
+            interval: interval.as_secs(),
+            approve: false,
+        }
+    }
 }
 
 /// `text` if it is a code of letters, digits and hyphens a person can type.
@@ -166,8 +182,10 @@ fn checked_start(start: DeviceStart) -> ConnectorResult<DeviceStart> {
 fn checked_poll(poll: DevicePoll) -> ConnectorResult<DevicePoll> {
     let invalid = || ConnectorError::invalid("The hub's answer to the sign-in isn't usable");
     match poll {
-        DevicePoll::Pending { interval } if (1..=MAX_POLL_INTERVAL).contains(&interval) => {
-            Ok(DevicePoll::Pending { interval })
+        DevicePoll::Pending { interval, approve }
+            if (1..=MAX_POLL_INTERVAL).contains(&interval) =>
+        {
+            Ok(DevicePoll::Pending { interval, approve })
         }
         DevicePoll::Pending { .. } => Err(invalid()),
         DevicePoll::Done { token, mut login } => {
@@ -1801,7 +1819,13 @@ pub mod tests {
         assert_eq!(started.user_code, "ABCD-1234");
         let handle = Credential::new(&started.handle).unwrap();
         let pending = client.poll_login(&base, &handle).await.unwrap();
-        assert_eq!(pending, DevicePoll::Pending { interval: 10 });
+        assert_eq!(
+            pending,
+            DevicePoll::Pending {
+                interval: 10,
+                approve: false
+            }
+        );
         let done = client.poll_login(&base, &handle).await.unwrap();
         assert_eq!(
             done,

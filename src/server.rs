@@ -5,7 +5,7 @@ use crate::{
     connectors,
     db::{self, Db, Mode},
     hub::{self, DevicePoll},
-    login::{self, AppConfig, Callback, LoginError, Logins},
+    login::{self, AppConfig, Callback, Identity, LoginError, Logins},
     model::*,
     oauth::Site,
     schedule::{self, Builtin, Policy, Scheduler, Trigger},
@@ -485,11 +485,13 @@ async fn hub_login_poll(State(app): State<App>) -> ApiResult<Value> {
     }
     let polled = hub::HubClient::new()?.poll_login(&url, &handle).await;
     match polled {
-        Ok(DevicePoll::Pending { interval }) => {
+        Ok(DevicePoll::Pending { interval, approve }) => {
             if let Some(waiting) = app.hub_login.lock().unwrap().as_mut() {
                 waiting.interval = interval;
             }
-            Ok(Json(json!({ "status": "pending", "interval": interval })))
+            Ok(Json(
+                json!({ "status": "pending", "interval": interval, "approve": approve }),
+            ))
         }
         Ok(DevicePoll::Done { token, login }) => {
             forget();
@@ -1153,6 +1155,74 @@ async fn device_poll(State(app): State<App>, headers: HeaderMap) -> Response {
         Err(e) => refusal(e),
     }
 }
+/// The GitHub user signed in on the hub's page that sent a request: under
+/// the name people sign in on and, for a change, from that name's page.
+/// Never the application token, a paired browser or a companion: only a
+/// person signed in with the App.
+fn page_user(
+    logins: &Logins,
+    headers: &HeaderMap,
+    change: bool,
+) -> Result<Identity, Box<Response>> {
+    if let Some(response) = off_sign_in_name(logins, headers, change) {
+        return Err(Box::new(response));
+    }
+    let renew = !headers.contains_key(BACKGROUND_HEADER);
+    cookie(headers, login::SESSION_COOKIE)
+        .and_then(|v| logins.session(v, renew))
+        .ok_or_else(|| Box::new(Denied::Unauthorized.response()))
+}
+/// The companions' sign-ins waiting for approval, for a signed-in user.
+async fn device_requests(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some(logins) = app.access.logins.as_ref() else {
+        return no_app();
+    };
+    match page_user(logins, &headers, false) {
+        Ok(user) => Json(logins.device_requests(&user)).into_response(),
+        Err(response) => *response,
+    }
+}
+#[derive(Deserialize)]
+struct DeviceChoice {
+    id: String,
+}
+/// Approve or deny a companion's sign-in, from the hub's page.
+async fn choose_device(
+    app: &App,
+    headers: &HeaderMap,
+    choice: &DeviceChoice,
+    approve: bool,
+) -> Response {
+    let Some(logins) = app.access.logins.as_ref() else {
+        return no_app();
+    };
+    let user = match page_user(logins, headers, true) {
+        Ok(user) => user,
+        Err(response) => return *response,
+    };
+    let chosen = match approve {
+        true => logins.approve_device(&user, &choice.id),
+        false => logins.deny_device(&user, &choice.id),
+    };
+    match chosen {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => refusal(e),
+    }
+}
+async fn approve_device(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(choice): Json<DeviceChoice>,
+) -> Response {
+    choose_device(&app, &headers, &choice, true).await
+}
+async fn deny_device(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(choice): Json<DeviceChoice>,
+) -> Response {
+    choose_device(&app, &headers, &choice, false).await
+}
 async fn assets(req: Request) -> Response {
     let path = req.uri().path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -1300,7 +1370,10 @@ fn router(app: App) -> Router {
         .route("/github/callback", get(login_callback))
         .route("/logout", post(logout))
         .route("/device", post(device_start))
-        .route("/device/poll", post(device_poll));
+        .route("/device/poll", post(device_poll))
+        .route("/devices", get(device_requests))
+        .route("/devices/approve", post(approve_device))
+        .route("/devices/deny", post(deny_device));
     Router::new()
         .nest("/api", api)
         .nest("/auth", auth)
@@ -2154,10 +2227,18 @@ mod tests {
         let Json(pending) = poll().await.ok().unwrap();
         assert_eq!(pending["status"], "pending");
         clock.advance(Duration::from_secs(5));
+        // GitHub has the code; a signed-in browser has yet to approve it.
+        let Json(waiting) = poll().await.ok().unwrap();
+        assert_eq!(
+            (waiting["status"].as_str(), waiting["approve"].as_bool()),
+            (Some("pending"), Some(true))
+        );
+        login::tests::approve(&logins, USER_CODE);
         let Json(done) = poll().await.ok().unwrap();
+        let entered = fake.lock().unwrap().users["ghu_allowed"].1.clone();
         assert_eq!(
             (done["status"].as_str(), done["login"].as_str()),
-            (Some("done"), Some("octocat"))
+            (Some("done"), Some(entered.as_str()))
         );
         assert_eq!(done["hub"]["url"], url);
         assert!(poll().await.is_err(), "nothing waits any more");
@@ -2220,6 +2301,11 @@ mod tests {
         let start = logins.device_start(login::tests::PEER).await.unwrap();
         fake.lock().unwrap().polls = [token_answer("ghu_allowed")].into();
         clock.advance(Duration::from_secs(5));
+        logins
+            .device_poll(login::tests::PEER, &start.handle)
+            .await
+            .unwrap();
+        login::tests::approve(&logins, &start.user_code);
         let Ok(DevicePoll::Done { token, .. }) =
             logins.device_poll(login::tests::PEER, &start.handle).await
         else {
@@ -2231,6 +2317,122 @@ mod tests {
         assert!(rotate_companion_token(State(hub)).await.is_ok());
         let (again, _, _) = login::tests::logins(root.path()).await;
         assert!(!again.companion(&token));
+    }
+
+    /// Every sign-in waiting on `logins`, as the allowed user sees them.
+    fn all_requests(logins: &Logins) -> Vec<login::DeviceRequest> {
+        logins.device_requests(&login::tests::allowed()).requests
+    }
+
+    #[tokio::test]
+    async fn companion_sign_ins_are_approved_from_the_hubs_page_alone() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = login::tests::logins(root.path()).await;
+        let (session, _) = login::tests::sign_in(&logins, &fake, "ghu_allowed")
+            .await
+            .unwrap();
+        let router = router(test_app(
+            root.path(),
+            Mode::Hub,
+            LOCAL,
+            Some(logins.clone()),
+        ));
+        let start = logins.device_start(login::tests::PEER).await.unwrap();
+        // The code is entered on GitHub.
+        fake.lock().unwrap().polls = [crate::oauth::tests::token_answer("ghu_allowed")].into();
+        clock.advance(Duration::from_secs(5));
+        logins
+            .device_poll(login::tests::PEER, &start.handle)
+            .await
+            .unwrap();
+        let signed_in = format!("{}={session}", login::SESSION_COOKIE);
+        let bearer = format!("Bearer {TOKEN}");
+        let page = [(HOST, TAILNET), (COOKIE, signed_in.as_str())];
+        let (status, _, body) = call(&router, Method::GET, "/auth/devices", &page, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed: Value = serde_json::from_str(&body).unwrap();
+        let listed = &listed["requests"];
+        assert_eq!(listed[0]["user_code"], start.user_code.as_str());
+        assert_eq!(listed[0]["peer"], login::tests::PEER);
+        assert!(listed[0]["started"].is_string());
+        assert!(
+            !body.contains(&start.handle),
+            "the page never sees the handle"
+        );
+        let id = listed[0]["id"].as_str().unwrap().to_string();
+        let choice = || Some(json!({ "id": id }));
+        // Only a signed-in browser, under the sign-in name, from its page.
+        let elsewhere: [&[(header::HeaderName, &str)]; 6] = [
+            &[(HOST, TAILNET)],
+            &[(HOST, TAILNET), (AUTHORIZATION, bearer.as_str())],
+            &[(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())],
+            &[(HOST, TAILNET), (COOKIE, signed_in.as_str())],
+            &[
+                (HOST, TAILNET),
+                (COOKIE, signed_in.as_str()),
+                (ORIGIN, "https://attacker.example"),
+            ],
+            &[
+                (HOST, TAILNET),
+                (COOKIE, signed_in.as_str()),
+                (ORIGIN, "http://hub.example.ts.net"),
+            ],
+        ];
+        for (n, headers) in elsewhere.into_iter().enumerate() {
+            let (status, _, body) = call(
+                &router,
+                Method::POST,
+                "/auth/devices/approve",
+                headers,
+                choice(),
+            )
+            .await;
+            assert!(
+                matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+                "case {n}: {status} {body}"
+            );
+        }
+        for headers in [
+            &page[..1],
+            &[(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())],
+        ] {
+            let (status, _, _) = call(&router, Method::GET, "/auth/devices", headers, None).await;
+            assert!(matches!(
+                status,
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+            ));
+        }
+        assert!(!all_requests(&logins)[0].approved);
+        let from_page = [
+            (HOST, TAILNET),
+            (COOKIE, signed_in.as_str()),
+            (ORIGIN, HUB_ORIGIN),
+        ];
+        let approve = || {
+            call(
+                &router,
+                Method::POST,
+                "/auth/devices/approve",
+                &from_page,
+                choice(),
+            )
+        };
+        assert_eq!(approve().await.0, StatusCode::OK);
+        assert!(all_requests(&logins)[0].approved);
+        // A replay is refused.
+        assert_eq!(approve().await.0, StatusCode::CONFLICT);
+        let (status, _, _) = call(
+            &router,
+            Method::POST,
+            "/auth/devices/deny",
+            &from_page,
+            choice(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(all_requests(&logins).is_empty());
+        assert_eq!(approve().await.0, StatusCode::NOT_FOUND);
     }
 
     /// The hub credential a companion keeps, from its data directory.

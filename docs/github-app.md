@@ -79,7 +79,7 @@ On the companion, sign in to the hub instead of pasting its companion token:
 workboard hub login https://hub.example.ts.net/
 ```
 
-It prints a code and `https://github.com/login/device`; enter the code there, as an allowed user, and the companion starts pulling.
+It prints a code and `https://github.com/login/device`; enter the code there, as an allowed user. Then open the hub's page, signed in with the same GitHub account: it lists the companion's sign-in with its code, when it started and the tailnet address it came from. Check that the code is the one your companion printed, and approve it; the companion then starts pulling.
 
 ## How the sign-ins work
 
@@ -99,14 +99,16 @@ The hub runs GitHub's device flow on the companion's behalf:
 
 1. `workboard hub login URL` asks its local service, which posts to the hub's `/auth/device`, without a body. The hub asks GitHub for a device code and answers with the code to show, the page to enter it on, and a random handle.
 2. The companion polls `/auth/device/poll` with the handle, without a body, as often as GitHub allows. The hub asks GitHub at most once per interval, and slows down when GitHub says to.
-3. Once the person entered the code, the hub reads `GET /user` with the new token, checks the numeric ID against the allowlist, and answers with a **companion credential**: a random token, bound to that user ID, which reads the export and nothing else, like the companion token. The hub keeps only its SHA-256 (`companions.json`, mode `0600`), and once its user is no longer on the allowlist, the hub deletes it when it starts, so putting the user back doesn't bring it back. Each user keeps at most four, a new one dropping the oldest, and `workboard companion-token --rotate` revokes all of them, with the App configured or not.
-4. The companion keeps the credential like the companion token, and pulls.
+3. Once the person entered the code, the hub reads `GET /user` with the new token and checks the numeric ID against the allowlist. It doesn't ask GitHub again, and drops that token.
+4. The sign-in then waits for its person to approve it on the hub's page (`GET /auth/devices`, and `POST /auth/devices/approve` or `/deny` with its ID), signed in there with GitHub as the account that entered the code. The page shows each signed-in user only the sign-ins their own account entered the code of, and only that account can approve or deny one; before anyone entered its code, nobody can, and it expires on its own. Those requests are taken only with a session cookie, under the name people sign in on, and a change only from that name's page (its `Origin`), as JSON; never with the application token or a companion's. The page shows each such sign-in's code, when it started, the peer it came from and the account that entered the code, and how many others wait for their code. A sign-in can be approved once, and an approval can't be used again: it ends with the credential, a denial, or the device code's expiry (15 minutes). A companion from before approvals doesn't tell its person to approve, but its sign-in completes the same way once they do.
+5. Once approved, the hub answers the companion's next poll with a **companion credential**: a random token, bound to that user ID, which reads the export and nothing else, like the companion token. The hub keeps only its SHA-256 (`companions.json`, mode `0600`), and once its user is no longer on the allowlist, the hub deletes it when it starts, so putting the user back doesn't bring it back. Each user keeps at most four, a new one dropping the oldest, and `workboard companion-token --rotate` revokes all of them, with the App configured or not.
+6. The companion keeps the credential like the companion token, and pulls.
 
 **Why the hub runs the flow**, rather than the companion getting a user token itself and sending it to the hub: the user token never leaves the hub, and the hub only ever accepts a token it got from GitHub for its own App. A token the companion sent could be any token of the user's, from any app, and it would cross the tailnet to the hub. The companion also needs no GitHub client and no client ID of its own, and still sends the hub nothing of its own: its requests at sign-in are two `POST`s without a body. The hub doesn't keep the device flow's user token; the web sign-in keeps one for #13.
 
 The export-only companion token stays, as a fallback: `workboard hub set URL --token-stdin` still takes it.
 
-**Who can start a companion's sign-in.** Anyone on the tailnet can ask the hub for a device code, since a companion has no credential yet. Someone who did, and got an allowed user to enter their code on github.com, would get a companion credential, which reads the export. GitHub's page names the App and asks the person to confirm, so only enter a code that your own `workboard hub login` printed. A later change could have a signed-in browser approve each companion first.
+**Who can start a companion's sign-in.** Anyone on the tailnet can ask the hub for a device code, since a companion has no credential yet. Someone who did, and got an allowed user to enter their code on github.com, would still get nothing: the sign-in completes only once that user also approves it on the hub's page, where it shows with its code and the address it came from. So only enter a code, and approve a sign-in, that your own `workboard hub login` printed.
 
 ### Rate limits and logs
 

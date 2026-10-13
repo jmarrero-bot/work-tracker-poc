@@ -346,12 +346,52 @@ struct Session {
     seen: SystemTime,
 }
 
-/// A companion's device flow, waiting for the person to enter the code.
+/// A companion's device flow, waiting for the person to enter the code on
+/// GitHub, and for a signed-in browser to approve it on the hub's page.
 struct Device {
+    /// What the hub's page names it by, to approve or deny it: random, and
+    /// never the companion's handle.
+    id: String,
     code: Credential,
+    /// The code the companion shows, which the page shows too, so the
+    /// person can tell their own sign-in from another.
+    user_code: String,
+    /// Who asked for it, as the hub's front says.
+    peer: String,
+    started: SystemTime,
     interval: Duration,
     next_poll: SystemTime,
     expires: SystemTime,
+    /// Who entered the code on GitHub, once someone allowed did. GitHub
+    /// isn't asked again after that.
+    user: Option<Identity>,
+    /// Who approved it on the hub's page.
+    approved: Option<Identity>,
+}
+
+/// What the hub's page shows a signed-in user of the companions' sign-ins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceRequests {
+    /// Those whose code that user's account entered.
+    pub requests: Vec<DeviceRequest>,
+    /// How many wait for anyone to enter their code.
+    pub waiting: usize,
+}
+
+/// A companion's sign-in waiting on the hub, as its page shows it to a
+/// signed-in user, to approve or deny.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceRequest {
+    pub id: String,
+    /// The code the companion shows.
+    pub user_code: String,
+    pub started: Timestamp,
+    pub expires: Timestamp,
+    /// The tailnet address it came from, or "this machine".
+    pub peer: String,
+    /// The GitHub login that entered the code, once one did.
+    pub github_login: Option<String>,
+    pub approved: bool,
 }
 
 /// A companion credential, kept by its hash, and whose it is.
@@ -708,10 +748,16 @@ impl Logins {
         state.devices.insert(
             hashed(&handle),
             Device {
+                id: new_token(),
                 code: code.device_code,
+                user_code: code.user_code.clone(),
+                peer: peer.to_string(),
+                started: now,
                 interval: code.interval,
                 next_poll: now + code.interval,
                 expires: now + code.expires_in,
+                user: None,
+                approved: None,
             },
         );
         Ok(DeviceStart {
@@ -724,8 +770,9 @@ impl Logins {
     }
 
     /// Poll a companion's device flow by its handle: not yet, or, once its
-    /// person entered the code and is allowed, a companion credential bound
-    /// to their user ID. GitHub is asked at most once per interval.
+    /// person entered the code and is allowed, and they approved it on the
+    /// hub's page, a companion credential bound to their user ID. GitHub is
+    /// asked at most once per interval, and not again once it answered.
     pub async fn device_poll(&self, peer: &str, handle: &str) -> Result<DevicePoll, LoginError> {
         let key = hashed(handle);
         let now = self.now();
@@ -744,21 +791,19 @@ impl Logins {
                 state.devices.remove(&key);
                 return Err(LoginError::expired());
             }
+            if device.user.is_some() {
+                drop(state);
+                return self.finish_device(&key);
+            }
             if now < device.next_poll {
-                return Ok(DevicePoll::Pending {
-                    interval: device.interval.as_secs(),
-                });
+                return Ok(DevicePoll::pending(device.interval));
             }
             device.next_poll = now + device.interval;
             (device.code.clone(), device.interval)
         };
         let polled = self.oauth.poll_device(&self.config.client_id, &code).await;
         let token = match polled {
-            Err(OAuthError::Refused(Refused::Pending)) => {
-                return Ok(DevicePoll::Pending {
-                    interval: interval.as_secs(),
-                })
-            }
+            Err(OAuthError::Refused(Refused::Pending)) => return Ok(DevicePoll::pending(interval)),
             Err(OAuthError::Refused(Refused::SlowDown(seconds))) => {
                 let slower = seconds.map_or_else(
                     || oauth::poll_interval((interval + SLOW_DOWN).as_secs()),
@@ -768,9 +813,7 @@ impl Logins {
                     device.interval = slower;
                     device.next_poll = now + slower;
                 }
-                return Ok(DevicePoll::Pending {
-                    interval: slower.as_secs(),
-                });
+                return Ok(DevicePoll::pending(slower));
             }
             // A network failure can pass; the companion polls again.
             Err(OAuthError::Failed(e)) if e.kind == ErrorKind::Transient => {
@@ -782,13 +825,155 @@ impl Logins {
             }
             Ok(token) => token,
         };
-        self.state().devices.remove(&key);
-        let user = self.identify(&token.access).await?;
-        let credential = self.issue_companion(&user)?;
+        let user = match self.identify(&token.access).await {
+            Ok(user) => user,
+            Err(e) => {
+                self.state().devices.remove(&key);
+                return Err(e);
+            }
+        };
+        // The device flow's user token isn't kept: it only said who it is.
+        match self.state().devices.get_mut(&key) {
+            Some(device) => device.user = Some(user),
+            // Denied on the page, or swept, meanwhile.
+            None => return Err(LoginError::expired()),
+        }
+        self.finish_device(&key)
+    }
+
+    /// The device flow `key` names, whose person GitHub named: a companion
+    /// credential once they approved it on the hub's page, used up then,
+    /// or not yet.
+    fn finish_device(&self, key: &str) -> Result<DevicePoll, LoginError> {
+        let mut state = self.state();
+        let device = state.devices.get(key).ok_or_else(LoginError::expired)?;
+        let user = device
+            .user
+            .clone()
+            .expect("invariant: GitHub named the person first");
+        let Some(approver) = device.approved.clone() else {
+            return Ok(DevicePoll::Pending {
+                interval: device.interval.as_secs(),
+                approve: true,
+            });
+        };
+        state.devices.remove(key);
+        if approver.id != user.id {
+            return Err(LoginError::new(
+                StatusCode::FORBIDDEN,
+                "This sign-in was approved by another GitHub account than the one that entered its code; start again",
+            ));
+        }
+        let credential = self.issue_companion(&mut state, &user)?;
         Ok(DevicePoll::Done {
             token: credential,
             login: user.login,
         })
+    }
+
+    /// The companions' sign-ins waiting on the hub that `viewer`'s GitHub
+    /// account entered the code of, newest first, for the hub's page to show
+    /// them, and how many wait for anyone to enter theirs. Nobody sees
+    /// another account's sign-ins, or a code before it was entered.
+    pub fn device_requests(&self, viewer: &Identity) -> DeviceRequests {
+        let all = self.all_device_requests();
+        let waiting = all.iter().filter(|(user, _)| user.is_none()).count();
+        let requests = all
+            .into_iter()
+            .filter(|(user, _)| *user == Some(viewer.id))
+            .map(|(_, request)| request)
+            .collect();
+        DeviceRequests { requests, waiting }
+    }
+
+    /// Every waiting sign-in, newest first, with the user ID that entered
+    /// its code, if one did.
+    fn all_device_requests(&self) -> Vec<(Option<u64>, DeviceRequest)> {
+        let now = self.now();
+        let mut state = self.state();
+        state.devices.retain(|_, d| now < d.expires);
+        let mut requests: Vec<(Option<u64>, DeviceRequest)> = state
+            .devices
+            .values()
+            .map(|d| {
+                (
+                    d.user.as_ref().map(|u| u.id),
+                    DeviceRequest {
+                        id: d.id.clone(),
+                        user_code: d.user_code.clone(),
+                        started: Timestamp::of(d.started),
+                        expires: Timestamp::of(d.expires),
+                        peer: d.peer.clone(),
+                        github_login: d.user.as_ref().map(|u| u.login.clone()),
+                        approved: d.approved.is_some(),
+                    },
+                )
+            })
+            .collect();
+        requests.sort_by_key(|(_, r)| std::cmp::Reverse(r.started));
+        requests
+    }
+
+    /// The waiting device flow the page names `id`, if it is live.
+    fn device_by_id<'a>(
+        &self,
+        state: &'a mut State,
+        id: &str,
+    ) -> Result<(String, &'a mut Device), LoginError> {
+        let now = self.now();
+        state.devices.retain(|_, d| now < d.expires);
+        state
+            .devices
+            .iter_mut()
+            .find(|(_, d)| matches_token(&d.id, id))
+            .map(|(key, d)| (key.clone(), d))
+            .ok_or_else(|| {
+                LoginError::new(
+                    StatusCode::NOT_FOUND,
+                    "That sign-in is no longer waiting: it finished, expired or was denied",
+                )
+            })
+    }
+
+    /// Approve a companion's sign-in, as `approver`, signed in on the hub's
+    /// page: only once its code was entered on GitHub, so the page can show
+    /// as whom, and only by that account. Only once: approving it again is
+    /// refused.
+    pub fn approve_device(&self, approver: &Identity, id: &str) -> Result<(), LoginError> {
+        let mut state = self.state();
+        let (_, device) = self.device_by_id(&mut state, id)?;
+        let Some(user) = &device.user else {
+            return Err(not_entered());
+        };
+        if user.id != approver.id {
+            return Err(another_account());
+        }
+        if device.approved.is_some() {
+            return Err(LoginError::new(
+                StatusCode::CONFLICT,
+                "That sign-in was already approved",
+            ));
+        }
+        device.approved = Some(approver.clone());
+        Ok(())
+    }
+
+    /// Deny a companion's sign-in, as `denier`, signed in on the hub's
+    /// page: it ends, and its companion is told it expired. Only the
+    /// account that entered its code may, and only once it has, so one
+    /// allowed user can't end another's sign-in; one nobody entered the
+    /// code of expires on its own.
+    pub fn deny_device(&self, denier: &Identity, id: &str) -> Result<(), LoginError> {
+        let mut state = self.state();
+        let (key, device) = self.device_by_id(&mut state, id)?;
+        let Some(user) = &device.user else {
+            return Err(not_entered());
+        };
+        if user.id != denier.id {
+            return Err(another_account());
+        }
+        state.devices.remove(&key);
+        Ok(())
     }
 
     fn save_companions(&self, companions: &[Companion]) -> Result<()> {
@@ -798,9 +983,8 @@ impl Logins {
 
     /// A new companion credential for `user`. Each user keeps at most
     /// [`MAX_COMPANIONS`], the oldest dropped first.
-    fn issue_companion(&self, user: &Identity) -> Result<String, LoginError> {
+    fn issue_companion(&self, state: &mut State, user: &Identity) -> Result<String, LoginError> {
         let token = new_token();
-        let mut state = self.state();
         let mut companions = state.companions.clone();
         while companions.iter().filter(|c| c.user == user.id).count() >= MAX_COMPANIONS {
             let oldest = companions
@@ -841,6 +1025,24 @@ impl Logins {
     }
 }
 
+/// The refusal of an approval or denial of a sign-in nobody has entered
+/// the code of.
+fn not_entered() -> LoginError {
+    LoginError::new(
+        StatusCode::CONFLICT,
+        "Nobody has entered that sign-in's code on GitHub yet; only the account that does can approve or deny it",
+    )
+}
+
+/// The refusal of an approval or denial by another account than the one
+/// that entered the code.
+fn another_account() -> LoginError {
+    LoginError::new(
+        StatusCode::FORBIDDEN,
+        "Another GitHub account entered that sign-in's code; only it can approve or deny it",
+    )
+}
+
 /// Revoke every companion credential a hub's device flow gave, from its
 /// data directory at `root`: with its GitHub App configured or not.
 pub fn forget_companions(root: &Path) -> Result<()> {
@@ -872,10 +1074,14 @@ pub mod tests {
     pub const OTHER: u64 = 2002;
 
     pub fn config() -> AppConfig {
+        config_allowing(&[ALLOWED])
+    }
+
+    fn config_allowing(users: &[u64]) -> AppConfig {
         AppConfig::new(
             CLIENT_ID,
             &format!("https://{TAILNET}{CALLBACK_PATH}"),
-            &[ALLOWED],
+            users,
             &[TAILNET.into()],
         )
         .unwrap()
@@ -884,6 +1090,14 @@ pub mod tests {
     /// A hub's sign-ins against a fake GitHub, on a clock the test moves,
     /// and that GitHub, which knows the allowed user's token and another's.
     pub async fn logins(root: &Path) -> (Arc<Logins>, Shared, Arc<ManualClock>) {
+        logins_allowing(root, &[ALLOWED]).await
+    }
+
+    /// [`logins`], allowing `users`.
+    async fn logins_allowing(
+        root: &Path,
+        users: &[u64],
+    ) -> (Arc<Logins>, Shared, Arc<ManualClock>) {
         let (site, fake) = fake_github().await;
         {
             let mut fake = fake.lock().unwrap();
@@ -894,8 +1108,38 @@ pub mod tests {
         }
         let clock = Arc::new(ManualClock::at(Timestamp::from_unix(1_791_763_200)));
         let secret = Credential::new(SECRET).unwrap();
-        let logins = Logins::new(config(), secret, site, clock.clone(), root).unwrap();
+        let logins =
+            Logins::new(config_allowing(users), secret, site, clock.clone(), root).unwrap();
         (Arc::new(logins), fake, clock)
+    }
+
+    /// Every waiting sign-in, whoever's.
+    fn all(logins: &Logins) -> Vec<DeviceRequest> {
+        logins
+            .all_device_requests()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect()
+    }
+
+    /// The allowed user, as their session on the hub's page says.
+    pub fn allowed() -> Identity {
+        Identity {
+            id: ALLOWED,
+            login: "allowed-user".into(),
+        }
+    }
+
+    /// Approve the waiting device flow that shows `user_code`, as the
+    /// allowed user, on the hub's page.
+    pub fn approve(logins: &Logins, user_code: &str) {
+        let request = logins
+            .device_requests(&allowed())
+            .requests
+            .into_iter()
+            .find(|r| r.user_code == user_code)
+            .expect("the sign-in waits");
+        logins.approve_device(&allowed(), &request.id).unwrap();
     }
 
     /// Sign in through the fake GitHub as the owner of `token`: the
@@ -1289,9 +1533,10 @@ pub mod tests {
             token_answer("ghu_allowed"),
         ]
         .into();
+        let pending = |seconds| DevicePoll::pending(Duration::from_secs(seconds));
         // Polled too soon: GitHub isn't asked.
         let early = logins.device_poll(PEER, &start.handle).await.unwrap();
-        assert_eq!(early, DevicePoll::Pending { interval: 5 });
+        assert_eq!(early, pending(5));
         let polls = |fake: &Shared| {
             fake.lock()
                 .unwrap()
@@ -1307,32 +1552,37 @@ pub mod tests {
             logins.device_poll(PEER, &start.handle),
             logins.device_poll(PEER, &start.handle)
         );
-        assert_eq!(
-            (one.unwrap(), two.unwrap()),
-            (
-                DevicePoll::Pending { interval: 5 },
-                DevicePoll::Pending { interval: 5 }
-            )
-        );
+        assert_eq!((one.unwrap(), two.unwrap()), (pending(5), pending(5)));
         assert_eq!(polls(&fake), 1);
         clock.advance(Duration::from_secs(5));
         assert_eq!(
             logins.device_poll(PEER, &start.handle).await.unwrap(),
-            DevicePoll::Pending { interval: 10 }
+            pending(10)
         );
         clock.advance(Duration::from_secs(5));
         assert_eq!(
             logins.device_poll(PEER, &start.handle).await.unwrap(),
-            DevicePoll::Pending { interval: 10 }
+            pending(10)
         );
         assert_eq!(polls(&fake), 2, "slowed down");
         clock.advance(Duration::from_secs(5));
+        // GitHub has the code; the hub's page has yet to approve it.
+        let waiting = DevicePoll::Pending {
+            interval: 10,
+            approve: true,
+        };
+        assert_eq!(
+            logins.device_poll(PEER, &start.handle).await.unwrap(),
+            waiting
+        );
+        approve(&logins, &start.user_code);
         let DevicePoll::Done { token, login } =
             logins.device_poll(PEER, &start.handle).await.unwrap()
         else {
             panic!("not done")
         };
-        assert_eq!(login, "octocat");
+        assert_eq!(polls(&fake), 3, "GitHub is asked until it answers");
+        assert_eq!(login, fake.lock().unwrap().users["ghu_allowed"].1);
         assert!(logins.companion(&token));
         assert!(!logins.companion("anything-else"));
         // Kept by its hash only, and the handle is used up.
@@ -1357,6 +1607,8 @@ pub mod tests {
         let start = logins.device_start(PEER).await.unwrap();
         fake.lock().unwrap().polls = [token_answer("ghu_allowed")].into();
         clock.advance(Duration::from_secs(5));
+        logins.device_poll(PEER, &start.handle).await.unwrap();
+        approve(&logins, &start.user_code);
         let DevicePoll::Done { token, .. } = logins.device_poll(PEER, &start.handle).await.unwrap()
         else {
             panic!("not done")
@@ -1406,5 +1658,153 @@ pub mod tests {
         );
         assert!(logins.state().companions.is_empty());
         assert!(!root.path().join(COMPANIONS_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn a_companion_sign_in_waits_for_a_browser_to_approve_it_once() {
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = logins_allowing(root.path(), &[ALLOWED, OTHER]).await;
+        let other = Identity {
+            id: OTHER,
+            login: "other-user".into(),
+        };
+        let started = Timestamp::of(clock.now());
+        let start = logins.device_start(PEER).await.unwrap();
+        // The page shows the code, when it started and where from, before
+        // anyone entered the code.
+        let [request] = &all(&logins)[..] else {
+            panic!("one waits")
+        };
+        let expires = started.after(Duration::from_secs(start.expires_in));
+        assert_eq!(
+            request,
+            &DeviceRequest {
+                id: request.id.clone(),
+                user_code: start.user_code.clone(),
+                started,
+                expires,
+                peer: PEER.into(),
+                github_login: None,
+                approved: false,
+            }
+        );
+        assert_ne!(request.id, start.handle, "the page never sees the handle");
+        let id = request.id.clone();
+        // Nobody sees it yet, only that one waits, and nobody may deny it.
+        let empty = DeviceRequests {
+            requests: vec![],
+            waiting: 1,
+        };
+        assert_eq!(logins.device_requests(&allowed()), empty);
+        assert_eq!(
+            logins.deny_device(&allowed(), &id).unwrap_err().status,
+            StatusCode::CONFLICT
+        );
+        fake.lock().unwrap().polls = [token_answer("ghu_allowed")].into();
+        clock.advance(Duration::from_secs(5));
+        let waiting = DevicePoll::Pending {
+            interval: 5,
+            approve: true,
+        };
+        assert_eq!(
+            logins.device_poll(PEER, &start.handle).await.unwrap(),
+            waiting
+        );
+        // GitHub isn't asked again while it waits.
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(
+            logins.device_poll(PEER, &start.handle).await.unwrap(),
+            waiting
+        );
+        let asked = |fake: &Shared| {
+            fake.lock()
+                .unwrap()
+                .seen
+                .iter()
+                .filter(|s| s.1 == "/login/oauth/access_token")
+                .count()
+        };
+        assert_eq!(asked(&fake), 1);
+        // Now its account sees it, and no other.
+        let mine = logins.device_requests(&allowed());
+        assert_eq!((mine.requests.len(), mine.waiting), (1, 0));
+        assert!(logins.device_requests(&other).requests.is_empty());
+        let entered = all(&logins)[0].github_login.clone();
+        assert_eq!(
+            entered,
+            Some(fake.lock().unwrap().users["ghu_allowed"].1.clone())
+        );
+        // Only the account that entered the code approves it, and once.
+        let refused = logins.approve_device(&other, &id).unwrap_err();
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            logins
+                .approve_device(&allowed(), "forged")
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        logins.approve_device(&allowed(), &id).unwrap();
+        assert!(all(&logins)[0].approved);
+        assert_eq!(
+            logins.approve_device(&allowed(), &id).unwrap_err().status,
+            StatusCode::CONFLICT
+        );
+        let DevicePoll::Done { token, .. } = logins.device_poll(PEER, &start.handle).await.unwrap()
+        else {
+            panic!("not done")
+        };
+        assert!(logins.companion(&token));
+        // Used up: nothing waits, and the approval can't be used again.
+        assert!(all(&logins).is_empty());
+        assert_eq!(
+            logins.approve_device(&allowed(), &id).unwrap_err().status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            logins.device_poll(PEER, &start.handle).await.unwrap_err(),
+            LoginError::expired()
+        );
+
+        // Not before its code is entered on GitHub, so the page can show
+        // whose it is; and denied, the companion is told it expired, and
+        // GitHub isn't asked again.
+        let start = logins.device_start(PEER).await.unwrap();
+        let id = all(&logins)[0].id.clone();
+        assert_eq!(
+            logins.approve_device(&allowed(), &id).unwrap_err().status,
+            StatusCode::CONFLICT
+        );
+        fake.lock().unwrap().polls = [token_answer("ghu_allowed")].into();
+        clock.advance(Duration::from_secs(5));
+        logins.device_poll(PEER, &start.handle).await.unwrap();
+        // Only by the account that entered the code.
+        assert_eq!(
+            logins.deny_device(&other, &id).unwrap_err().status,
+            StatusCode::FORBIDDEN
+        );
+        logins.deny_device(&allowed(), &id).unwrap();
+        assert_eq!(
+            logins.deny_device(&allowed(), &id).unwrap_err().status,
+            StatusCode::NOT_FOUND
+        );
+        clock.advance(Duration::from_secs(5));
+        let before = asked(&fake);
+        assert_eq!(
+            logins.device_poll(PEER, &start.handle).await.unwrap_err(),
+            LoginError::expired()
+        );
+        assert_eq!(asked(&fake), before);
+
+        // Expired: no longer shown, and can't be approved.
+        let start = logins.device_start(PEER).await.unwrap();
+        let id = all(&logins)[0].id.clone();
+        clock.advance(Duration::from_secs(start.expires_in));
+        assert!(all(&logins).is_empty());
+        assert_eq!(
+            logins.approve_device(&allowed(), &id).unwrap_err().status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(logins.state().companions.len(), 1);
     }
 }

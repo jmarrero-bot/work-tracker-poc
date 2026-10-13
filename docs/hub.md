@@ -101,11 +101,11 @@ On the laptop, run Workboard as usual, connect the internal sources, and sign in
 ```sh
 workboard serve
 workboard connect jira --url https://jira.example.com/ --label 'Work Jira' --token-env WORKBOARD_JIRA_TOKEN
-workboard hub login https://hub.example.ts.net/   # enter the code it shows on github.com
+workboard hub login https://hub.example.ts.net/   # enter the code on github.com, then approve it on the hub's page
 workboard hub show
 ```
 
-`hub login` runs GitHub's device flow through the hub, which gives the laptop a credential that only reads its export, bound to the GitHub user who entered the code. Without the App, give it the companion token instead: `workboard hub set https://hub.example.ts.net/ --token-stdin`. Either pulls once to check the address and the credential before it keeps them; the credential is stored like a connection's, in a private file. From then on the companion pulls on its own schedule (every 5 minutes, or `serve --sync-interval`), with the same backoff as a connection, and `workboard sync` pulls too. `workboard hub unset` stops it and forgets the token and the hub's work.
+`hub login` runs GitHub's device flow through the hub, which gives the laptop a credential that only reads its export, bound to the GitHub user who entered the code, once that user also approves the sign-in on the hub's page, signed in there with GitHub. Without the App, give it the companion token instead: `workboard hub set https://hub.example.ts.net/ --token-stdin`. Either pulls once to check the address and the credential before it keeps them; the credential is stored like a connection's, in a private file. From then on the companion pulls on its own schedule (every 5 minutes, or `serve --sync-interval`), with the same backoff as a connection, and `workboard sync` pulls too. `workboard hub unset` stops it and forgets the token and the hub's work.
 
 A hub address is HTTPS, or plain HTTP only to the laptop's own loopback, so the token never crosses a network in the clear. A hub never pulls from another hub.
 

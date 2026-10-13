@@ -433,7 +433,8 @@ enum HubCommand {
         token_stdin: bool,
     },
     /// Sign in to the hub at URL with GitHub, and pull from it with the
-    /// credential that gives: open the page it shows and enter the code.
+    /// credential that gives: open the page it shows and enter the code,
+    /// then approve the sign-in on the hub's page, signed in there.
     /// The hub runs GitHub's device flow; it gives this machine a
     /// credential that only reads its external export, as a GitHub user
     /// it allows.
@@ -1231,13 +1232,14 @@ async fn hub_login(
     )
     .await?;
     let text = |key: &str| start[key].as_str().unwrap_or_default().to_string();
+    let code = text("user_code");
     println!(
-        "Open {} and enter the code {}",
+        "Open {} and enter the code {code}",
         text("verification_uri"),
-        text("user_code")
     );
     println!("Waiting for GitHub...");
     let mut interval = start["interval"].as_u64().unwrap_or(5);
+    let mut told = false;
     loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;
         let poll: serde_json::Value = request(
@@ -1259,6 +1261,10 @@ async fn hub_login(
                 status.connections
             );
             return Ok(());
+        }
+        if poll["approve"] == true && !told {
+            told = true;
+            println!("GitHub has the code. Now approve this sign-in on {url}, in a browser signed in there with the same GitHub account: check that it shows the code {code}");
         }
         if let Some(error) = poll["error"].as_str() {
             println!("Still waiting; the last poll failed: {error}");
