@@ -60,6 +60,114 @@ pub fn lock(root: &Path) -> Result<fs::File> {
     Ok(file)
 }
 
+/// The database's file in a data directory.
+const DATABASE: &str = "work.sqlite";
+/// What starts and ends the name of a copy of the database made before an
+/// upgrade, `work.vN.sqlite`.
+const BACKUP_PREFIX: &str = "work.v";
+const BACKUP_SUFFIX: &str = ".sqlite";
+/// What ends the name of a copy of the database while it is written.
+const PARTIAL: &str = ".partial";
+/// The files SQLite keeps beside a database, by the end of their names: its
+/// rollback journal, write-ahead log and shared memory.
+const SQLITE_COMPANIONS: [&str; 3] = ["-journal", "-wal", "-shm"];
+
+/// Whether a file named `name` in a data directory is one of SQLite's: the
+/// database, a copy of it from before an upgrade, or a file SQLite keeps
+/// beside either.
+fn is_sqlite_file(name: &str) -> bool {
+    let base = SQLITE_COMPANIONS
+        .iter()
+        .find_map(|end| name.strip_suffix(end))
+        .unwrap_or(name);
+    base == DATABASE || (base.starts_with(BACKUP_PREFIX) && base.ends_with(BACKUP_SUFFIX))
+}
+
+/// Create the file at `path` readable and writable by this user only, or
+/// open it if it is there and `new` isn't asked for.
+fn create_private(path: &Path, new: bool) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if new {
+        options.create_new(true);
+    } else {
+        options.create(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .with_context(|| format!("Cannot create {}", path.display()))
+}
+
+/// Open the SQLite file at `path` without following a symbolic link,
+/// creating it private if `create` says to, and fail unless it is a
+/// regular file of this user's; then make it private through the
+/// descriptor opened, so the file checked is the file changed. One that
+/// wasn't private is named on standard error. A file that isn't there,
+/// and isn't to be created, is fine.
+#[cfg(unix)]
+fn private_sqlite_file(path: &Path, create: bool) -> Result<()> {
+    use rustix::fs::{fchmod, fstat, open, FileType, Mode, OFlags};
+    let shown = path.display();
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if create {
+        flags |= OFlags::CREATE;
+    }
+    let fd = match open(path, flags, Mode::from_raw_mode(0o600)) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) if !create => return Ok(()),
+        Err(rustix::io::Errno::ISDIR) => {
+            bail!("{shown} isn't a regular file; Workboard keeps its SQLite files as plain files")
+        }
+        Err(rustix::io::Errno::LOOP) => bail!(
+            "{shown} is a symbolic link, so it could put the database where others can read it. Workboard keeps its SQLite files in the data directory itself: put the file in place of the link"
+        ),
+        Err(e) => return Err(e).with_context(|| format!("Cannot open {shown}")),
+    };
+    let stat = fstat(&fd).with_context(|| format!("Cannot read {shown}"))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        bail!("{shown} isn't a regular file; Workboard keeps its SQLite files as plain files")
+    }
+    if stat.st_uid != rustix::process::geteuid().as_raw() {
+        bail!("{shown} isn't yours; Workboard keeps its SQLite files only in files you own")
+    }
+    let mode = stat.st_mode & 0o777;
+    if mode != 0o600 {
+        fchmod(&fd, Mode::from_raw_mode(0o600))
+            .with_context(|| format!("Cannot make {shown} private"))?;
+        eprintln!("Made {shown} readable by you only; it was mode {mode:o}");
+    }
+    Ok(())
+}
+
+/// Create the database in the data directory `root` private, if it isn't
+/// there yet, before SQLite opens it: SQLite gives the write-ahead log and
+/// shared memory it creates beside a database that database's mode, so
+/// they are private too. Every SQLite file there has to be a regular file
+/// of this user's, not a symbolic link, which could put it anywhere; one an
+/// earlier version left readable by others, as it did the write-ahead log
+/// and shared memory, is made private, and named on standard error.
+fn private_sqlite_files(root: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    create_private(&root.join(DATABASE), false)?;
+    #[cfg(unix)]
+    {
+        private_sqlite_file(&root.join(DATABASE), true)?;
+        let entries =
+            fs::read_dir(root).with_context(|| format!("Cannot read {}", root.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let sqlite = name.to_str().is_some_and(is_sqlite_file);
+            if sqlite && name != DATABASE {
+                private_sqlite_file(&entry.path(), false)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Remove the file at `path`, if there is one.
 pub fn remove_if_there(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
@@ -156,14 +264,36 @@ fn backup(sql: &Sqlite, path: &Path) -> Result<()> {
     if !has_data || path.exists() {
         return Ok(());
     }
-    let target = path
+    // Written under another name and put in place once it is complete and
+    // on disk, so a crash never leaves a copy that isn't whole where one
+    // would pass for the original next time.
+    let partial = PathBuf::from(format!("{}{PARTIAL}", path.display()));
+    let target = partial
         .to_str()
         .context("The data directory path is not UTF-8")?;
+    remove_if_there(&partial)?;
+    // VACUUM INTO fills an empty file it is given, so the copy is private
+    // from the start, and so is the journal SQLite keeps beside it.
+    create_private(&partial, true)?;
     // Unlike a file copy, VACUUM INTO includes changes still in the WAL.
-    sql.execute("VACUUM INTO ?1", [target])
-        .with_context(|| format!("Cannot back up the database to {target} before upgrading it"))?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let copied = sql
+        .execute("VACUUM INTO ?1", [target])
+        .map_err(anyhow::Error::from)
+        .and_then(|_| Ok(fs::File::open(&partial)?.sync_all()?));
+    if let Err(e) = copied {
+        let _ = fs::remove_file(&partial);
+        return Err(e).with_context(|| {
+            format!(
+                "Cannot back up the database to {} before upgrading it",
+                path.display()
+            )
+        });
+    }
+    fs::rename(&partial, path)
+        .with_context(|| format!("Cannot put the database's copy in {}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -527,15 +657,17 @@ impl Db {
     pub fn open_as(root: &Path, mode: Mode) -> Result<Self> {
         private_dir(root)?;
         private_dir(&root.join(SECRETS))?;
-        let mut sql = Sqlite::open(root.join("work.sqlite"))?;
+        private_sqlite_files(root)?;
+        let mut sql = Sqlite::open(root.join(DATABASE))?;
         // The prototype's schema; migrate() builds on it.
         sql.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
           CREATE TABLE IF NOT EXISTS connections(id TEXT PRIMARY KEY, body TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS efforts(id TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY, body TEXT NOT NULL, effort_id TEXT REFERENCES efforts(id));")?;
         migrate(&mut sql, root)?;
-        #[cfg(unix)]
-        fs::set_permissions(root.join("work.sqlite"), fs::Permissions::from_mode(0o600))?;
+        // Again, now that SQLite made its write-ahead log and shared
+        // memory: they are private files of this user's too.
+        private_sqlite_files(root)?;
         claim(&mut sql, root, mode)?;
         let db = Self {
             sql,
@@ -1541,9 +1673,14 @@ mod tests {
                 .unwrap();
             }
         }
+        // What a copy cut short by a crash left is no copy: it is written
+        // again, whole, and put in place only then.
+        let partial = root.join("work.v0.sqlite.partial");
+        fs::write(&partial, "").unwrap();
         for _ in 0..2 {
             // Opening again must not migrate twice.
             let db = Db::open(&root).unwrap();
+            assert!(!partial.exists());
             let version: i32 = db
                 .sql
                 .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -2534,6 +2671,91 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_files_are_private() {
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("db");
+        // SQLite creates the write-ahead log and shared memory with the
+        // database's mode, whatever the umask lets through.
+        let db = Db::open(&root).unwrap();
+        db.save_connection(&connection("a", Zone::Internal))
+            .unwrap();
+        for name in ["work.sqlite", "work.sqlite-wal", "work.sqlite-shm"] {
+            assert_eq!(mode(&root.join(name)), 0o600, "{name}");
+        }
+        drop(db);
+        // Files an earlier version left readable by others are made
+        // private when the database is opened, and only SQLite's.
+        let open = [
+            "work.sqlite",
+            "work.sqlite-wal",
+            "work.sqlite-shm",
+            "work.v3.sqlite",
+        ];
+        for name in open.iter().chain(&["notes.txt"]) {
+            let path = root.join(name);
+            if !path.exists() {
+                fs::write(&path, "").unwrap();
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let db = Db::open(&root).unwrap();
+        for name in open {
+            assert_eq!(mode(&root.join(name)), 0o600, "{name}");
+        }
+        assert_eq!(mode(&root.join("notes.txt")), 0o644);
+        assert_eq!(db.connections().unwrap().len(), 1);
+        drop(db);
+        // One that is a symbolic link could put the database anywhere,
+        // readable by others, so the database isn't opened; and neither
+        // what the link points to nor the link changes. Nor is one that
+        // isn't a plain file.
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+        for name in [
+            "work.sqlite",
+            "work.sqlite-wal",
+            "work.sqlite-shm",
+            "work.v3.sqlite",
+        ] {
+            let path = root.join(name);
+            if !path.exists() {
+                fs::write(&path, "").unwrap();
+            }
+            let kept = temp.path().join("kept");
+            fs::rename(&path, &kept).unwrap();
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+            let error = format!("{:#}", Db::open(&root).err().unwrap());
+            assert!(error.contains("symbolic link"), "{name}: {error}");
+            assert_eq!(mode(&outside), 0o644, "{name}");
+            assert!(fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            let error = format!("{:#}", Db::open(&root).err().unwrap());
+            assert!(error.contains("regular file"), "{name}: {error}");
+            fs::remove_dir(&path).unwrap();
+            fs::rename(&kept, &path).unwrap();
+        }
+        assert_eq!(Db::open(&root).unwrap().connections().unwrap().len(), 1);
+        let names = [
+            ("work.sqlite", true),
+            ("work.sqlite-journal", true),
+            ("work.v12.sqlite-wal", true),
+            ("work.sqlite.bak", false),
+            ("other.sqlite", false),
+            ("work.sqlite-wal.old", false),
+        ];
+        for (name, sqlite) in names {
+            assert_eq!(is_sqlite_file(name), sqlite, "{name}");
+        }
     }
 
     #[test]
