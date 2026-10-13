@@ -1,6 +1,6 @@
 # Releasing the hub's image
 
-A hub runs from its container image, which its deployment, such as a quadlet, pins by digest. A release is a tag here; deploying it is a change to that pin, which whoever runs the hub reviews, so nothing reaches their machine without them.
+A hub runs from its container image, which its deployment, such as a quadlet, pins by digest. A release is a tag here; deploying it is a change to that pin, which whoever runs the hub reviews, so nothing reaches their machine without them. These steps are for this repository's image; a build of your own publishes under your account the same way ([run-your-own.md](run-your-own.md)).
 
 ## Cut a tag
 
