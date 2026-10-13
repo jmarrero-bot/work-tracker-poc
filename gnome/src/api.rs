@@ -1,12 +1,16 @@
 //! A client of the local Workboard service's HTTP API, the only way this app
-//! gets or changes anything. It reads the service's token from the data
-//! directory, as the CLI does, and never opens the database.
+//! gets or changes anything. It reaches the service through its private
+//! Unix socket, as the CLI does, which only this user can connect to and
+//! which needs no token, and never opens the database.
 //!
 //! The types are this app's own view of the API's JSON: only the fields it
 //! shows, each with a default, so a field the service adds later doesn't
 //! break it. CI checks them against a running service.
 
 use anyhow::{anyhow, bail, Context, Result};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{header, Method, Request, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{
     collections::BTreeMap,
@@ -16,11 +20,15 @@ use std::{
 
 /// The port `workboard serve` listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 8421;
-/// The file in the data directory that holds the service's token, rotated
-/// on every start of the service.
-const TOKEN_FILE: &str = "service.token";
-/// The service's directory in `$XDG_RUNTIME_DIR`, where it also puts its
-/// token, as `service-PORT.token`.
+/// The file in the data directory that names the service's socket, and the
+/// ID of the service listening there.
+const SOCKET_POINTER: &str = "socket-path";
+/// The header with which the service on a socket answers its ID.
+const INSTANCE_HEADER: &str = "x-workboard-instance";
+/// The header with which a request names the service it is for.
+const EXPECT_HEADER: &str = "x-workboard-expect-instance";
+/// The service's directory in `$XDG_RUNTIME_DIR`, where it puts its
+/// socket, as `service-PORT.sock`.
 const RUNTIME_DIR: &str = "workboard";
 /// How long one request to the local service may take. A sync joins the
 /// sources' own syncs, which can take a while.
@@ -338,15 +346,13 @@ pub struct Board {
     pub bots: Vec<BotView>,
 }
 
-/// Where the local service is, and how to authenticate to it.
+/// Where the local service is: its private socket.
 #[derive(Debug, Clone)]
 pub struct Client {
-    http: reqwest::Client,
     data_dir: PathBuf,
-    /// The service's copy of its token in the session's runtime directory,
-    /// where a sandbox can read it without the data directory.
-    runtime_token: Option<PathBuf>,
-    base: String,
+    /// The socket the service on the port puts in the session's runtime
+    /// directory, where a sandbox can reach it without the data directory.
+    runtime_socket: Option<PathBuf>,
 }
 
 impl Client {
@@ -354,110 +360,69 @@ impl Client {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|d| !d.is_empty())
             .map(PathBuf::from);
-        Self::with_runtime(data_dir, port, runtime)
+        Ok(Self::with_runtime(data_dir, port, runtime))
     }
 
-    /// A client of the service on `port`, which keeps its token in
-    /// `data_dir` and, if given, the runtime directory `runtime`.
-    fn with_runtime(data_dir: PathBuf, port: u16, runtime: Option<PathBuf>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            // Loopback only: no proxy may see the token.
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("Cannot set up an HTTP client")?;
-        Ok(Self {
-            http,
+    /// A client of the service on `port`, which puts its socket in the
+    /// runtime directory `runtime`, if given, and names it in `data_dir`.
+    fn with_runtime(data_dir: PathBuf, port: u16, runtime: Option<PathBuf>) -> Self {
+        Self {
             data_dir,
-            runtime_token: runtime
-                .map(|dir| dir.join(RUNTIME_DIR).join(format!("service-{port}.token"))),
-            base: format!("http://127.0.0.1:{port}/api/"),
-        })
+            runtime_socket: runtime
+                .map(|dir| dir.join(RUNTIME_DIR).join(format!("service-{port}.sock"))),
+        }
     }
 
-    /// The service's current token, as far as can be told: the copy in the
-    /// runtime directory, else the data directory's. It changes whenever
-    /// the service starts, so it is read again for every request, which
-    /// runs off the main thread.
-    fn token(&self) -> Result<String> {
-        Ok(self.tokens()?.remove(0))
-    }
-
-    /// The tokens to try, in order: the runtime directory's copy, then the
-    /// data directory's, if it differs. A runtime copy can be an earlier
-    /// start's, if this one couldn't replace it.
-    fn tokens(&self) -> Result<Vec<String>> {
-        let read = |path: &Path| {
-            std::fs::read_to_string(path)
-                .ok()
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-        };
-        let mut tokens: Vec<String> = self
-            .runtime_token
-            .as_deref()
-            .and_then(read)
-            .into_iter()
-            .collect();
-        if let Some(token) = read(&self.data_dir.join(TOKEN_FILE)) {
-            if !tokens.contains(&token) {
-                tokens.push(token);
-            }
+    /// The service's socket, as far as can be told: the one the data
+    /// directory names, with the ID of the service there, else, as in the
+    /// Flatpak, which can't read the data directory, the runtime
+    /// directory's for the port. It moves only when the service starts
+    /// again, but is looked up for every request, which runs off the main
+    /// thread.
+    fn socket(&self) -> Result<(PathBuf, Option<String>)> {
+        let named = std::fs::read_to_string(self.data_dir.join(SOCKET_POINTER))
+            .ok()
+            .and_then(|text| {
+                let mut lines = text.lines().map(str::trim);
+                let path = PathBuf::from(lines.next()?);
+                let instance = lines.next().filter(|i| !i.is_empty())?.to_string();
+                path.is_absolute().then_some((path, Some(instance)))
+            });
+        if let Some(named) = named {
+            return Ok(named);
         }
-        if tokens.is_empty() {
-            let runtime = self
-                .runtime_token
-                .as_ref()
-                .map(|p| format!("{} or ", p.display()))
-                .unwrap_or_default();
-            bail!(
-                "No Workboard service token in {runtime}{}; start `workboard serve`, with the same data directory",
-                self.data_dir.display()
-            )
+        if let Some(path) = self.runtime_socket.as_ref().filter(|p| p.exists()) {
+            return Ok((path.clone(), None));
         }
-        Ok(tokens)
+        let runtime = self
+            .runtime_socket
+            .as_ref()
+            .map(|p| format!("{} or ", p.display()))
+            .unwrap_or_default();
+        bail!(
+            "No Workboard service socket at {runtime}in {}; start `workboard serve`, with the same data directory",
+            self.data_dir.display()
+        )
     }
 
     /// Call the local service, which the app drives with any method, as
-    /// the CLI does. Sources are only read, by the service.
-    #[allow(clippy::disallowed_methods)]
+    /// the CLI does. Sources are only read, by the service. Each call goes
+    /// on a connection of its own, which, when the data directory names
+    /// the service, first asks the service there who it is, so no request
+    /// goes to another one, even one that took over the socket meanwhile.
     async fn call<T: DeserializeOwned>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<T> {
-        let tokens = self.tokens()?;
-        let last = tokens.len() - 1;
-        let mut answer = None;
-        for (i, token) in tokens.into_iter().enumerate() {
-            let mut request = self
-                .http
-                .request(method.clone(), format!("{}{path}", self.base))
-                .bearer_auth(token);
-            if let Some(body) = &body {
-                request = request.json(body);
-            }
-            let response = request.send().await.map_err(|_| {
-                anyhow!(
-                    "Cannot reach Workboard at {}; start `workboard serve`",
-                    self.base.trim_end_matches("api/")
-                )
-            })?;
-            // A token refused may be a stale copy: the next one is tried.
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED && i < last {
-                continue;
-            }
-            answer = Some(response);
-            break;
-        }
-        let response = answer.context("No token was tried")?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .context("Workboard's answer was cut short")?;
+        let (socket, instance) = self.socket()?;
+        let (status, bytes) = tokio::time::timeout(
+            TIMEOUT,
+            self.send(&socket, instance.as_deref(), method, path, body.as_ref()),
+        )
+        .await
+        .context("Workboard didn't answer in time")??;
         if !status.is_success() {
             let message = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
@@ -469,18 +434,113 @@ impl Client {
             .with_context(|| format!("Workboard's answer to {path} doesn't parse"))
     }
 
-    /// The private URL that pairs a browser with the service, as `workboard
-    /// serve` prints it.
-    pub fn pairing_url(&self) -> Result<String> {
-        let token = self.token()?;
-        Ok(format!(
-            "{}#token={token}",
-            self.base.trim_end_matches("api/")
-        ))
+    async fn send(
+        &self,
+        socket: &Path,
+        instance: Option<&str>,
+        method: Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(StatusCode, Bytes)> {
+        let unreachable = || {
+            anyhow!(
+                "Cannot reach Workboard at {}; start `workboard serve`",
+                socket.display()
+            )
+        };
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|_| unreachable())?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .map_err(|_| unreachable())?;
+        tokio::spawn(connection);
+        let request = |method: Method, path: &str, body: Option<&serde_json::Value>| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(format!("/api/{path}"))
+                // Only a name: the connection is the socket.
+                .header(header::HOST, "workboard");
+            if let Some(instance) = instance {
+                // Another service refuses it before acting on it.
+                builder = builder.header(EXPECT_HEADER, instance);
+            }
+            let request = match body {
+                Some(body) => builder
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(serde_json::to_vec(body)?))),
+                None => builder.body(Full::new(Bytes::new())),
+            };
+            request.context("Cannot build a request")
+        };
+        let mismatch = |answer: &hyper::Response<hyper::body::Incoming>| {
+            let answered = answer
+                .headers()
+                .get(INSTANCE_HEADER)
+                .and_then(|v| v.to_str().ok());
+            instance.is_some() && answered != instance
+        };
+        let other = || {
+            anyhow!(
+                "The Workboard service at {} isn't the one of {}; start `workboard serve`, with that data directory",
+                socket.display(),
+                self.data_dir.display()
+            )
+        };
+        // This connection's service first, when the data directory says
+        // which it is.
+        if instance.is_some() {
+            let ping = sender
+                .send_request(request(Method::GET, "ping", None)?)
+                .await
+                .map_err(|_| unreachable())?;
+            if mismatch(&ping) {
+                return Err(other());
+            }
+            ping.into_body().collect().await?;
+            sender.ready().await.map_err(|_| unreachable())?;
+        }
+        let answer = sender
+            .send_request(request(method, path, body)?)
+            .await
+            .map_err(|_| unreachable())?;
+        if mismatch(&answer) {
+            return Err(other());
+        }
+        let status = answer.status();
+        let bytes = answer
+            .into_body()
+            .collect()
+            .await
+            .context("Workboard's answer was cut short")?
+            .to_bytes();
+        Ok((status, bytes))
+    }
+
+    /// A new URL that pairs a browser with the service, with a code that
+    /// works once, for a few minutes: never the service's token.
+    pub async fn pairing_url(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Pairing {
+            urls: Vec<String>,
+        }
+        let pairing: Pairing = self
+            .call(Method::POST, "pairing", Some(serde_json::json!({})))
+            .await?;
+        let url = pairing
+            .urls
+            .into_iter()
+            .next()
+            .context("Workboard sent no pairing URL")?;
+        if !url.starts_with("http://127.0.0.1:") {
+            bail!("Workboard sent a pairing URL that isn't on this machine")
+        }
+        Ok(url)
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.call(reqwest::Method::GET, path, None).await
+        self.call(Method::GET, path, None).await
     }
 
     /// Everything the app shows.
@@ -498,7 +558,7 @@ impl Client {
     /// already run. The answer's per-connection results are in the board.
     pub async fn sync(&self, connection: Option<&str>) -> Result<()> {
         let body = serde_json::json!({ "connection": connection });
-        let _: serde_json::Value = self.call(reqwest::Method::POST, "sync", Some(body)).await?;
+        let _: serde_json::Value = self.call(Method::POST, "sync", Some(body)).await?;
         Ok(())
     }
 
@@ -510,7 +570,7 @@ impl Client {
         }
         let _: serde_json::Value = self
             .call(
-                reqwest::Method::POST,
+                Method::POST,
                 &format!("connections/{connection}/verify"),
                 Some(serde_json::json!({})),
             )
@@ -541,81 +601,98 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A one-request HTTP server on loopback that answers `status` and
-    /// `body`, and hands back the request it got.
-    async fn serve_once(
-        status: &'static str,
-        body: &'static str,
-    ) -> (u16, tokio::task::JoinHandle<String>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let task = tokio::spawn(async move {
+    /// An HTTP server on the Unix socket at `path`, for one connection,
+    /// that answers its requests in turn with `answers` (status, extra
+    /// header lines, body), and hands back the requests it got.
+    fn serve(
+        path: &Path,
+        answers: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0u8; 4096];
-            // Headers, then a body as long as Content-Length says.
-            loop {
-                let n = socket.read(&mut buf).await.unwrap();
-                request.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&request).to_string();
-                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                    let length = head
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length: ")
-                                .map(|v| v.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    if rest.len() >= length {
-                        break;
+            let mut seen = vec![];
+            let mut pending = Vec::new();
+            let last = answers.len().saturating_sub(1);
+            for (n, (status, extra, body)) in answers.into_iter().enumerate() {
+                // Headers, then a body as long as Content-Length says.
+                let request = loop {
+                    let text = String::from_utf8_lossy(&pending).to_string();
+                    if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if rest.len() >= length {
+                            let end = head.len() + 4 + length;
+                            let request = text[..end].to_string();
+                            pending.drain(..end);
+                            break Some(request);
+                        }
                     }
-                }
-                if n == 0 {
-                    break;
-                }
+                    let mut buf = [0u8; 4096];
+                    let read = socket.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break None;
+                    }
+                    pending.extend_from_slice(&buf[..read]);
+                };
+                let Some(request) = request else { break };
+                seen.push(request);
+                let connection = if n == last { "close" } else { "keep-alive" };
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: {connection}\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(answer.as_bytes()).await.unwrap();
             }
-            let answer = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(answer.as_bytes()).await.unwrap();
-            String::from_utf8(request).unwrap()
-        });
-        (port, task)
+            seen
+        })
     }
 
-    fn data_dir(token: Option<&str>) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        if let Some(token) = token {
-            std::fs::write(dir.path().join(TOKEN_FILE), token).unwrap();
-        }
-        dir
+    /// [`serve`], for one request: the request it got.
+    fn serve_once(
+        path: &Path,
+        status: &'static str,
+        body: &'static str,
+    ) -> tokio::task::JoinHandle<String> {
+        let server = serve(path, vec![(status, "", body)]);
+        tokio::spawn(async move { server.await.unwrap().remove(0) })
+    }
+
+    /// A data directory, a runtime directory, and a client of the service
+    /// on port 8421, whose socket would be at the path returned.
+    fn service() -> (tempfile::TempDir, tempfile::TempDir, Client, PathBuf) {
+        let data = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let client = Client::with_runtime(data.path().into(), 8421, Some(runtime.path().into()));
+        let socket = runtime.path().join(RUNTIME_DIR).join("service-8421.sock");
+        (data, runtime, client, socket)
     }
 
     #[tokio::test]
-    async fn sends_the_service_token_read_from_the_data_directory() {
-        let dir = data_dir(Some("secret-token\n"));
-        let (port, server) = serve_once("200 OK", r#"{"results":[]}"#).await;
-        let client = Client::with_runtime(dir.path().into(), port, None).unwrap();
+    async fn calls_the_service_on_its_socket_without_a_token() {
+        let (_data, _runtime, client, socket) = service();
+        let server = serve_once(&socket, "200 OK", r#"{"results":[]}"#);
         client.sync(Some("c1")).await.unwrap();
         let request = server.await.unwrap();
         assert!(
             request.starts_with("POST /api/sync HTTP/1.1\r\n"),
             "{request}"
         );
-        assert!(
-            request.contains("authorization: Bearer secret-token\r\n"),
-            "{request}"
-        );
+        assert!(!request.contains("authorization"), "{request}");
         assert!(request.ends_with(r#"{"connection":"c1"}"#), "{request}");
     }
 
     #[tokio::test]
     async fn verify_posts_to_the_connection() {
-        let dir = data_dir(Some("t"));
-        let (port, server) = serve_once("200 OK", "{}").await;
-        let client = Client::with_runtime(dir.path().into(), port, None).unwrap();
+        let (_data, _runtime, client, socket) = service();
+        let server = serve_once(&socket, "200 OK", "{}");
         client.verify("abc-123").await.unwrap();
         let request = server.await.unwrap();
         assert!(
@@ -628,104 +705,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_web_page_opens_with_a_one_time_pairing_url() {
+        let (_data, _runtime, client, socket) = service();
+        let server = serve_once(
+            &socket,
+            "200 OK",
+            r#"{"urls":["http://127.0.0.1:8421/#pair=one-time","https://hub.example.ts.net/#pair=one-time"],"expires_in":600}"#,
+        );
+        let url = client.pairing_url().await.unwrap();
+        assert_eq!(url, "http://127.0.0.1:8421/#pair=one-time");
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("POST /api/pairing HTTP/1.1\r\n"),
+            "{request}"
+        );
+        // Only ever a page on this machine.
+        let (_data, _runtime, client, socket) = service();
+        let _server = serve_once(
+            &socket,
+            "200 OK",
+            r#"{"urls":["https://elsewhere.example/"]}"#,
+        );
+        assert!(client.pairing_url().await.is_err());
+    }
+
+    #[tokio::test]
     async fn errors_say_what_to_do() {
-        // No token: the service never started with this data directory.
-        let dir = data_dir(None);
-        let client = Client::with_runtime(dir.path().into(), 1, None).unwrap();
+        // No socket: the service never started with this data directory.
+        let (data, _runtime, client, socket) = service();
         let error = client.sync(None).await.unwrap_err().to_string();
         assert!(error.contains("start `workboard serve`"), "{error}");
 
         // The service's own message is shown as it is.
-        let dir = data_dir(Some("t"));
-        let (port, _server) =
-            serve_once("400 Bad Request", r#"{"error":"Unknown connection"}"#).await;
-        let client = Client::with_runtime(dir.path().into(), port, None).unwrap();
+        let server = serve_once(
+            &socket,
+            "400 Bad Request",
+            r#"{"error":"Unknown connection"}"#,
+        );
         let error = client.sync(Some("x")).await.unwrap_err().to_string();
         assert_eq!(error, "Unknown connection");
+        server.await.unwrap();
 
         // Without one, the status.
-        let (port, _server) = serve_once("401 Unauthorized", "").await;
-        let client = Client::with_runtime(dir.path().into(), port, None).unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        let _server = serve_once(&socket, "401 Unauthorized", "");
         let error = client.sync(None).await.unwrap_err().to_string();
         assert!(error.contains("401"), "{error}");
 
-        // Nothing listening.
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let client = Client::with_runtime(dir.path().into(), port, None).unwrap();
+        // A socket nothing listens on, as a killed service leaves.
+        let gone = data.path().join("gone.sock");
+        drop(std::os::unix::net::UnixListener::bind(&gone).unwrap());
+        std::fs::write(
+            data.path().join(SOCKET_POINTER),
+            format!("{}\nkilled\n", gone.display()),
+        )
+        .unwrap();
+        let client = Client::with_runtime(data.path().into(), 8421, None);
         let error = client.sync(None).await.unwrap_err().to_string();
         assert!(error.starts_with("Cannot reach Workboard"), "{error}");
     }
 
-    /// A stale runtime copy, an earlier start's, is refused; the data
-    /// directory's token is tried next.
-    #[tokio::test]
-    async fn a_stale_runtime_token_falls_back_to_the_data_directory() {
-        let dir = data_dir(Some("current"));
-        let runtime = tempfile::tempdir().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::fs::create_dir(runtime.path().join(RUNTIME_DIR)).unwrap();
-        std::fs::write(
-            runtime
-                .path()
-                .join(RUNTIME_DIR)
-                .join(format!("service-{port}.token")),
-            "stale",
-        )
-        .unwrap();
-        let server = tokio::spawn(async move {
-            let mut seen = vec![];
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buf = vec![0u8; 8192];
-                let n = socket.read(&mut buf).await.unwrap();
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                let current = request.contains("authorization: Bearer current\r\n");
-                let (status, body) = if current {
-                    ("200 OK", r#"{"results":[]}"#)
-                } else {
-                    ("401 Unauthorized", r#"{"error":"Unauthorized"}"#)
-                };
-                let answer = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(answer.as_bytes()).await.unwrap();
-                seen.push(current);
-            }
-            seen
-        });
-        let client =
-            Client::with_runtime(dir.path().into(), port, Some(runtime.path().into())).unwrap();
-        client.sync(None).await.unwrap();
-        assert_eq!(server.await.unwrap(), [false, true]);
-    }
-
     #[test]
-    fn reads_the_runtime_copy_of_the_token_first() {
-        let dir = data_dir(Some("data-dir-token"));
-        let runtime = tempfile::tempdir().unwrap();
-        let client =
-            Client::with_runtime(dir.path().into(), 8421, Some(runtime.path().into())).unwrap();
-        // None there yet: the data directory's.
-        assert_eq!(client.token().unwrap(), "data-dir-token");
+    fn finds_the_socket_the_data_directory_names_else_by_port() {
+        let (data, runtime, client, socket) = service();
+        assert!(client.socket().is_err());
+        // Another port's is another service's.
         let published = runtime.path().join(RUNTIME_DIR);
         std::fs::create_dir(&published).unwrap();
-        // Another port's is another service's.
-        std::fs::write(published.join("service-8422.token"), "other").unwrap();
-        assert_eq!(client.token().unwrap(), "data-dir-token");
-        std::fs::write(published.join("service-8421.token"), "runtime-token\n").unwrap();
-        assert_eq!(client.token().unwrap(), "runtime-token");
+        std::fs::write(published.join("service-8422.sock"), "").unwrap();
+        assert!(client.socket().is_err());
+        // Without the data directory, as in the Flatpak: the port's.
+        std::fs::write(&socket, "").unwrap();
+        assert_eq!(client.socket().unwrap(), (socket.clone(), None));
+        // The data directory names it, and the service there, first.
+        let named = data.path().join("service.sock");
+        std::fs::write(
+            data.path().join(SOCKET_POINTER),
+            format!("{}\nthis-one\n", named.display()),
+        )
+        .unwrap();
+        assert_eq!(client.socket().unwrap(), (named, Some("this-one".into())));
+        // A name that isn't a path, or without an ID, is no socket.
+        let other = tempfile::tempdir().unwrap();
+        for text in ["relative.sock\nid\n", "/run/x.sock\n"] {
+            std::fs::write(other.path().join(SOCKET_POINTER), text).unwrap();
+            let client = Client::with_runtime(other.path().into(), 8421, None);
+            let error = client.socket().unwrap_err().to_string();
+            assert!(error.contains("start `workboard serve`"), "{error}");
+        }
+    }
 
-        let empty = data_dir(None);
-        let client =
-            Client::with_runtime(empty.path().into(), 8421, Some(runtime.path().join("none")))
-                .unwrap();
-        let error = client.token().unwrap_err().to_string();
-        assert!(error.contains("service-8421.token or "), "{error}");
+    /// A client whose data directory names its service's socket, with
+    /// the ID `this-one`, and that socket.
+    fn named() -> (tempfile::TempDir, Client, PathBuf) {
+        let data = tempfile::tempdir().unwrap();
+        let named = data.path().join("service.sock");
+        std::fs::write(
+            data.path().join(SOCKET_POINTER),
+            format!("{}\nthis-one\n", named.display()),
+        )
+        .unwrap();
+        let client = Client::with_runtime(data.path().into(), 8421, None);
+        (data, client, named)
+    }
+
+    #[tokio::test]
+    async fn another_service_on_the_named_socket_gets_no_request() {
+        let (_data, client, named) = named();
+        // It answers the ping with an ID of its own.
+        let server = serve(
+            &named,
+            vec![
+                (
+                    "200 OK",
+                    "X-Workboard-Instance: another\r\n",
+                    r#"{"ok":true}"#,
+                ),
+                (
+                    "200 OK",
+                    "X-Workboard-Instance: another\r\n",
+                    r#"{"results":[]}"#,
+                ),
+            ],
+        );
+        let error = client.sync(None).await.unwrap_err().to_string();
+        assert!(error.contains("isn't the one of"), "{error}");
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 1, "only the ping: {seen:?}");
+        assert!(
+            seen[0].starts_with("GET /api/ping HTTP/1.1\r\n"),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_named_service_gets_its_request_on_the_connection_it_answered() {
+        let (_data, client, named) = named();
+        let server = serve(
+            &named,
+            vec![
+                (
+                    "200 OK",
+                    "X-Workboard-Instance: this-one\r\n",
+                    r#"{"ok":true}"#,
+                ),
+                (
+                    "200 OK",
+                    "X-Workboard-Instance: this-one\r\n",
+                    r#"{"results":[]}"#,
+                ),
+            ],
+        );
+        client.sync(Some("c1")).await.unwrap();
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen[0].starts_with("GET /api/ping HTTP/1.1\r\n"),
+            "{seen:?}"
+        );
+        assert!(
+            seen[1].starts_with("POST /api/sync HTTP/1.1\r\n"),
+            "{seen:?}"
+        );
+        // Each says which service it is for, which another refuses.
+        for request in &seen {
+            assert!(
+                request.contains("x-workboard-expect-instance: this-one\r\n"),
+                "{request}"
+            );
+        }
     }
 
     #[test]

@@ -573,34 +573,19 @@ pub(crate) fn replace_secret(path: &std::path::Path, value: &str) -> Result<()> 
     std::fs::rename(&staged, path)?;
     Ok(())
 }
-/// Where in `$XDG_RUNTIME_DIR` the service also puts its token.
-const RUNTIME_DIR: &str = "workboard";
-
-/// The file in [`RUNTIME_DIR`] with the token of the service on `port`.
-/// One service listens on a port, so its token is the one there.
-fn runtime_token_name(port: u16) -> String {
-    format!("service-{port}.token")
-}
-
-/// Also put the token in the session's runtime directory, private to the
-/// user and gone at logout, so a sandboxed client such as the GNOME app's
-/// Flatpak can read it without access to the data directory, which holds
-/// the database and the credentials. Without a runtime directory, or if
-/// writing fails, clients read the data directory's copy.
-fn publish_token(port: u16, token: &str) {
-    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) else {
+/// Remove the copy of the token of the service on `port` that earlier
+/// versions put in the session's runtime directory for the GNOME app's
+/// Flatpak, which reaches the service through its socket now. Nothing reads
+/// it any more, and it is a credential.
+fn unpublish_token(port: u16) {
+    let Some(runtime) = crate::socket::runtime_dir() else {
         return;
     };
-    let dir = std::path::PathBuf::from(runtime).join(RUNTIME_DIR);
-    let path = dir.join(runtime_token_name(port));
-    let written = db::private_dir(&dir).and_then(|()| replace_secret(&path, token));
-    if let Err(e) = written {
-        // An earlier start's copy would be taken for this one's.
-        let _ = db::remove_if_there(&path);
-        eprintln!(
-            "Cannot put the service token in {}: {e:#}; clients read it from the data directory",
-            dir.display()
-        );
+    let path = runtime
+        .join(crate::socket::RUNTIME_DIR)
+        .join(format!("service-{port}.token"));
+    if let Err(e) = db::remove_if_there(&path) {
+        eprintln!("Cannot remove an earlier version's copy of the service token: {e:#}");
     }
 }
 /// A hub's companion token, made on its first start and kept.
@@ -1753,7 +1738,7 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         std::fs::remove_file(&path)?
     }
     db::write_secret(&path, &token)?;
-    publish_token(port, &token);
+    unpublish_token(port);
     let local = format!("127.0.0.1:{port}");
     let companion = match mode {
         Mode::Hub => Some(RwLock::new(companion_token_of(&root)?)),

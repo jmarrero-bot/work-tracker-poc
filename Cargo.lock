@@ -2859,10 +2859,13 @@ name = "workboard-gnome"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "gtk4",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libadwaita",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",

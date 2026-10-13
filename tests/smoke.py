@@ -53,8 +53,6 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
             time.sleep(.05)
         else: raise RuntimeError('Service did not start')
         token = (root / 'service.token').read_text().strip()
-        # A copy in the session's runtime directory, by port, for sandboxed
-        # clients, as private as the data directory's.
         # One service, or credentials migration, per data directory.
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
@@ -63,9 +61,10 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert second.returncode != 0 and 'Another Workboard service' in second.stderr, second
         migrating = subprocess.run(command + ['credentials', 'migrate', '--to', 'files'], capture_output=True, text=True)
         assert migrating.returncode != 0 and 'Another Workboard service' in migrating.stderr, migrating
-        published = runtime / 'workboard' / f'service-{port}.token'
-        assert published.read_text().strip() == token
-        assert published.stat().st_mode & 0o777 == 0o600 and published.parent.stat().st_mode & 0o777 == 0o700
+        # No copy of the token in the runtime directory: the GNOME app uses
+        # the socket.
+        assert not (runtime / 'workboard' / f'service-{port}.token').exists()
+        assert (runtime / 'workboard').stat().st_mode & 0o777 == 0o700
         # The CLI's private socket, by port in the runtime directory, which
         # the data directory names: this user's alone, and no token needed.
         unix_socket = runtime / 'workboard' / f'service-{port}.sock'
