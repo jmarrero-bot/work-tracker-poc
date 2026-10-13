@@ -1,5 +1,5 @@
 # Publishes the hub's image to ghcr.io for a `v*` tag, attests its build
-# provenance, and smoke-tests the pushed digest. atomic-setup pins that
+# provenance, and smoke-tests the pushed digest. Deployments pin that
 # digest; see docs/release.md.
 name: release
 
@@ -13,7 +13,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  # ghcr.io/OWNER/REPO, or the repository variable IMAGE_NAME in its place
+  # (lowercase, under the repository owner's namespace, which is where the
+  # job's token can push); see docs/run-your-own.md.
+  IMAGE: ghcr.io/${{ vars.IMAGE_NAME || github.repository }}
 
 jobs:
   publish:
@@ -91,8 +94,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           echo "Image=${IMAGE}@${DIGEST}"
-          printf '%s\n' "## ${TAG}" '' 'For the quadlet in atomic-setup:' '' '```' "Image=${IMAGE}@${DIGEST}" '```' >> "${GITHUB_STEP_SUMMARY}"
-      # atomic-setup pulls the image without credentials, so the package
+          printf '%s\n' "## ${TAG}" '' 'For the deployment to pin:' '' '```' "Image=${IMAGE}@${DIGEST}" '```' >> "${GITHUB_STEP_SUMMARY}"
+      # Deployments pull the image without credentials, so the package
       # must stay public; only the web UI changes that (docs/release.md).
       - name: Check that anyone can pull it
         env:
