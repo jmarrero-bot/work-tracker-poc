@@ -167,7 +167,6 @@ Live source requests only read: GET, and for GitHub, GraphQL queries checked as 
 
 ## References
 
-- https://github.com/jmarrero/atomic-setup/tree/main/bot
 - https://docs.gitlab.com/api/merge_requests/
 - https://docs.gitlab.com/security/tokens/access_token_scopes/
 - https://developer.atlassian.com/server/jira/platform/personal-access-token/
