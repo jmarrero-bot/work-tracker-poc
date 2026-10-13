@@ -1,4 +1,8 @@
 # Build: flatpak-builder --user --install --force-clean build-dir gnome/io.github.jmarrero_bot.Workboard.yml
+#
+# A build of your own: copy this file next to it as YOUR.APP.ID.yml and
+# change `id` below. The build takes the app ID from there (FLATPAK_ID),
+# so nothing else changes (see docs/run-your-own.md).
 id: io.github.jmarrero_bot.Workboard
 runtime: org.gnome.Platform
 runtime-version: '50'
@@ -32,8 +36,7 @@ modules:
   - name: workboard-gnome
     buildsystem: simple
     build-commands:
-      - cargo build --release --locked -p workboard-gnome
-      - make -C gnome install PREFIX=/app
+      - make -C gnome install PREFIX=/app APP_ID="$FLATPAK_ID"
     sources:
       - type: dir
         path: ..

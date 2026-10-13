@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A GNOME companion app for the local Workboard service"
+repository = "https://github.com/jmarrero-bot/work-tracker-poc"
 # The version libadwaita-rs 0.9 and gtk4-rs 0.11 need.
 rust-version = "1.92"
 
