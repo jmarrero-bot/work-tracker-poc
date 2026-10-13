@@ -324,6 +324,7 @@ mod tests {
             // Not exported either: which plugin file it trusts.
             plugin: Some(crate::model::PluginConfig {
                 sha256: Some(format!("{INTERNAL}-sha256")),
+                env: vec![format!("{INTERNAL}-variable")],
             }),
         }
     }

@@ -1,11 +1,14 @@
 //! Third-party connectors: executables that speak the plugin protocol in
 //! `docs/plugins.md` over standard input and output, one process per call.
 //! A plugin gets the credential on standard input only, an environment with
-//! nothing but `PATH` and `LANG`, and a time limit, after which its whole
+//! nothing but `PATH`, `LANG`, a private, empty `HOME` of its run's own,
+//! `PYTHONNOUSERSITE`, and the proxy, CA bundle and time zone variables its
+//! connection allows, and a time limit, after which its whole
 //! process group is killed. Only a file owned by the user and writable by
 //! nobody else is run, only while it hashes to the SHA-256 its connection
 //! trusts, and on Linux exactly the file that was checked and hashed.
 
+use super::check_plugin_env;
 use crate::connector::{
     Account, BoxFuture, Connector, ConnectorError, ConnectorResult, ErrorKind, Refreshed,
     RemoteItem, Target, Tracked, PROTOCOL_VERSION,
@@ -18,6 +21,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::{
+    ffi::OsString,
     fs::{self, File},
     io::{Read, Seek},
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -30,9 +34,43 @@ use tokio::{
     process::Command,
 };
 
-/// The whole environment of a plugin. Credentials never go through it.
+/// The environment of every plugin, besides what its connection allows.
+/// Credentials never go through it.
 const PLUGIN_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const PLUGIN_LANG: &str = "C.UTF-8";
+/// Keeps Python from adding the user's site-packages to its path, which
+/// it would otherwise find from the password database even with `HOME`
+/// pointing elsewhere: code there would run in a plugin, unpinned.
+const PYTHON_NO_USER_SITE: (&str, &str) = ("PYTHONNOUSERSITE", "1");
+/// What starts the name of a run's private home, in the temporary
+/// directory.
+const HOME_PREFIX: &str = "workboard-plugin-home-";
+
+/// A plugin run's own home: a new, empty directory only this user can
+/// enter, removed with whatever the run left in it when dropped. So a
+/// plugin that wants a `HOME` has one, and no dotfile in the service's
+/// home (`.curlrc`, `.gitconfig`, a shell's startup files) can change
+/// what it runs.
+struct PrivateHome(PathBuf);
+
+impl PrivateHome {
+    fn new() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let path =
+            std::env::temp_dir().join(format!("{HOME_PREFIX}{}", uuid::Uuid::new_v4().simple()));
+        // A new directory, never one that was there: creating it fails if
+        // anything has the name.
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for PrivateHome {
+    fn drop(&mut self) {
+        // It doesn't follow links the plugin left in it.
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 /// Largest answer read from a plugin, in bytes.
 const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 /// Longest error message kept from a plugin, in characters.
@@ -87,6 +125,9 @@ pub struct Plugin {
     /// while its file hashes to it. None for a connection that trusts no
     /// file yet, whose plugin doesn't run.
     pinned: Option<String>,
+    /// Variables of the service's environment it gets, with their values,
+    /// as its connection allows them.
+    env: Vec<(String, OsString)>,
 }
 
 /// Open the plugin at `program` and check what was opened: a regular file,
@@ -193,12 +234,14 @@ impl Plugin {
     /// The plugin at `program`, whose item IDs are namespaced by `kind`.
     /// Only an absolute path is run, never one looked up in `PATH`, only a
     /// file that passes [`open_checked`], and only while it hashes to
-    /// `pinned`.
+    /// `pinned`. It gets the variables in `env` besides `PATH` and `LANG`,
+    /// if [`check_plugin_env`] allows their names.
     pub fn new(
         kind: &str,
         program: &Path,
         timeout: Duration,
         pinned: Option<String>,
+        env: Vec<(String, OsString)>,
     ) -> Result<Self> {
         let valid_kind = !kind.is_empty()
             && kind.len() <= 64
@@ -211,12 +254,17 @@ impl Plugin {
         if !program.is_absolute() {
             bail!("A plugin is run by its absolute path")
         }
+        let names: Vec<String> = env.iter().map(|(name, _)| name.clone()).collect();
+        if check_plugin_env(&names)?.len() != env.len() {
+            bail!("A plugin gets each variable once")
+        }
         open_checked(program)?;
         Ok(Self {
             kind: kind.into(),
             program: program.into(),
             timeout,
             pinned,
+            env,
         })
     }
 
@@ -253,8 +301,8 @@ impl Plugin {
     }
 
     /// The command that runs the opened plugin `file`, in a process group
-    /// of its own.
-    fn command(&self, file: &File) -> Command {
+    /// of its own, with `home` as its home.
+    fn command(&self, file: &File, home: &Path) -> Command {
         #[cfg(target_os = "linux")]
         let mut command = {
             let fd = file.as_raw_fd();
@@ -284,8 +332,11 @@ impl Plugin {
         };
         command
             .env_clear()
+            .envs(self.env.iter().map(|(name, value)| (name, value)))
             .env("PATH", PLUGIN_PATH)
             .env("LANG", PLUGIN_LANG)
+            .env("HOME", home)
+            .env(PYTHON_NO_USER_SITE.0, PYTHON_NO_USER_SITE.1)
             .current_dir("/")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -315,6 +366,19 @@ impl Plugin {
             items,
         })
         .map_err(ConnectorError::invalid)?;
+        // An allowed variable that holds the credential anyway, as a proxy
+        // address with it as its password would, is never passed on.
+        let credential = target.credential.expose().as_bytes();
+        if let Some((name, _)) = self.env.iter().find(|(_, value)| {
+            value
+                .as_encoded_bytes()
+                .windows(credential.len())
+                .any(|w| w == credential)
+        }) {
+            return Err(self.invalid(&format!(
+                "was not run: {name}, which its connection passes on, holds the connection's credential"
+            )));
+        }
         let file = open_checked(&self.program)
             .map_err(|e| self.invalid(&format!("cannot be run: {e:#}")))?;
         self.check_pin(&file)?;
@@ -341,8 +405,12 @@ impl Plugin {
     /// Run the opened plugin `file` with `request` on its standard input,
     /// and read its answer.
     async fn run(&self, file: File, request: &[u8]) -> ConnectorResult<Response> {
+        // Declared first, so it is removed last, once the plugin's whole
+        // group is gone.
+        let home = PrivateHome::new()
+            .map_err(|e| self.invalid(&format!("has no private home to run in: {e}")))?;
         let mut child = self
-            .command(&file)
+            .command(&file, &home.0)
             .spawn()
             .map_err(|e| self.invalid(&format!("cannot be started: {e}")))?;
         drop(file);
@@ -470,7 +538,7 @@ mod tests {
     /// The plugin at `path`, trusted as it is now.
     fn pinned(path: &Path, timeout: Duration) -> Plugin {
         let sha256 = sha256_of(path).unwrap();
-        Plugin::new("fake-forge", path, timeout, Some(sha256)).unwrap()
+        Plugin::new("fake-forge", path, timeout, Some(sha256), vec![]).unwrap()
     }
     fn target(base_url: &str, credential: &str) -> Target {
         Target::new(base_url, credential).unwrap()
@@ -668,12 +736,19 @@ mod tests {
     #[test]
     fn only_trusted_executables_are_plugins() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
-        assert!(Plugin::new("Fake Forge", &script, DEFAULT_TIMEOUT, None).is_err());
-        assert!(Plugin::new("fake-forge", Path::new("fake-forge"), DEFAULT_TIMEOUT, None).is_err());
+        assert!(Plugin::new("Fake Forge", &script, DEFAULT_TIMEOUT, None, vec![]).is_err());
+        assert!(Plugin::new(
+            "fake-forge",
+            Path::new("fake-forge"),
+            DEFAULT_TIMEOUT,
+            None,
+            vec![]
+        )
+        .is_err());
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
         let error = |name: &str| {
-            Plugin::new("fake-forge", &dir.join(name), DEFAULT_TIMEOUT, None)
+            Plugin::new("fake-forge", &dir.join(name), DEFAULT_TIMEOUT, None, vec![])
                 .err()
                 .map(|e| format!("{e:#}"))
         };
@@ -690,6 +765,61 @@ mod tests {
         // A directory others can write to could have the file replaced.
         fs::set_permissions(dir, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(error("plugin").unwrap().contains("plugin directory"));
+    }
+
+    #[tokio::test]
+    async fn a_plugin_gets_only_the_variables_its_connection_allows() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
+        let sha256 = sha256_of(&path).unwrap();
+        let plugin = |env: &[(&str, &str)]| {
+            let env = env
+                .iter()
+                .map(|(name, value)| (name.to_string(), OsString::from(value)))
+                .collect();
+            Plugin::new(
+                "fake-forge",
+                &path,
+                DEFAULT_TIMEOUT,
+                Some(sha256.clone()),
+                env,
+            )
+        };
+        let target = target("https://env.example/", "test-only-token");
+        // Whatever this process has, such as HOME, stays out.
+        let account = plugin(&[]).unwrap().verify(&target).await.unwrap();
+        assert_eq!(account.name, "nothing else");
+        let allowed = [
+            ("HTTPS_PROXY", "http://proxy.example:3128"),
+            ("SSL_CERT_FILE", "/etc/pki/tls/certs/ca-bundle.crt"),
+        ];
+        let account = plugin(&allowed).unwrap().verify(&target).await.unwrap();
+        assert_eq!(
+            account.name,
+            "HTTPS_PROXY=http://proxy.example:3128;SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt"
+        );
+        // PATH, LANG and HOME stay Workboard's own, and nothing else is
+        // allowed but what is known to be safe.
+        for name in ["PATH", "HOME", "LD_PRELOAD", "PYTHONPATH", "GH_TOKEN"] {
+            assert!(plugin(&[(name, "x")]).is_err(), "{name}");
+        }
+        // Its home is a new, empty directory of its own, which goes with
+        // the run (the script checks the rest).
+        let home = plugin(&[])
+            .unwrap()
+            .verify(&Target::new("https://home.example/", "test-only-token").unwrap())
+            .await
+            .unwrap()
+            .name;
+        let prefix = std::env::temp_dir().join(HOME_PREFIX);
+        assert!(home.starts_with(prefix.to_str().unwrap()), "{home}");
+        assert!(!Path::new(&home).exists(), "{home} outlived its run");
+        // An allowed variable holding the credential anyway isn't passed,
+        // and the plugin isn't run.
+        let leaky = plugin(&[("HTTPS_PROXY", "http://me:test-only-token@proxy.example")]);
+        let error = leaky.unwrap().verify(&target).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Invalid, "{error}");
+        assert!(error.message.contains("HTTPS_PROXY"), "{error}");
+        assert!(!error.message.contains("test-only-token"), "{error}");
     }
 
     #[cfg(target_os = "linux")]
@@ -739,7 +869,13 @@ mod tests {
         // As `sha256sum` prints it.
         assert_eq!(trusted.len(), 64);
         assert!(trusted.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
-        let plugin = Plugin::new("fake-forge", &path, DEFAULT_TIMEOUT, Some(trusted.clone()));
+        let plugin = Plugin::new(
+            "fake-forge",
+            &path,
+            DEFAULT_TIMEOUT,
+            Some(trusted.clone()),
+            vec![],
+        );
         let plugin = plugin.unwrap();
         assert_eq!(plugin.verify(&target).await.unwrap().id, "42");
         // Another file in its place, which would leave a mark if it ran,
@@ -765,13 +901,14 @@ mod tests {
         assert!(error.message.contains("workboard plugin trust"), "{error}");
         assert!(!ran.exists(), "the changed plugin ran");
         // So is any file, for a connection that trusts none yet.
-        let unpinned = Plugin::new("fake-forge", &path, DEFAULT_TIMEOUT, None).unwrap();
+        let unpinned = Plugin::new("fake-forge", &path, DEFAULT_TIMEOUT, None, vec![]).unwrap();
         let error = unpinned.verify(&target).await.unwrap_err();
         assert_eq!(error.kind, ErrorKind::Auth, "{error}");
         assert!(error.message.contains("trusts no plugin file"), "{error}");
         assert!(!ran.exists(), "an untrusted plugin ran");
         // Trusting the new file runs it.
-        let plugin = Plugin::new("fake-forge", &path, DEFAULT_TIMEOUT, Some(swapped)).unwrap();
+        let plugin =
+            Plugin::new("fake-forge", &path, DEFAULT_TIMEOUT, Some(swapped), vec![]).unwrap();
         assert_eq!(plugin.verify(&target).await.unwrap().name, "other");
         assert!(ran.exists());
     }

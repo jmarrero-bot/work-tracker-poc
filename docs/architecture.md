@@ -21,7 +21,7 @@ Every client operates on the same API: the page, the CLI and the GNOME app ([gno
 
 ## Model
 
-- **Connection:** UUID, provider, canonical base URL, stable remote account ID, display name, zone, its own sync interval if it has one, for GitHub, optionally another user it watches, for the bot, where its board, tracker and heartbeat are, and for a plugin, the SHA-256 of the plugin file it trusts. The secret is separate from this record, and so is its sync state.
+- **Connection:** UUID, provider, canonical base URL, stable remote account ID, display name, zone, its own sync interval if it has one, for GitHub, optionally another user it watches, for the bot, where its board, tracker and heartbeat are, and for a plugin, the SHA-256 of the plugin file it trusts and which variables of the service's environment the plugin gets. The secret is separate from this record, and so is its sync state.
 - **Sync state:** per connection, in its own table: when its last successful sync started, its last attempt, when its next scheduled sync is due, its failures in a row, the kind and message of its last error, and until when its source asked to wait. It is written in the same transaction as what a sync found.
 - **Item:** local ID namespaced by connection, remote identity, source URL, unmodified source status, derived outcome and the reason for it, attention category, the reasons it waits on the account (if it does), source update time, optional effort, its connection's zone, and for the bot's items, the board's fields or the board item that links a fork pull request. When shown, a synced item also carries its connection's last success and whether that is stale. Manually added items have no connection and are internal.
 - **Settings:** the data directory's mode, local or hub, recorded the first time a service opens it.
@@ -140,7 +140,7 @@ All `/api` routes require the local application's bearer credential, a browser s
 | `GET /api/mine` | What waits on each connection's account, and apart from it what watching found |
 | `GET /api/bot` | Each bot connection: its board's counts, its heartbeat's agent runs, and links that ask it for something |
 | `POST /api/connections` | Verify an account and store its credential |
-| `PATCH /api/connections/:id` | Watch another GitHub user from a connection, or stop; change how often it syncs (`sync_interval` in seconds, null for the default) |
+| `PATCH /api/connections/:id` | Watch another GitHub user from a connection, or stop; change how often it syncs (`sync_interval` in seconds, null for the default); for a plugin, which variables of the service's environment it gets (`plugin_env`) |
 | `POST /api/connections/:id/verify` | Check a connection's credential again, or replace it (`token`) with one for the same account; resumes its scheduled syncs |
 | `GET /api/connections/:id/plugin` | Which plugin file a plugin connection trusts, and what its plugin hashes to now (SHA-256) |
 | `POST /api/connections/:id/plugin` | Trust the plugin file with this SHA-256 (`sha256`), if the plugin still hashes to it, and verify the connection |

@@ -87,7 +87,8 @@ pub struct Shared {
     forgejo: Arc<forgejo::Memory>,
 }
 
-/// A plugin connection's own settings: which plugin file it trusts.
+/// A plugin connection's own settings: which plugin file it trusts, and
+/// which variables of the service's environment its plugin gets.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// The SHA-256 of the plugin executable the person trusts, as
@@ -98,6 +99,79 @@ pub struct PluginConfig {
     /// pinned, whose plugin doesn't run until the person trusts one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Names of variables of the service's environment the plugin gets
+    /// besides `PATH` and `LANG`, such as a proxy's or a CA bundle's, as
+    /// [`check_plugin_env`] allows them. Set by the person, never by the
+    /// plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+}
+
+/// The variables of the service's environment a plugin may get, if its
+/// connection allows them by name, and no others. Each says only how to
+/// reach the network, which certificates to trust, or the time zone, and
+/// is read as data: none names a program, library, startup file or
+/// configuration that an interpreter or a tool would run or load, as
+/// `LD_PRELOAD`, `PYTHONPATH`, `BASH_ENV`, `DOTNET_STARTUP_HOOKS`,
+/// `GIT_SSH_COMMAND`, `SSH_ASKPASS` or `XDG_CONFIG_HOME` do, and none holds
+/// or reaches a credential, as `GH_TOKEN`, `SSH_AUTH_SOCK`, `NETRC` or
+/// `KUBECONFIG` do. A list of what is safe keeps up where one of what isn't
+/// can't.
+///
+/// - The proxies, in both cases, since tools differ in which they read:
+///   where requests go, and which hosts go direct. A proxy's password in
+///   its address is refused at run time like the credential.
+/// - CA bundles, by the names OpenSSL, Python's requests, curl, Node.js and
+///   git read: files of certificates to trust.
+/// - `TZ`: a time zone, or a time zone file to read.
+///
+/// Not `LANG` or `LC_*`: `LANG` is Workboard's own, and glibc takes a path
+/// for a locale name, loading locale data from wherever it points. Not
+/// `HOME`: a plugin gets a private, empty home of its own run's instead,
+/// since dotfiles there (`.curlrc`, `.gitconfig`, a shell's startup files,
+/// Python's user site-packages) would run or configure code the pin
+/// doesn't cover.
+pub const PLUGIN_ENV_ALLOWED: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "TZ",
+];
+
+/// Check the names of the variables a plugin may get from the service's
+/// environment, and return them sorted, each once. Only the names in
+/// [`PLUGIN_ENV_ALLOWED`] are: anything else is refused, saying which are.
+pub fn check_plugin_env(names: &[String]) -> Result<Vec<String>> {
+    let mut checked = Vec::new();
+    for name in names {
+        if !PLUGIN_ENV_ALLOWED.contains(&name.as_str()) {
+            let why = match name.as_str() {
+                "PATH" | "LANG" => "Workboard sets it for every plugin",
+                "HOME" => "every run gets a private, empty home of its own",
+                _ => "it could make the plugin run or load code its pin doesn't cover, or reach a credential",
+            };
+            bail!(
+                "A plugin can't get {name:?} from the service's environment: {why}. It may get only {}",
+                PLUGIN_ENV_ALLOWED.join(", ")
+            )
+        }
+        checked.push(name.clone());
+    }
+    checked.sort();
+    checked.dedup();
+    Ok(checked)
 }
 
 /// What a connector is built from besides its provider: its connection's
@@ -191,11 +265,19 @@ fn plugin(
     program: &Path,
     config: Option<&PluginConfig>,
 ) -> Result<Box<dyn Connector>> {
+    // What the service's environment holds now, of what the connection
+    // allows: an unset variable stays unset.
+    let names = check_plugin_env(config.map_or(&[], |c| &c.env))?;
+    let env = names
+        .into_iter()
+        .filter_map(|name| std::env::var_os(&name).map(|value| (name, value)))
+        .collect();
     Ok(Box::new(plugin::Plugin::new(
         provider,
         program,
         plugin::DEFAULT_TIMEOUT,
         config.and_then(|c| c.sha256.clone()),
+        env,
     )?))
 }
 
@@ -413,6 +495,74 @@ mod tests {
             "https://example.com/jira/"
         );
         assert!(source_url("javascript:alert(1)").is_err());
+    }
+    #[test]
+    fn plugin_environment_allowlists_are_checked() {
+        let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let checked = check_plugin_env(&names(PLUGIN_ENV_ALLOWED)).unwrap();
+        assert_eq!(checked.len(), PLUGIN_ENV_ALLOWED.len());
+        assert!(checked.is_sorted());
+        assert_eq!(
+            check_plugin_env(&names(&["NO_PROXY", "TZ", "NO_PROXY"])).unwrap(),
+            names(&["NO_PROXY", "TZ"])
+        );
+        // Everything else, whatever it is: what runs or loads code, what
+        // holds or reaches a credential, and what only looks harmless.
+        for name in [
+            "",
+            "A=B",
+            "PATH",
+            "LANG",
+            "lang",
+            "HOME",
+            "LC_ALL",
+            "TMPDIR",
+            "LD_PRELOAD",
+            "ld_preload",
+            "DYLD_INSERT_LIBRARIES",
+            "GLIBC_TUNABLES",
+            "GCONV_PATH",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PERL5LIB",
+            "RUBYOPT",
+            "NODE_OPTIONS",
+            "JAVA_TOOL_OPTIONS",
+            "DOTNET_STARTUP_HOOKS",
+            "CORECLR_PROFILER_PATH",
+            "ELECTRON_RUN_AS_NODE",
+            "BASH_ENV",
+            "ENV",
+            "ZDOTDIR",
+            "VIMINIT",
+            "BROWSER",
+            "SSH_ASKPASS",
+            "SUDO_ASKPASS",
+            "GIT_SSH_COMMAND",
+            "OPENSSL_CONF",
+            "XDG_CONFIG_HOME",
+            "GNUPGHOME",
+            "KUBECONFIG",
+            "DOCKER_HOST",
+            "NETRC",
+            "PGPASSFILE",
+            "MYSQL_PWD",
+            "DATABASE_URL",
+            "GH_TOKEN",
+            "WORKBOARD_ERRATA_TOKEN",
+            "SSH_AUTH_SOCK",
+            "KRB5CCNAME",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "Https_Proxy",
+        ] {
+            let error = check_plugin_env(&names(&["TZ", name]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("HTTPS_PROXY, ALL_PROXY"), "{name}: {error}");
+        }
+        let home = check_plugin_env(&names(&["HOME"])).unwrap_err().to_string();
+        assert!(home.contains("private, empty home"), "{home}");
     }
     #[test]
     fn waits_are_capped() {

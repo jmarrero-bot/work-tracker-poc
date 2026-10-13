@@ -124,6 +124,12 @@ enum Command {
         sync_interval: Option<Duration>,
         #[command(flatten)]
         bot: BotArgs,
+        /// For a connector plugin: also pass it this variable of the
+        /// service's environment: a proxy's (HTTPS_PROXY, NO_PROXY, ...), a
+        /// CA bundle's (SSL_CERT_FILE, ...) or TZ, and nothing else. Repeat
+        /// it for more.
+        #[arg(long = "plugin-env", value_name = "NAME")]
+        plugin_env: Vec<String>,
     },
     /// List connection identities and sync health: when each last synced,
     /// when it syncs next, and whether it needs you.
@@ -342,6 +348,19 @@ enum PluginCommand {
         #[arg(long, value_name = "SHA256")]
         sha256: Option<String>,
     },
+    /// Show which variables of the service's environment a connection's
+    /// plugin gets, or replace them with NAMEs: only a proxy's
+    /// (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY, in either case), a CA
+    /// bundle's (SSL_CERT_FILE, SSL_CERT_DIR, REQUESTS_CA_BUNDLE,
+    /// CURL_CA_BUNDLE, NODE_EXTRA_CA_CERTS, GIT_SSL_CAINFO, GIT_SSL_CAPATH)
+    /// or TZ.
+    Env {
+        connection: String,
+        names: Vec<String>,
+        /// Pass none.
+        #[arg(long, conflicts_with = "names")]
+        clear: bool,
+    },
 }
 #[derive(Subcommand)]
 enum GithubAppCommand {
@@ -557,6 +576,7 @@ async fn main() -> Result<()> {
             watch_user,
             sync_interval,
             bot,
+            plugin_env,
         } => {
             let token = read_token(token_env, token_stdin)?.ok_or_else(|| {
                 anyhow!("Use --token-stdin or --token-env NAME. Tokens are never command-line arguments.")
@@ -574,6 +594,7 @@ async fn main() -> Result<()> {
                 watch_user,
                 sync_interval: sync_interval.map(|i| i.as_secs()),
                 bot: bot.input()?,
+                plugin_env,
             };
             let c: Connection = request(
                 &client,
@@ -1139,6 +1160,52 @@ async fn main() -> Result<()> {
         Command::Plugin {
             command: PluginCommand::Trust { connection, sha256 },
         } => trust_plugin(&client, &root, args.port, &connection, sha256).await?,
+        Command::Plugin {
+            command:
+                PluginCommand::Env {
+                    connection,
+                    names,
+                    clear,
+                },
+        } => {
+            let path = format!("connections/{connection}");
+            let c: Connection = if names.is_empty() && !clear {
+                let snapshot: SnapshotClient = request(
+                    &client,
+                    &root,
+                    args.port,
+                    reqwest::Method::GET,
+                    "snapshot",
+                    None,
+                )
+                .await?;
+                snapshot
+                    .connections
+                    .into_iter()
+                    .find(|c| c.id == connection)
+                    .context("Connection not found")?
+            } else {
+                request(
+                    &client,
+                    &root,
+                    args.port,
+                    reqwest::Method::PATCH,
+                    &path,
+                    Some(serde_json::json!({ "plugin_env": names })),
+                )
+                .await?
+            };
+            match c.plugin.as_ref().map(|p| p.env.join(", ")) {
+                Some(env) if !env.is_empty() => println!(
+                    "{}'s plugin gets {env} from the service's environment, besides PATH and LANG",
+                    c.label
+                ),
+                _ => println!(
+                    "{}'s plugin gets nothing from the service's environment but PATH and LANG",
+                    c.label
+                ),
+            }
+        }
         Command::Serve { .. } | Command::GithubApp { .. } | Command::Credentials { .. } => {
             unreachable!()
         }

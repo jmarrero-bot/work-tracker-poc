@@ -49,11 +49,37 @@ Workboard runs a plugin:
 
 - only if it is a regular file, not a symbolic link, owned by the user running Workboard and not writable by its group or others, in a directory that is the same, and only while it hashes to the SHA-256 its connection trusts. On Linux, Workboard opens the file, checks it and hashes it through the open descriptor, and runs that descriptor (`/proc/self/fd/N`), so the file checked and hashed is the file run even if the path is replaced in between. Rewriting the same file in place after it was hashed takes its owner, the user Workboard runs as. Elsewhere Workboard runs the path again, and only those ownership checks keep it from being swapped after it was hashed;
 - by its absolute path, never one looked up in `PATH`;
-- with no arguments, `/` as its working directory, and an environment of only `PATH=/usr/local/bin:/usr/bin:/bin` and `LANG=C.UTF-8`. There is no `HOME`, no proxy variables such as `HTTPS_PROXY`, and no CA bundle variables such as `SSL_CERT_FILE`, so a plugin that needs them has to find them on its own for now;
+- with no arguments, `/` as its working directory, and an environment of only `PATH=/usr/local/bin:/usr/bin:/bin`, `LANG=C.UTF-8`, `PYTHONNOUSERSITE=1`, a private, empty `HOME` of its run's own, and the proxy, CA bundle and time zone variables its connection allows (below);
 - with its standard error discarded, since a plugin's own diagnostics could echo the credential;
 - in a process group of its own, which is killed when the call ends, so a helper it started can't outlive the call;
 - for at most 120 seconds per call. After that it is killed and the call fails as `transient`. Meanwhile only its own connection waits: other connections sync on their own;
 - reading at most 16 MiB of its answer.
+
+## The plugin's environment
+
+A plugin gets `PATH=/usr/local/bin:/usr/bin:/bin`, `LANG=C.UTF-8`, `PYTHONNOUSERSITE=1`, and a `HOME` of its own: a new, empty directory in the temporary directory that only you can enter, made for each run and removed with whatever the run left in it once the plugin's process group is gone. It never gets the service's `HOME`, since dotfiles there (`.curlrc`, `.gitconfig`, a shell's startup files) or Python's user site-packages would change what it runs; `PYTHONNOUSERSITE` keeps Python from finding those through the password database instead.
+
+Nothing else of the service's environment reaches a plugin unless its connection allows it by name, and only these names can be allowed:
+
+| Names | What they are |
+| --- | --- |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, and `http_proxy`, `https_proxy`, `all_proxy`, `no_proxy` | Where requests go, and which hosts go direct. Both cases, since tools differ in which they read. |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `GIT_SSL_CAPATH` | The certificates to trust, by the names OpenSSL, Python's requests, curl, Node.js and git read. |
+| `TZ` | The time zone. |
+
+Each is read as data: none names a program, library, startup file or configuration that an interpreter or a tool runs or loads, and none holds or reaches a credential. Every other name is refused, with the list above, because a list of what is known to be harmful can't keep up: `LD_PRELOAD`, `PYTHONPATH`, `DOTNET_STARTUP_HOOKS`, `BASH_ENV`, `GIT_SSH_COMMAND`, `SSH_ASKPASS` or `XDG_CONFIG_HOME` would run code the pin doesn't cover, and `GH_TOKEN`, `SSH_AUTH_SOCK`, `NETRC` or `KUBECONFIG` would hand over a credential. `LC_*` isn't allowed either, since glibc takes a path for a locale name and loads locale data from wherever it points; `LANG` stays Workboard's own.
+
+The connection's list is set by the person, never by the plugin:
+
+```sh
+workboard connect errata --url https://errata.example.com/ --token-env WORKBOARD_ERRATA_TOKEN \
+  --plugin-env HTTPS_PROXY --plugin-env NO_PROXY --plugin-env SSL_CERT_FILE
+workboard plugin env CONNECTION_ID HTTPS_PROXY NO_PROXY TZ    # replaces the list
+workboard plugin env CONNECTION_ID                            # shows it
+workboard plugin env CONNECTION_ID --clear                    # none
+```
+
+The API takes the same as `plugin_env`, a list of names, when connecting (`POST /api/connections`) and later (`PATCH /api/connections/:id`). A name that isn't allowed is refused, and nothing is saved. Each run passes the values the service's environment holds then; a variable the service doesn't have stays unset. The credential still reaches a plugin only on standard input: a run is refused when an allowed variable holds the connection's credential anyway, as a proxy address with it as the password would.
 
 An error message from a plugin is shown after the plugin's name, with any copy of the credential replaced by `[redacted]`, without control characters, and cut at 500 characters. An item that contains the credential is refused.
 

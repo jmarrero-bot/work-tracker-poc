@@ -238,6 +238,10 @@ pub struct ConnectInput {
     /// are.
     #[serde(default)]
     pub bot: Option<BotInput>,
+    /// For a source served by a connector plugin: the variables of the
+    /// service's environment the plugin gets, by name.
+    #[serde(default)]
+    pub plugin_env: Vec<String>,
 }
 
 /// The items a connection found by watching another user, as of its last
