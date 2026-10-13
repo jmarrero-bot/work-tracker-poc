@@ -35,10 +35,10 @@ Then connect its sources, always as external, with the same CLI on the same data
 
 ```sh
 export WB='workboard --data-dir ~/.local/share/workboard-hub'
-$WB connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user jmarrero
+$WB connect github --url https://github.com/ --external --token-env GH_TOKEN --watch-user YOUR_LOGIN
 $WB connect fedora --url https://forge.fedoraproject.org/ --external --token-env FEDORA_TOKEN
-$WB connect bot --url https://github.com/ --external --token-env GH_TOKEN --board orgs/jmarrero-forge/1 \
-  --tracker jmarrero-forge/tracker --heartbeat 1 --bot-login jmarrero-bot --forge-org jmarrero-forge
+$WB connect bot --url https://github.com/ --external --token-env GH_TOKEN --board orgs/ORG/NUMBER \
+  --tracker OWNER/REPO --heartbeat ISSUE --bot-login BOT_LOGIN --forge-org FORGE_ORG
 ```
 
 Open `https://bot.tail1234.ts.net/` and sign in with GitHub (or, with `--pairing`, open the pairing URL the hub printed for its tailnet name). Without the App, print the companion token for the laptop:

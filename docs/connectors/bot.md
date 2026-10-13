@@ -4,12 +4,12 @@ The `bot` connector shows what a harness bot, such as jmarrero-bot, works on: th
 
 ## Connect it
 
-Nothing about the bot is assumed: each part is given when connecting. jmarrero's values are what `bot-operator --json` says on the bot's machine:
+Nothing about the bot is assumed, and nothing has a default: each part is given when connecting, so anyone can connect their own bot. For a homegit harness, `bot-operator --json` on the bot's machine says what they are:
 
 ```sh
 workboard connect bot --url https://github.com/ --external --token-env GH_TOKEN \
-  --board orgs/jmarrero-forge/1 --tracker jmarrero-forge/tracker --heartbeat 1 \
-  --bot-login jmarrero-bot --forge-org jmarrero-forge
+  --board orgs/ORG/NUMBER --tracker OWNER/REPO --heartbeat ISSUE \
+  --bot-login BOT_LOGIN --forge-org FORGE_ORG
 ```
 
 - `--board`: the Projects (v2) board the bot works from, as `orgs/OWNER/NUMBER`, `users/OWNER/NUMBER`, or the board's address.

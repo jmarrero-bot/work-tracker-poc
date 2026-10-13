@@ -36,7 +36,7 @@ Every connection is in the internal or the external zone, internal unless marked
 
 The hub (`serve --hub`) keeps external work only, refusing anything else at every write, and is meant to be reached over the tailnet through `tailscale serve`. The companion on the work laptop keeps the internal work, pulls the hub's export, read-only, and shows both on one board; it never sends the hub anything but that read. See [docs/hub.md](docs/hub.md).
 
-jmarrero-bot's work is connected read-only too, through the same GitHub client: the items on its Workstream board, its open fork pull requests, and its coordinator's heartbeat, whose workers show as agent runs. Items waiting on jmarrero show in Mine as "bot waiting on you". Its heartbeat and pull requests are matched by the numeric ID of its account, not its login. "Ask the bot" is only a link: a prefilled issue in the bot's tracker, or a comment on an item, that he opens in his browser and submits himself. See [docs/connectors/bot.md](docs/connectors/bot.md).
+A harness bot's work, such as jmarrero-bot's, is connected read-only too, through the same GitHub client: the items on its board, its open fork pull requests, and its coordinator's heartbeat, whose workers show as agent runs. Items waiting on you show in Mine as "bot waiting on you". The bot's board, tracker, heartbeat issue, login and forge organization are given when connecting, with no defaults, so anyone can connect their own bot; its heartbeat and pull requests are matched by the numeric ID of its account, not its login. "Ask the bot" is only a link: a prefilled issue in the bot's tracker, or a comment on an item, that you open in your browser and submit yourself. See [docs/connectors/bot.md](docs/connectors/bot.md).
 
 Connectors are plugins behind one interface: Jira, GitLab, GitHub, Fedora Forge and the bot are built in, and other sources can be served by a plugin executable in any language; see [docs/plugins.md](docs/plugins.md).
 
@@ -99,7 +99,7 @@ workboard connect gitlab-public --url https://gitlab.com/ --label 'Public GitLab
 workboard connect github --url https://github.com/ --label GitHub --external --token-env WORKBOARD_GITHUB_TOKEN
 workboard connect fedora --url https://forge.fedoraproject.org/ --label 'Fedora Forge' --external --token-env WORKBOARD_FEDORA_TOKEN
 workboard connect bot --url https://github.com/ --label Bot --external --token-env WORKBOARD_GITHUB_TOKEN \
-  --board orgs/jmarrero-forge/1 --tracker jmarrero-forge/tracker --heartbeat 1 --bot-login jmarrero-bot --forge-org jmarrero-forge
+  --board orgs/ORG/NUMBER --tracker OWNER/REPO --heartbeat ISSUE --bot-login BOT_LOGIN --forge-org FORGE_ORG
 workboard connections
 ```
 
