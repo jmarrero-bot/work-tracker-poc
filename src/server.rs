@@ -1420,11 +1420,25 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         hub_login: Arc::default(),
     };
     println!("{}", welcome(&app.access, mode));
-    let stop = stop_requested()?;
-    axum::serve(listener, router(app))
+    let requested = stop_requested()?;
+    // Sessions end with the process, and so do the user tokens kept for
+    // them: a stopped hub keeps none in its data directory until it starts
+    // again. They go as soon as the stop is asked for, since an engine or
+    // systemd kills the service if requests in flight hold it up too long.
+    let users = root.clone();
+    let stop = async move {
+        requested.await;
+        if let Err(e) = login::forget_user_tokens(&users) {
+            eprintln!("{e:#}");
+        }
+    };
+    let served = axum::serve(listener, router(app))
         .with_graceful_shutdown(stop)
-        .await?;
-    Ok(())
+        .await;
+    // Again, for a session a request in flight opened meanwhile.
+    let forgotten = login::forget_user_tokens(&root);
+    served?;
+    forgotten
 }
 /// Resolves once the service is asked to stop: on Ctrl-C (SIGINT), or on
 /// SIGTERM, which container engines and systemd send. Without a handler,

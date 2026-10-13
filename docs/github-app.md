@@ -91,7 +91,7 @@ It prints a code and `https://github.com/login/device`; enter the code there, as
 4. It keeps the user token, and its refresh token, in `github-users/ID.json` (mode `0600`), for posting commands as that user later (#13). This slice uses it only to tell who signed in.
 5. It sets the session cookie, `__Host-workboard_user`: HttpOnly, Secure, SameSite=Strict, Path=/, holding a random session ID, never the token. The session ends after 12 hours unused, and 7 days after sign-in in any case. Unused means no request of yours: each one renews the session, but the page's own refreshes every 30 seconds don't (they say so with an `X-Workboard-Background` header), so an open page left alone still signs out. **Sign out** (a `POST /auth/logout` from the page) ends it at once. As soon as none of a user's sessions is left, signed out, expired or dropped, the hub deletes their token: a sweep every minute ends expired sessions without waiting for a request.
 
-Sessions are kept in memory, so restarting the hub signs everyone out, and it deletes the user tokens kept for them, with its App configured or not. Session IDs, sign-in cookies and device-flow handles are looked up by their SHA-256, so a lookup's timing gives none away.
+Sessions are kept in memory, so stopping or restarting the hub signs everyone out. It deletes the user tokens kept for them when it stops, on SIGTERM or Ctrl-C, and again when it starts, with its App configured or not. Session IDs, sign-in cookies and device-flow handles are looked up by their SHA-256, so a lookup's timing gives none away.
 
 ### The companion
 

@@ -388,7 +388,15 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
             assert app.call('/auth/github/login', 'POST', **page)[0] == 200
         status, headers, _ = app.call('/auth/github/login', 'POST', **page)
         assert status == 429 and headers['Retry-After'], headers
-        print('PASS: hub mode refusals, tailnet name and origins, pairing only with --pairing, the companion token, a companion pulling read-only GETs, the merged board and Mine view, duplicates, read-only hub work, no internal work at the hub, staleness with the hub down, mode persistence, and a hub with its GitHub App: its private secret, no pairing, the CLI on loopback only, and checked sign-in steps')
+        # A stop on SIGTERM, as an engine or systemd sends it, forgets the
+        # user tokens kept for sessions, here one a sign-in would have left.
+        users = app_root / 'github-users'
+        users.mkdir(mode=0o700)
+        (users / '1001.json').write_text('{}')
+        app.stop()
+        assert app.process.returncode == 0, app.process.stderr.read()
+        assert not users.exists(), list(users.iterdir())
+        print('PASS: hub mode refusals, tailnet name and origins, pairing only with --pairing, the companion token, a companion pulling read-only GETs, the merged board and Mine view, duplicates, read-only hub work, no internal work at the hub, staleness with the hub down, mode persistence, and a hub with its GitHub App: its private secret, no pairing, the CLI on loopback only, and checked sign-in steps, and user tokens forgotten on SIGTERM')
     finally:
         for service in services:
             service.stop()

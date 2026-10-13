@@ -261,7 +261,8 @@ impl Limiter {
 }
 
 /// Forget the user tokens kept for sessions, as a service does when it
-/// starts: sessions don't outlive the process, so neither do they.
+/// starts and when it stops: sessions don't outlive the process, so neither
+/// do they.
 pub fn forget_user_tokens(root: &Path) -> Result<()> {
     let users = root.join(USERS_DIR);
     match std::fs::remove_dir_all(&users) {
