@@ -38,8 +38,8 @@ USER 65532:65532
 # The service listens on 127.0.0.1:8421 inside the container only; publish
 # it to the host's loopback through pasta (docs/hub.md).
 EXPOSE 8421
-# An authenticated read through the CLI, which takes the service's token
-# from the data directory.
+# An authenticated read through the CLI, which reaches the service through
+# its private socket, in the data directory.
 HEALTHCHECK --interval=1m --timeout=10s --start-period=30s --retries=3 \
     CMD ["/usr/local/bin/workboard", "connections"]
 ENTRYPOINT ["/usr/local/bin/workboard"]

@@ -12,6 +12,7 @@ mod outcome;
 mod schedule;
 mod secrets;
 mod server;
+mod socket;
 mod zone;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -32,7 +33,8 @@ struct Args {
     /// Private local data directory. Use a separate directory for demo data.
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
-    /// Port of the local Workboard service.
+    /// The loopback port `serve` listens on, for browsers. Other commands
+    /// reach the service of the data directory through its private socket.
     #[arg(long, global = true, default_value_t = 8421)]
     port: u16,
     #[command(subcommand)]
@@ -472,31 +474,28 @@ fn default_root() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("Set --data-dir when HOME is unavailable")?;
     Ok(PathBuf::from(home).join(".local/share/workboard"))
 }
+/// A client of the local Workboard service running on the data directory
+/// `root`, through its private socket, which needs no token. It checks on
+/// each connection that the service there is that data directory's before
+/// it sends a request.
+fn local_client(root: &std::path::Path) -> Result<Local> {
+    #[cfg(not(unix))]
+    bail!("The CLI reaches the service through a Unix socket; use Linux or macOS");
+    Ok(Local::new(
+        socket::find(root)?,
+        std::time::Duration::from_secs(900),
+    ))
+}
+type Local = socket::Client;
 /// Call the local Workboard service, which the CLI drives with any method.
 /// Sources are only read, by the service.
-#[allow(clippy::disallowed_methods)]
 async fn request<T: serde::de::DeserializeOwned>(
-    client: &reqwest::Client,
-    root: &std::path::Path,
-    port: u16,
+    client: &Local,
     method: reqwest::Method,
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<T> {
-    let token = std::fs::read_to_string(root.join("service.token"))
-        .context("Start `workboard serve` with the same --data-dir first")?;
-    let mut req = client
-        .request(method, format!("http://127.0.0.1:{port}/api/{path}"))
-        .bearer_auth(token.trim());
-    if let Some(body) = body {
-        req = req.json(&body)
-    }
-    let res = req
-        .send()
-        .await
-        .context("Cannot reach local Workboard; start the service first")?;
-    let status = res.status();
-    let v: serde_json::Value = res.json().await?;
+    let (status, v) = client.call(method, path, body.as_ref()).await?;
     if !status.is_success() {
         bail!(
             "{}",
@@ -562,10 +561,7 @@ async fn main() -> Result<()> {
     {
         return migrate_credentials(&root, to);
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(900))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let client = local_client(&root)?;
     let get = |path: &str| path.to_string();
     match args.command {
         Command::Connect {
@@ -600,8 +596,6 @@ async fn main() -> Result<()> {
             };
             let c: Connection = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::POST,
                 "connections",
                 Some(serde_json::to_value(input)?),
@@ -633,8 +627,6 @@ async fn main() -> Result<()> {
         } => {
             let c: Connection = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::PATCH,
                 &format!("connections/{connection}"),
                 Some(serde_json::json!({ "watch_user": login })),
@@ -656,8 +648,6 @@ async fn main() -> Result<()> {
             let token = read_token(token_env, token_stdin)?;
             let c: Connection = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::POST,
                 &format!("connections/{connection}/verify"),
                 Some(serde_json::json!({ "token": token })),
@@ -680,8 +670,6 @@ async fn main() -> Result<()> {
         } => {
             let c: Connection = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::PATCH,
                 &format!("connections/{connection}"),
                 Some(serde_json::json!({ "sync_interval": interval.map(|i| i.as_secs()) })),
@@ -698,8 +686,6 @@ async fn main() -> Result<()> {
         Command::Sync { connection } => {
             let v: serde_json::Value = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::POST,
                 "sync",
                 Some(serde_json::json!({ "connection": connection })),
@@ -726,15 +712,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Connections => {
-            let s: SnapshotClient = request(
-                &client,
-                &root,
-                args.port,
-                reqwest::Method::GET,
-                &get("snapshot"),
-                None,
-            )
-            .await?;
+            let s: SnapshotClient =
+                request(&client, reqwest::Method::GET, &get("snapshot"), None).await?;
             let now = Timestamp::of(SystemTime::now());
             if let Some(status) = &s.hub {
                 print_hub(status, now);
@@ -764,15 +743,8 @@ async fn main() -> Result<()> {
         }
         Command::Inbox { json } | Command::Next { json } => {
             let next = matches!(args.command, Command::Next { .. });
-            let s: SnapshotClient = request(
-                &client,
-                &root,
-                args.port,
-                reqwest::Method::GET,
-                "snapshot",
-                None,
-            )
-            .await?;
+            let s: SnapshotClient =
+                request(&client, reqwest::Method::GET, "snapshot", None).await?;
             let items: Vec<_> = s
                 .items
                 .into_iter()
@@ -809,15 +781,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Mine { json } => {
-            let view: mine::Mine = request(
-                &client,
-                &root,
-                args.port,
-                reqwest::Method::GET,
-                "mine",
-                None,
-            )
-            .await?;
+            let view: mine::Mine = request(&client, reqwest::Method::GET, "mine", None).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&view)?);
             } else {
@@ -834,7 +798,7 @@ async fn main() -> Result<()> {
         }
         Command::Bot { json } => {
             let views: Vec<bot::BotView> =
-                request(&client, &root, args.port, reqwest::Method::GET, "bot", None).await?;
+                request(&client, reqwest::Method::GET, "bot", None).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&views)?);
             } else if views.is_empty() {
@@ -853,7 +817,7 @@ async fn main() -> Result<()> {
             print,
         } => {
             let views: Vec<bot::BotView> =
-                request(&client, &root, args.port, reqwest::Method::GET, "bot", None).await?;
+                request(&client, reqwest::Method::GET, "bot", None).await?;
             let chosen: Vec<&bot::BotView> = views
                 .iter()
                 .filter(|v| connection.as_ref().is_none_or(|c| *c == v.connection_id))
@@ -893,15 +857,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Status { query, json } => {
-            let s: SnapshotClient = request(
-                &client,
-                &root,
-                args.port,
-                reqwest::Method::GET,
-                "snapshot",
-                None,
-            )
-            .await?;
+            let s: SnapshotClient =
+                request(&client, reqwest::Method::GET, "snapshot", None).await?;
             let efforts: Vec<_> = s
                 .efforts
                 .iter()
@@ -948,8 +905,6 @@ async fn main() -> Result<()> {
         } => {
             let e: Effort = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::POST,
                 "efforts",
                 Some(serde_json::to_value(EffortInput {
@@ -965,8 +920,6 @@ async fn main() -> Result<()> {
         Command::ShareTitle { effort, undo } => {
             let e: Effort = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::PATCH,
                 &format!("efforts/{effort}"),
                 Some(serde_json::json!({"share_title": !undo})),
@@ -982,8 +935,6 @@ async fn main() -> Result<()> {
         Command::Link { item, effort } => {
             let _: serde_json::Value = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::POST,
                 "links",
                 Some(serde_json::json!({"item":item,"effort":effort})),
@@ -1002,8 +953,6 @@ async fn main() -> Result<()> {
         } => {
             let i: Item = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::POST,
                 "items",
                 Some(serde_json::to_value(ManualInput {
@@ -1027,8 +976,6 @@ async fn main() -> Result<()> {
         } => {
             let i: Item = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::PATCH,
                 &format!("items/{item}"),
                 Some(serde_json::json!({"status":status,"action":action,"outcome":outcome})),
@@ -1039,8 +986,6 @@ async fn main() -> Result<()> {
         Command::Abandon { item, undo, force } => {
             let i: Item = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::POST,
                 &format!("items/{item}/abandon"),
                 Some(serde_json::json!({"abandoned": !undo, "force": force})),
@@ -1052,27 +997,13 @@ async fn main() -> Result<()> {
             if !external {
                 bail!("Only the external zone can be exported: use `workboard export --external`. Internal work never leaves this machine.")
             }
-            let v: serde_json::Value = request(
-                &client,
-                &root,
-                args.port,
-                reqwest::Method::GET,
-                "export/external",
-                None,
-            )
-            .await?;
+            let v: serde_json::Value =
+                request(&client, reqwest::Method::GET, "export/external", None).await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Command::Open { item, print } => {
-            let s: SnapshotClient = request(
-                &client,
-                &root,
-                args.port,
-                reqwest::Method::GET,
-                "snapshot",
-                None,
-            )
-            .await?;
+            let s: SnapshotClient =
+                request(&client, reqwest::Method::GET, "snapshot", None).await?;
             let i = s
                 .items
                 .iter()
@@ -1087,8 +1018,6 @@ async fn main() -> Result<()> {
         Command::Disconnect { connection } => {
             let _: serde_json::Value = request(
                 &client,
-                &root,
-                args.port,
                 reqwest::Method::DELETE,
                 &format!("connections/{connection}"),
                 None,
@@ -1107,8 +1036,6 @@ async fn main() -> Result<()> {
                 })?;
                 let status: hub::Status = request(
                     &client,
-                    &root,
-                    args.port,
                     reqwest::Method::PUT,
                     "hub",
                     Some(serde_json::json!({ "url": url, "token": token })),
@@ -1119,25 +1046,18 @@ async fn main() -> Result<()> {
                     status.url, status.items, status.connections
                 );
             }
-            HubCommand::Login { url } => hub_login(&client, &root, args.port, &url).await?,
+            HubCommand::Login { url } => hub_login(&client, &url).await?,
             HubCommand::Show => {
                 let status: Option<hub::Status> =
-                    request(&client, &root, args.port, reqwest::Method::GET, "hub", None).await?;
+                    request(&client, reqwest::Method::GET, "hub", None).await?;
                 match status {
                     Some(status) => print_hub(&status, Timestamp::of(SystemTime::now())),
                     None => println!("No hub is set; `workboard hub set URL` sets one"),
                 }
             }
             HubCommand::Unset => {
-                let _: serde_json::Value = request(
-                    &client,
-                    &root,
-                    args.port,
-                    reqwest::Method::DELETE,
-                    "hub",
-                    None,
-                )
-                .await?;
+                let _: serde_json::Value =
+                    request(&client, reqwest::Method::DELETE, "hub", None).await?;
                 println!("No longer pulling from the hub; its work and token are gone from here");
             }
         },
@@ -1149,8 +1069,6 @@ async fn main() -> Result<()> {
             };
             let v: serde_json::Value = request(
                 &client,
-                &root,
-                args.port,
                 method,
                 "companion-token",
                 rotate.then(|| serde_json::json!({})),
@@ -1161,7 +1079,7 @@ async fn main() -> Result<()> {
         }
         Command::Plugin {
             command: PluginCommand::Trust { connection, sha256 },
-        } => trust_plugin(&client, &root, args.port, &connection, sha256).await?,
+        } => trust_plugin(&client, &connection, sha256).await?,
         Command::Plugin {
             command:
                 PluginCommand::Env {
@@ -1172,15 +1090,8 @@ async fn main() -> Result<()> {
         } => {
             let path = format!("connections/{connection}");
             let c: Connection = if names.is_empty() && !clear {
-                let snapshot: SnapshotClient = request(
-                    &client,
-                    &root,
-                    args.port,
-                    reqwest::Method::GET,
-                    "snapshot",
-                    None,
-                )
-                .await?;
+                let snapshot: SnapshotClient =
+                    request(&client, reqwest::Method::GET, "snapshot", None).await?;
                 snapshot
                     .connections
                     .into_iter()
@@ -1189,8 +1100,6 @@ async fn main() -> Result<()> {
             } else {
                 request(
                     &client,
-                    &root,
-                    args.port,
                     reqwest::Method::PATCH,
                     &path,
                     Some(serde_json::json!({ "plugin_env": names })),
@@ -1216,16 +1125,9 @@ async fn main() -> Result<()> {
 }
 /// Sign in to the hub at `url` through the local service: show the code,
 /// then poll until the person entered it on GitHub, or it expired.
-async fn hub_login(
-    client: &reqwest::Client,
-    root: &std::path::Path,
-    port: u16,
-    url: &str,
-) -> Result<()> {
+async fn hub_login(client: &Local, url: &str) -> Result<()> {
     let start: serde_json::Value = request(
         client,
-        root,
-        port,
         reqwest::Method::POST,
         "hub/login",
         Some(serde_json::json!({ "url": url })),
@@ -1244,8 +1146,6 @@ async fn hub_login(
         tokio::time::sleep(Duration::from_secs(interval)).await;
         let poll: serde_json::Value = request(
             client,
-            root,
-            port,
             reqwest::Method::POST,
             "hub/login/poll",
             Some(serde_json::json!({})),
@@ -1294,16 +1194,9 @@ fn migrate_credentials(root: &std::path::Path, to: secrets::Backend) -> Result<(
 /// `workboard plugin trust`: show the plugin file a connection trusts and
 /// the one there now, and trust the one there now if the person says so,
 /// at the terminal or with `sha256`.
-async fn trust_plugin(
-    client: &reqwest::Client,
-    root: &std::path::Path,
-    port: u16,
-    connection: &str,
-    sha256: Option<String>,
-) -> Result<()> {
+async fn trust_plugin(client: &Local, connection: &str, sha256: Option<String>) -> Result<()> {
     let path = format!("connections/{connection}/plugin");
-    let trust: serde_json::Value =
-        request(client, root, port, reqwest::Method::GET, &path, None).await?;
+    let trust: serde_json::Value = request(client, reqwest::Method::GET, &path, None).await?;
     let label = trust["label"].as_str().unwrap_or(connection);
     let current = trust["current"]
         .as_str()
@@ -1334,8 +1227,6 @@ async fn trust_plugin(
     };
     let c: Connection = request(
         client,
-        root,
-        port,
         reqwest::Method::POST,
         &path,
         Some(serde_json::json!({ "sha256": sha256 })),

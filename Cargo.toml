@@ -16,8 +16,14 @@ description = "A personal work inbox across Jira, GitLab and downstream release 
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 graphql-parser = "0.4"
+http-body-util = "0.1"
+# The CLI's client of the service's socket, which checks the service on
+# each connection before it sends a request there.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 ring = "0.17"

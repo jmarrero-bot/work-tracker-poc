@@ -19,12 +19,13 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
+    future::IntoFuture,
     path::PathBuf,
     sync::{Arc, Mutex, PoisonError, RwLock},
     time::{Duration, SystemTime},
@@ -254,7 +255,17 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         })
 }
 
+/// Marks the requests that came through the service's private socket, which
+/// only this user can connect to ([`crate::socket`]). Only the socket's
+/// router adds it; nothing a client sends can.
+#[derive(Clone, Copy)]
+struct ViaSocket;
+
 async fn protect(State(app): State<App>, req: Request, next: Next) -> Response {
+    // The CLI and the GNOME app, as this user: full access, no token.
+    if req.extensions().get::<ViaSocket>().is_some() {
+        return next.run(req).await;
+    }
     // Routes nested under /api see their path without it.
     let path = req
         .extensions()
@@ -427,6 +438,10 @@ async fn snapshot(State(app): State<App>) -> ApiResult<Board> {
         mode: app.mode,
         hub,
     }))
+}
+/// Nothing: for a client to check it reached the service it meant to.
+async fn ping() -> Json<Value> {
+    Json(json!({ "ok": true }))
 }
 /// The hub this companion pulls from, if one is set, and how its pulls go.
 async fn get_hub(State(app): State<App>) -> ApiResult<Option<hub::Status>> {
@@ -1353,6 +1368,7 @@ pub struct GitHubApp {
 /// steps, which guard themselves, and the page.
 fn router(app: App) -> Router {
     let api = Router::new()
+        .route("/ping", get(ping))
         .route("/snapshot", get(snapshot))
         .route("/mine", get(mine))
         .route("/bot", get(bot_view))
@@ -1402,6 +1418,36 @@ fn router(app: App) -> Router {
         .layer(middleware::from_fn(refuse_funnel))
         .with_state(app)
 }
+/// `router` as the private socket serves it: as the CLI's or the GNOME
+/// app's ([`ViaSocket`]), every answer saying it is the service `instance`,
+/// and a request that means another service refused before anything acts
+/// on it ([`crate::socket::EXPECT_HEADER`]).
+fn on_socket(router: Router, instance: &str) -> Result<Router> {
+    let value = HeaderValue::from_str(instance)?;
+    let instance = instance.to_string();
+    Ok(router
+        .layer(Extension(ViaSocket))
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let (instance, value) = (instance.clone(), value.clone());
+            async move {
+                let expected = req
+                    .headers()
+                    .get(crate::socket::EXPECT_HEADER)
+                    .map(|v| v.as_bytes() == instance.as_bytes());
+                let mut response = match expected {
+                    Some(false) => refused(
+                        StatusCode::CONFLICT,
+                        "This isn't the Workboard service that request was for",
+                    ),
+                    _ => next.run(req).await,
+                };
+                response
+                    .headers_mut()
+                    .insert(crate::socket::INSTANCE_HEADER, value);
+                response
+            }
+        })))
+}
 pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     #[cfg(not(unix))]
     bail!("This initial server requires Unix file permissions; use Linux or macOS");
@@ -1441,6 +1487,9 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     db::private_dir(&root)?;
     let _lock = db::lock(&root)?;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    // With the data directory's lock and the port held, a socket there is
+    // one a service that was killed left.
+    let (socket, bound) = crate::socket::bind(&root, port)?;
     let mut db = Db::open_as(&root, mode)?;
     let secrets = crate::secrets::open(&root, mode == Mode::Hub)?;
     println!("Credentials are kept in {}", secrets.describe());
@@ -1512,21 +1561,33 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         hub_login: Arc::default(),
     };
     println!("{}", welcome(&app.access, mode));
+    // Both stop together, gracefully.
+    let (stopping, stop) = tokio::sync::watch::channel(false);
     let requested = stop_requested()?;
-    // Sessions end with the process, and so do the user tokens kept for
-    // them: a stopped hub keeps none in its data directory until it starts
-    // again. They go as soon as the stop is asked for, since an engine or
-    // systemd kills the service if requests in flight hold it up too long.
     let users = root.clone();
-    let stop = async move {
+    tokio::spawn(async move {
         requested.await;
+        // Sessions end with the process, and so do the user tokens kept
+        // for them: a stopped hub keeps none in its data directory until it
+        // starts again. They go as soon as the stop is asked for, since an
+        // engine or systemd kills the service if requests in flight hold it
+        // up too long.
         if let Err(e) = login::forget_user_tokens(&users) {
             eprintln!("{e:#}");
         }
+        let _ = stopping.send(true);
+    });
+    let stopped = |mut stop: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = stop.wait_for(|stopped| *stopped).await;
     };
-    let served = axum::serve(listener, router(app))
-        .with_graceful_shutdown(stop)
-        .await;
+    let tcp = axum::serve(listener, router(app.clone()))
+        .with_graceful_shutdown(stopped(stop.clone()))
+        .into_future();
+    let unix = axum::serve(socket, on_socket(router(app), bound.instance())?)
+        .with_graceful_shutdown(stopped(stop))
+        .into_future();
+    let served = tokio::try_join!(tcp, unix);
+    drop(bound);
     // Again, for a session a request in flight opened meanwhile.
     let forgotten = login::forget_user_tokens(&root);
     served?;
@@ -2518,6 +2579,71 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_cli_never_sends_a_request_to_another_service() {
+        use crate::socket::{Client, Found, EXPECT_HEADER};
+        let root = tempfile::tempdir().unwrap();
+        let app = test_app(root.path(), Mode::Local, LOCAL, None);
+        let sockets = tempfile::tempdir().unwrap();
+        // Serve `app` as the service `instance`, on a socket of its own.
+        let serve = |name: &str, instance: &str| {
+            let path = sockets.path().join(name);
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let served = on_socket(router(app.clone()), instance).unwrap();
+            tokio::spawn(axum::serve(listener, served).into_future());
+            path
+        };
+        let client = |path| {
+            let found = Found {
+                path,
+                instance: "this-service".into(),
+            };
+            Client::new(found, Duration::from_secs(10))
+        };
+        let efforts = || app.db.lock().unwrap().efforts().unwrap().len();
+        let effort = json!({ "title": "Meant for this service" });
+        // Another service took over the socket: its connection says so
+        // before the request goes out, and nothing is done there.
+        let other = client(serve("other.sock", "another-service"));
+        let error = other
+            .call(Method::POST, "efforts", Some(&effort))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("isn't the one of this data directory"),
+            "{error}"
+        );
+        assert_eq!(efforts(), 0);
+        // This one takes it.
+        let this = client(serve("this.sock", "this-service"));
+        let (status, _) = this
+            .call(Method::POST, "efforts", Some(&effort))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(efforts(), 1);
+        // A request meant for another service is refused before anything
+        // acts on it, whoever sends it.
+        let (status, headers, _) = call(
+            &on_socket(router(app.clone()), "this-service").unwrap(),
+            Method::POST,
+            "/api/efforts",
+            &[
+                (header::HOST, "workboard"),
+                (
+                    header::HeaderName::from_static(EXPECT_HEADER),
+                    "another-service",
+                ),
+            ],
+            Some(effort.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(headers[crate::socket::INSTANCE_HEADER], "this-service");
+        assert_eq!(efforts(), 1);
     }
 
     /// The hub credential a companion keeps, from its data directory.
