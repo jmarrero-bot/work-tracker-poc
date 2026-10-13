@@ -4,11 +4,13 @@
 //! does for its companions.
 
 use crate::{
+    bot::{AgentRuns, BotFields, BotKind},
     connector::ErrorKind,
     model::{Item, Outcome, Progress, Reason, Snapshot, Timestamp},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use url::Url;
 
 /// The zone of a connection, and of every item synced through it. A person
 /// chooses it when connecting; it isn't a property of the provider, since
@@ -44,6 +46,11 @@ pub struct ExternalSnapshot {
     pub connections: Vec<ExternalConnection>,
     pub items: Vec<ExternalItem>,
     pub efforts: Vec<ExternalEffort>,
+    /// The external bot connections: what their Ask links need, and what
+    /// they last read of their heartbeat and board. None from hubs that
+    /// predate them.
+    #[serde(default)]
+    pub bots: Vec<ExternalBot>,
 }
 
 /// An external connection. A sync error's message can name local paths or
@@ -90,6 +97,131 @@ pub struct ExternalItem {
     /// Why it waits on its connection's account, for a companion's Mine
     /// view.
     pub reasons: Vec<Reason>,
+    /// For a bot item, its board fields, or the board item that links a
+    /// fork pull request. None from hubs that predate them.
+    #[serde(default)]
+    pub bot: Option<ExternalBotFields>,
+}
+
+/// What the bot connector read of an item besides its usual fields, all of
+/// it public on the bot's board.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalBotFields {
+    pub kind: BotKind,
+    pub priority: Option<String>,
+    pub why: Option<String>,
+    pub news: Option<String>,
+    pub branch: Option<String>,
+    pub board_item: Option<String>,
+}
+
+impl ExternalBotFields {
+    fn of(b: &BotFields) -> Self {
+        Self {
+            kind: b.kind,
+            priority: b.priority.clone(),
+            why: b.why.clone(),
+            news: b.news.clone(),
+            branch: b.branch.clone(),
+            board_item: b.board_item.clone(),
+        }
+    }
+}
+
+/// An external bot connection: what a companion needs to build its Ask
+/// links (the tracker and the bot's login), its board's address, and what
+/// it last read of its heartbeat and board. Its heartbeat issue and forge
+/// organization aren't needed, and aren't exported as settings, though the
+/// heartbeat's comment link and the fork pull requests, all public, show
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalBot {
+    pub connection_id: String,
+    pub bot_login: String,
+    /// The repository work is asked of it in, `OWNER/REPO`.
+    pub tracker: String,
+    pub board_url: String,
+    /// None until a sync read them.
+    pub agents: Option<ExternalAgents>,
+}
+
+/// What a bot connection last read of its heartbeat and board. Why a read
+/// failed stays behind, as a connection's error message does: only that
+/// it failed leaves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalAgents {
+    /// None when the bot publishes no heartbeat.
+    pub heartbeat: Option<ExternalHeartbeat>,
+    pub failed: bool,
+    pub last_success: Option<Timestamp>,
+    pub stale: bool,
+    pub board: Option<ExternalBoard>,
+}
+
+/// A coordinator's heartbeat, as the bot published it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalHeartbeat {
+    pub updated_at: Timestamp,
+    pub session: String,
+    pub loop_state: String,
+    pub next_wake_at: Option<Timestamp>,
+    pub runs: Vec<ExternalRun>,
+    pub skipped: usize,
+    pub comment_url: Option<String>,
+}
+
+/// One agent run of a heartbeat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalRun {
+    pub name: String,
+    pub item_url: String,
+    pub item_key: String,
+    pub status: String,
+    pub started_at: Timestamp,
+    pub devspace: Option<String>,
+}
+
+/// A bot's board, counted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalBoard {
+    pub statuses: BTreeMap<String, usize>,
+    pub fork_prs: usize,
+    pub unreadable: usize,
+}
+
+impl ExternalAgents {
+    fn of(a: &AgentRuns) -> Self {
+        Self {
+            heartbeat: a.heartbeat.as_ref().map(|h| ExternalHeartbeat {
+                updated_at: h.updated_at,
+                session: h.session.clone(),
+                loop_state: h.loop_state.clone(),
+                next_wake_at: h.next_wake_at,
+                runs: h
+                    .runs
+                    .iter()
+                    .map(|r| ExternalRun {
+                        name: r.name.clone(),
+                        item_url: r.item_url.clone(),
+                        item_key: r.item_key.clone(),
+                        status: r.status.clone(),
+                        started_at: r.started_at,
+                        devspace: r.devspace.clone(),
+                    })
+                    .collect(),
+                skipped: h.skipped,
+                comment_url: h.comment_url.clone(),
+            }),
+            failed: a.error.is_some(),
+            last_success: a.last_success,
+            stale: a.stale,
+            board: a.board.as_ref().map(|b| ExternalBoard {
+                statuses: b.statuses.clone(),
+                fork_prs: b.fork_prs,
+                unreadable: b.unreadable,
+            }),
+        }
+    }
 }
 
 /// An effort as the external zone sees it. Its title and note are free text
@@ -174,8 +306,14 @@ pub fn neutral_title(id: &str) -> String {
 /// - efforts with at least one of those items, with their progress over
 ///   those items only, and their title only if shared, or if `from` is a
 ///   hub. An effort that mixes zones shows no trace of its internal items:
-///   no count, no placeholder, no link.
-pub fn external_only(snapshot: &Snapshot, from: Exporter) -> ExternalSnapshot {
+///   no count, no placeholder, no link;
+/// - of those connections that are a bot's, its tracker, login and board,
+///   and what `agents` says it last read of its heartbeat and board.
+pub fn external_only(
+    snapshot: &Snapshot,
+    agents: &[AgentRuns],
+    from: Exporter,
+) -> ExternalSnapshot {
     let connections: Vec<ExternalConnection> = snapshot
         .connections
         .iter()
@@ -249,6 +387,26 @@ pub fn external_only(snapshot: &Snapshot, from: Exporter) -> ExternalSnapshot {
                 .filter(|e| exported.contains(e.as_str())),
             zone: Zone::External,
             reasons: i.reasons.clone(),
+            bot: i.bot.as_ref().map(ExternalBotFields::of),
+        })
+        .collect();
+    let bots = snapshot
+        .connections
+        .iter()
+        .filter(|c| external.contains(c.id.as_str()))
+        .filter_map(|c| {
+            let config = c.bot.as_ref()?;
+            let base = Url::parse(&c.base_url).ok()?;
+            Some(ExternalBot {
+                connection_id: c.id.clone(),
+                bot_login: config.bot_login.clone(),
+                tracker: config.tracker.clone(),
+                board_url: config.board_url(&base).ok()?.into(),
+                agents: agents
+                    .iter()
+                    .find(|a| a.connection_id == c.id)
+                    .map(ExternalAgents::of),
+            })
         })
         .collect();
     ExternalSnapshot {
@@ -256,6 +414,7 @@ pub fn external_only(snapshot: &Snapshot, from: Exporter) -> ExternalSnapshot {
         connections,
         items,
         efforts,
+        bots,
     }
 }
 
@@ -349,11 +508,13 @@ mod tests {
                 held_until: None,
             },
             from_hub: false,
-            // Not exported: where a bot's work is says nothing about it.
+            // An external bot's board, tracker and login leave, for its
+            // companions' Ask links. Its forge organization isn't exported
+            // as a setting (its fork pull requests show it).
             bot: Some(crate::model::BotConfig {
-                board_owner: format!("{INTERNAL}-owner"),
-                tracker: format!("{INTERNAL}/tracker"),
-                bot_login: format!("{INTERNAL}-bot"),
+                board_owner: format!("{tag}-owner"),
+                tracker: format!("{tag}/tracker"),
+                bot_login: format!("{tag}-bot"),
                 forge_org: format!("{INTERNAL}-forge"),
                 ..crate::bot::tests::config()
             }),
@@ -361,6 +522,43 @@ mod tests {
             plugin: Some(crate::model::PluginConfig {
                 sha256: Some(format!("{INTERNAL}-sha256")),
                 env: vec![format!("{INTERNAL}-variable")],
+            }),
+        }
+    }
+    /// What `connection` last read of its heartbeat and board, tagged
+    /// internal unless it is external, but for its error message, which
+    /// never leaves.
+    fn agents(connection: &Connection) -> AgentRuns {
+        use crate::bot::{AgentRun, BoardSummary, Heartbeat};
+        let tag = tag(connection.zone == Zone::External);
+        AgentRuns {
+            connection_id: connection.id.clone(),
+            heartbeat: Some(Heartbeat {
+                updated_at: Timestamp::from_unix(1_791_763_000),
+                session: format!("{tag}-session"),
+                loop_state: format!("{tag}-state"),
+                next_wake_at: None,
+                runs: vec![AgentRun {
+                    name: format!("{tag}-run"),
+                    item_url: format!("https://{tag}.example/o/r/issues/1"),
+                    item_key: format!("{tag}/r#1"),
+                    status: format!("{tag}-status"),
+                    started_at: Timestamp::from_unix(1_791_762_000),
+                    devspace: Some(format!("{tag}-devspace")),
+                }],
+                skipped: 1,
+                comment_url: Some(format!(
+                    "https://{tag}.example/o/tracker/issues/1#issuecomment-1"
+                )),
+                stale: false,
+            }),
+            error: Some(format!("{INTERNAL} heartbeat error")),
+            last_success: Some(Timestamp::from_unix(1_791_763_100)),
+            stale: true,
+            board: Some(BoardSummary {
+                statuses: [(format!("{tag} status"), 2)].into(),
+                fork_prs: 3,
+                unreadable: 1,
             }),
         }
     }
@@ -397,12 +595,13 @@ mod tests {
             synced_at: None,
             stale: false,
             from_hub: false,
-            // Not exported, until someone decides it may leave.
             bot: Some(crate::model::BotFields {
-                why: Some(format!("{INTERNAL} why {n}")),
-                news: Some(format!("{INTERNAL} news {n}")),
-                priority: Some(format!("{INTERNAL} priority {n}")),
-                ..Default::default()
+                kind: crate::bot::BotKind::ForkPr,
+                why: Some(format!("{tag} why {n}")),
+                news: Some(format!("{tag} news {n}")),
+                priority: Some(format!("{tag} priority {n}")),
+                branch: Some(format!("https://{tag}.example/branch/{n}")),
+                board_item: Some(format!("https://{tag}.example/board/{n}")),
             }),
         }
     }
@@ -465,7 +664,7 @@ mod tests {
                 vec![item(n, c, zone, Outcome::Open, None)],
                 vec![],
             );
-            let out = external_only(&s, Exporter::Local);
+            let out = external_only(&s, &[], Exporter::Local);
             assert_eq!(out.items.len(), usize::from(exported), "case {n}");
             assert_eq!(out.connections.len(), 1);
             assert_eq!(out.connections[0].id, external.id);
@@ -494,7 +693,7 @@ mod tests {
             );
             // The full snapshot counts all five.
             assert_eq!(s.efforts[0].progress.total, 5);
-            let out = external_only(&s, Exporter::Local);
+            let out = external_only(&s, &[], Exporter::Local);
             assert_eq!(
                 out.efforts.len(),
                 1,
@@ -548,12 +747,12 @@ mod tests {
                 )],
                 vec![e],
             );
-            let hub = external_only(&s, Exporter::Hub);
+            let hub = external_only(&s, &[], Exporter::Hub);
             assert_eq!(hub.efforts[0].title, "hub effort title");
             // The note still stays behind.
             let json = serde_json::to_string(&hub).unwrap();
             assert!(!json.contains(INTERNAL), "{json}");
-            let local = external_only(&s, Exporter::Local);
+            let local = external_only(&s, &[], Exporter::Local);
             let title = if share_title {
                 "hub effort title".to_string()
             } else {
@@ -586,18 +785,63 @@ mod tests {
             )],
             vec![e],
         );
-        let out = serde_json::to_value(external_only(&s, Exporter::Local)).unwrap();
+        let read = [agents(&external)];
+        let out = serde_json::to_value(external_only(&s, &read, Exporter::Local)).unwrap();
         let keys = |v: &serde_json::Value| {
             let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
             keys.sort();
             keys
         };
-        let cases: [(&serde_json::Value, &[&str]); 5] = [
+        let agents = &out["bots"][0]["agents"];
+        let heartbeat = &agents["heartbeat"];
+        let cases: [(&serde_json::Value, &[&str]); 11] = [
             (
                 &out["efforts"][0]["progress"],
                 &["abandoned", "delivered", "needs_attention", "open", "total"],
             ),
-            (&out, &["connections", "efforts", "items", "zone"]),
+            (&out, &["bots", "connections", "efforts", "items", "zone"]),
+            (
+                &out["bots"][0],
+                &[
+                    "agents",
+                    "board_url",
+                    "bot_login",
+                    "connection_id",
+                    "tracker",
+                ],
+            ),
+            (
+                agents,
+                &["board", "failed", "heartbeat", "last_success", "stale"],
+            ),
+            (
+                heartbeat,
+                &[
+                    "comment_url",
+                    "loop_state",
+                    "next_wake_at",
+                    "runs",
+                    "session",
+                    "skipped",
+                    "updated_at",
+                ],
+            ),
+            (
+                &heartbeat["runs"][0],
+                &[
+                    "devspace",
+                    "item_key",
+                    "item_url",
+                    "name",
+                    "started_at",
+                    "status",
+                ],
+            ),
+            (&agents["board"], &["fork_prs", "statuses", "unreadable"]),
+            (
+                &out["items"][0]["bot"],
+                &["board_item", "branch", "kind", "news", "priority", "why"],
+            ),
             (
                 &out["connections"][0],
                 &[
@@ -617,6 +861,7 @@ mod tests {
                 &out["items"][0],
                 &[
                     "action",
+                    "bot",
                     "connection_id",
                     "effort_id",
                     "id",
@@ -667,7 +912,7 @@ mod tests {
                 account_id: id.into(),
                 ..connection(1, Zone::External)
             };
-            let out = external_only(&snapshot(vec![c], vec![], vec![]), Exporter::Local);
+            let out = external_only(&snapshot(vec![c], vec![], vec![]), &[], Exporter::Local);
             assert_eq!(out.connections[0].account_id.as_deref(), exported, "{id}");
         }
     }
@@ -723,8 +968,14 @@ mod tests {
                     item(n, c, zone, OUTCOMES[rng.below(OUTCOMES.len())], e)
                 })
                 .collect();
+            // What some of the bots, known or not, last read.
+            let read: Vec<_> = connections
+                .iter()
+                .filter(|_| rng.next() & 1 == 1)
+                .map(agents)
+                .collect();
             let s = snapshot(known.clone(), items.clone(), efforts.clone());
-            let out = external_only(&s, Exporter::Local);
+            let out = external_only(&s, &read, Exporter::Local);
             let json = serde_json::to_string(&out).unwrap();
             assert!(!json.contains(INTERNAL), "seed {seed}: {json}");
             assert_eq!(out.zone, Zone::External);
@@ -739,6 +990,15 @@ mod tests {
                 let id = numeric_account_id(&known.account_id);
                 assert!(id.is_some(), "seed {seed}");
                 assert_eq!(c.account_id, id, "seed {seed}");
+            }
+            // Each is a bot, whose settings leave with it, and what it last
+            // read, if it did.
+            let bots: Vec<_> = out.bots.iter().map(|b| &b.connection_id).collect();
+            assert_eq!(bots, shown, "seed {seed}");
+            for b in &out.bots {
+                let read = read.iter().find(|a| a.connection_id == b.connection_id);
+                assert_eq!(b.agents, read.map(ExternalAgents::of), "seed {seed}");
+                assert!(b.agents.as_ref().is_none_or(|a| a.failed), "seed {seed}");
             }
             // Everything external does leave.
             let expected: Vec<_> = items
@@ -756,6 +1016,11 @@ mod tests {
             for (shown, expected) in shown.iter().zip(&expected) {
                 assert_eq!(shown.id, expected.id, "seed {seed}");
                 assert_eq!(shown.effort_id, expected.effort_id, "seed {seed}");
+                assert_eq!(
+                    shown.bot,
+                    expected.bot.as_ref().map(ExternalBotFields::of),
+                    "seed {seed}"
+                );
             }
             for e in &efforts {
                 let outcomes: Vec<_> = expected

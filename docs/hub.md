@@ -47,7 +47,7 @@ Open `https://hub.example.ts.net/` and sign in with GitHub (or, with `--pairing`
 $WB companion-token
 ```
 
-Upgrade the companions before the hub. A companion checks the hub's export whole, and refuses all of it if it has a source or a reason it doesn't know, such as the bot connector's `bot` items and their `bot_waiting` reason, which an older companion doesn't.
+Upgrade the companions before the hub. A companion checks the hub's export whole, and refuses all of it if it has a source or a reason it doesn't know, such as the bot connector's `bot` items and their `bot_waiting` reason, which an older companion doesn't. Fields it doesn't know, such as a bot's board fields, it ignores, and a newer companion takes an older hub's export without them.
 
 ## Run the hub from its image
 
@@ -115,6 +115,8 @@ The board, the Mine view and the CLI show the hub's connections, items and effor
 
 The hub's work is as fresh as the hub's connection that synced it was at the last pull. It is stale as soon as a pull fails, not only after three intervals as a connection's work: while the hub can't be reached, its work is never shown as current. The companion's own work isn't affected.
 
+The hub's bot shows in the companion's Bot view too, read-only: its board, its heartbeat and agent runs, and links to ask it for something, built on the companion ([connectors/bot.md](connectors/bot.md#on-a-companion)).
+
 If the companion connects an account the hub also connects, the hub's copy of that connection and its items is left out, and so is a hub effort left with none of its work, so nothing shows twice or empty: the companion's own copy is shown, being synced right on the laptop. The same account is the same provider, the same instance, and the same numeric account ID, which the export carries for GitHub, GitLab, Fedora Forge and the bot, and which survives a rename. Where either side doesn't know it, such as from an older hub, or for an account whose ID isn't a number, the account name decides instead, without regard to case.
 
 ## Trust model
@@ -139,4 +141,4 @@ Tokens are files of mode `0600` in the data directory, not encrypted at rest, as
 
 ## What crosses the boundary
 
-From the hub to the companion, and nothing the other way: the hub's external export, as `docs/architecture.md` lists it field by field. It is the hub's external connections without their error messages, their items, and the efforts that have such items, with their progress over those items and their titles. A hub always exports its efforts' titles: it holds external work only, and its companions are trusted more than it is.
+From the hub to the companion, and nothing the other way: the hub's external export, as `docs/architecture.md` lists it field by field. It is the hub's external connections without their error messages, their items, and the efforts that have such items, with their progress over those items and their titles. A hub always exports its efforts' titles: it holds external work only, and its companions are trusted more than it is. Of a bot connection, it exports its items' board fields, its login, tracker and board, and what it last read of its heartbeat and board; not its heartbeat issue and forge organization as settings (all of it is public, and the comment link and fork pull requests show them), nor why a read failed. The companion checks all of it again ([connectors/bot.md](connectors/bot.md#on-a-companion)).

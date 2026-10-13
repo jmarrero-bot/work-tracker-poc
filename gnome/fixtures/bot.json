@@ -26,5 +26,22 @@
     },
     "ask": {"issue_url": "https://github.com/example-org/tracker/issues/new?labels=ask&body=x", "comment_url": null, "comment": null},
     "asks": {}
+  },
+  {
+    "connection_id": "hub:b2",
+    "label": "Bot on the hub",
+    "bot_login": "example-bot",
+    "board_url": "https://github.com/orgs/example-org/projects/1",
+    "agents": {
+      "connection_id": "hub:b2",
+      "heartbeat": null,
+      "error": "The hub couldn't read the heartbeat at its last sync",
+      "last_success": "2026-10-12T11:55:00Z",
+      "stale": true,
+      "board": {"statuses": {"Needs human": 1}, "fork_prs": 0, "unreadable": 0}
+    },
+    "ask": {"issue_url": "https://github.com/example-org/tracker/issues/new?labels=ask&body=x", "comment_url": null, "comment": null},
+    "asks": {},
+    "from_hub": true
   }
 ]

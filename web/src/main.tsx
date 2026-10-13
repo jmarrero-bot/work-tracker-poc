@@ -160,6 +160,8 @@ type BotView = {
   ask: Ask;
   // By item ID.
   asks: Record<string, Ask>;
+  // The hub's bot, as of the companion's last pull: read-only here.
+  from_hub?: boolean;
 };
 // Only links that open a web page are shown as links.
 const webLink = (url: string | null | undefined) =>
@@ -731,6 +733,14 @@ function BotCard({ bot, now }: { bot: BotView; now: number }) {
       <div className="connection-top">
         <Mark provider="bot" />
         <h2>{bot.label}</h2>
+        {bot.from_hub && (
+          <em
+            className="zone-tag hub"
+            title="The hub's bot, as of the last pull: read-only here. Ask links are built here, and open GitHub in your browser."
+          >
+            Hub
+          </em>
+        )}
         <a
           className="connection-kind live"
           href={webLink(bot.board_url)}

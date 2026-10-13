@@ -10,15 +10,19 @@
 //! anything else anywhere in the crate.
 
 use crate::{
+    bot::{self, AgentRun, AgentRuns, BoardSummary, BotFields, BotView, Heartbeat},
     connector::{
         safe_id, BoxFuture, ConnectorError, ConnectorResult, Credential, ErrorKind, Requests,
     },
     connectors::{self, http_error, parse_json, read_body},
     model::{
-        valid_provider, Connection, Effort, EffortView, Item, Progress, Schedule, Snapshot,
-        SyncState,
+        valid_github_login, valid_provider, Connection, Effort, EffortView, Item, Progress,
+        Schedule, Snapshot, SyncState, Timestamp,
     },
-    zone::{numeric_account_id, ExternalConnection, ExternalSnapshot, Zone},
+    zone::{
+        numeric_account_id, ExternalAgents, ExternalBot, ExternalBotFields, ExternalConnection,
+        ExternalSnapshot, Zone,
+    },
 };
 use anyhow::{bail, Context, Result};
 use reqwest::{
@@ -29,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Mutex, PoisonError},
+    time::SystemTime,
 };
 use url::Url;
 
@@ -57,6 +62,8 @@ const MAX_FIELD: usize = 8192;
 const MAX_ID: usize = 512;
 /// Most connections, items or efforts accepted from a hub, each.
 const MAX_COUNT: usize = 50_000;
+/// The provider of a bot connection, the only one with bot fields.
+const BOT: &str = "bot";
 /// Hosts a hub may be reached at over plain HTTP: this machine's loopback,
 /// where its token never crosses a network.
 const LOOPBACK: &[&str] = &["127.0.0.1", "[::1]", "localhost"];
@@ -298,7 +305,7 @@ impl HubClient {
                 let snapshot = serde_json::from_value(parse_json(LABEL, &body)?).map_err(|_| {
                     ConnectorError::invalid("The hub's answer isn't an external export")
                 })?;
-                checked(snapshot)
+                checked(snapshot, Timestamp::of(SystemTime::now()))
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ConnectorError::new(
                 ErrorKind::Auth,
@@ -355,12 +362,136 @@ fn printable(text: &mut String) {
     }
 }
 
+/// A hub's bot item's fields, if fit to show here: bounded text, its Branch
+/// an HTTP(S) link, and the board item that links a fork pull request an
+/// issue or pull request on the instance at `base`. What passes has its
+/// links as parsed and its text without control characters.
+fn checked_bot_fields(b: &mut ExternalBotFields, base: &Url) -> Option<()> {
+    let fields = [&b.priority, &b.why, &b.news, &b.branch, &b.board_item];
+    if fields.into_iter().flatten().any(|f| f.len() > MAX_FIELD) {
+        return None;
+    }
+    for text in [&mut b.priority, &mut b.why, &mut b.news]
+        .into_iter()
+        .flatten()
+    {
+        printable(text);
+    }
+    if let Some(branch) = &mut b.branch {
+        *branch = connectors::source_url(branch).ok()?;
+    }
+    if let Some(item) = &mut b.board_item {
+        *item = bot::item_on(item, base)?.0;
+    }
+    Some(())
+}
+
+/// A hub's bot, if fit to use here, on the instance at `base`, at `now`:
+/// its login and tracker what they can be on GitHub, its board on the
+/// instance, and what it read of its heartbeat and board held to the
+/// checks the hub's own reading of the heartbeat passed
+/// ([`bot::parse_heartbeat`]): names and states of a safe character set,
+/// a wake time within the longest sleep after the heartbeat or none, at
+/// most as many runs, each on an issue or pull request of the instance,
+/// and links to the instance only. A heartbeat from, or a run started,
+/// more than a few minutes ahead of this machine's clock is left out
+/// rather than refusing the export, so a clock that is off can't hide all
+/// of the hub's work: the heartbeat as one that couldn't be read, the run
+/// as a malformed one. Its board's counts are bounded, and its status
+/// names cleaned as the hub names them ([`bot::status_name`]).
+fn checked_bot(b: &mut ExternalBot, base: &Url, now: Timestamp) -> Option<()> {
+    if !valid_github_login(&b.bot_login) || bot::tracker_parts(&b.tracker).is_none() {
+        return None;
+    }
+    b.board_url = bot::board_on(&b.board_url, base)?.into();
+    let Some(agents) = &mut b.agents else {
+        return Some(());
+    };
+    if agents
+        .heartbeat
+        .as_ref()
+        .is_some_and(|h| !bot::not_ahead(h.updated_at, now))
+    {
+        eprintln!(
+            "Left out the hub's heartbeat of {}: it is from more than a few minutes ahead of this machine's clock",
+            b.bot_login
+        );
+        agents.heartbeat = None;
+        agents.failed = true;
+    }
+    if let Some(h) = &mut agents.heartbeat {
+        if !bot::valid_name(&h.session)
+            || !bot::valid_word(&h.loop_state)
+            || h.runs.len() > bot::MAX_WORKERS
+            || h.skipped > MAX_COUNT
+        {
+            return None;
+        }
+        h.next_wake_at = bot::wake_after(h.updated_at, h.next_wake_at);
+        if let Some(url) = &mut h.comment_url {
+            if url.len() > MAX_FIELD {
+                return None;
+            }
+            *url = bot::page_on(url, base)?;
+        }
+        // A run started ahead of this machine's clock is left out, and
+        // counted with the malformed ones, as the hub's reading does.
+        let ahead = h.runs.len();
+        h.runs.retain(|r| bot::not_ahead(r.started_at, now));
+        let ahead = ahead - h.runs.len();
+        if ahead > 0 {
+            eprintln!(
+                "Left out {ahead} of the hub's agent runs of {}: they started more than a few minutes ahead of this machine's clock",
+                b.bot_login
+            );
+            h.skipped = h.skipped.saturating_add(ahead);
+        }
+        let mut names = HashSet::new();
+        for r in &mut h.runs {
+            let (url, key) = bot::item_on(&r.item_url, base)?;
+            if !bot::valid_name(&r.name)
+                || !names.insert(r.name.clone())
+                || key != r.item_key
+                || !bot::valid_word(&r.status)
+                || r.devspace
+                    .as_deref()
+                    .is_some_and(|d| !bot::valid_devspace(d))
+            {
+                return None;
+            }
+            r.item_url = url;
+        }
+    }
+    if let Some(board) = &mut agents.board {
+        let total = board
+            .statuses
+            .values()
+            .try_fold(0usize, |total, n| total.checked_add(*n));
+        if board.statuses.len() > MAX_COUNT
+            || total.is_none_or(|total| total > MAX_COUNT)
+            || board.fork_prs > MAX_COUNT
+            || board.unreadable > MAX_COUNT
+        {
+            return None;
+        }
+        let mut cleaned = BoardSummary::default();
+        for (status, n) in &board.statuses {
+            cleaned.add(status, *n);
+        }
+        board.statuses = cleaned.statuses;
+    }
+    Some(())
+}
+
 /// What a hub sent, if all of it is external and well formed: every object
 /// says it is external, items belong to connections it sent and efforts
 /// to efforts it sent, links are HTTP(S), and nothing is out of bounds.
-/// Anything else refuses all of it. What passes keeps links as they are
-/// parsed, and text without control characters.
-pub fn checked(mut s: ExternalSnapshot) -> ConnectorResult<ExternalSnapshot> {
+/// A bot's fields and settings belong to a bot connection it sent, and
+/// their links to that connection's instance; a heartbeat or run ahead of
+/// `now`, this machine's clock, by more than clocks may disagree, is left
+/// out. Anything else refuses all of it. What passes keeps links as they are parsed, and
+/// text without control characters.
+pub fn checked(mut s: ExternalSnapshot, now: Timestamp) -> ConnectorResult<ExternalSnapshot> {
     let fail = |why: &str| Err(ConnectorError::invalid(format!("The hub's export {why}")));
     if s.zone != Zone::External
         || s.connections.iter().any(|c| c.zone != Zone::External)
@@ -415,6 +546,39 @@ pub fn checked(mut s: ExternalSnapshot) -> ConnectorResult<ExternalSnapshot> {
     }
     if !s.efforts.iter().all(|e| text_ok(&[&e.title])) {
         return fail("has an effort that isn't valid");
+    }
+    // Each connection's instance, and whether it is a bot's. Their
+    // addresses were checked above.
+    let bases: HashMap<String, (bool, Url)> = s
+        .connections
+        .iter()
+        .filter_map(|c| {
+            Some((
+                c.id.clone(),
+                (c.provider == BOT, Url::parse(&c.base_url).ok()?),
+            ))
+        })
+        .collect();
+    let bot_base = |id: &str| match bases.get(id) {
+        Some((true, base)) => Some(base),
+        _ => None,
+    };
+    for i in &mut s.items {
+        let Some(fields) = &mut i.bot else { continue };
+        let fit = i.provider == BOT
+            && bot_base(&i.connection_id)
+                .is_some_and(|base| checked_bot_fields(fields, base).is_some());
+        if !fit {
+            return fail("has an item whose bot fields aren't valid");
+        }
+    }
+    let mut bots = HashSet::new();
+    for b in &mut s.bots {
+        let fit = bots.insert(b.connection_id.clone())
+            && bot_base(&b.connection_id).is_some_and(|base| checked_bot(b, base, now).is_some());
+        if !fit {
+            return fail("has a bot that isn't valid");
+        }
     }
     for c in &mut s.connections {
         for text in [&mut c.label, &mut c.account_name] {
@@ -594,7 +758,14 @@ pub fn merge(snapshot: &mut Snapshot, export: &ExternalSnapshot, status: &Status
             synced_at,
             stale,
             from_hub: true,
-            bot: None,
+            bot: i.bot.as_ref().map(|b| BotFields {
+                kind: b.kind,
+                priority: b.priority.clone(),
+                why: b.why.clone(),
+                news: b.news.clone(),
+                branch: b.branch.clone(),
+                board_item: b.board_item.clone(),
+            }),
         });
     }
     for e in export
@@ -619,6 +790,100 @@ pub fn merge(snapshot: &mut Snapshot, export: &ExternalSnapshot, status: &Status
             },
             from_hub: true,
         });
+    }
+}
+
+/// What a companion says of a bot whose heartbeat its hub couldn't read at
+/// its last sync. The hub's own message stays on the hub.
+const HUB_HEARTBEAT_ERROR: &str = "The hub couldn't read the heartbeat at its last sync";
+
+/// The hub's bots, as the companion's Bot view shows them, read-only: where
+/// their board is, what the hub last read of their heartbeat and board, as
+/// fresh as the hub's work is (`status`), and links that ask them for
+/// something, built here, at `now`, from the tracker and login the hub
+/// exported. `board` is the companion's board with the hub's work merged
+/// in ([`merge`]): a bot whose connection it left out, as the companion's
+/// own, isn't shown twice, and only the hub's bot items shown get Ask
+/// links.
+pub fn bot_views(
+    board: &Snapshot,
+    export: &ExternalSnapshot,
+    status: &Status,
+    now: Timestamp,
+) -> Vec<BotView> {
+    export
+        .bots
+        .iter()
+        .filter_map(|b| {
+            let id = format!("{PREFIX}{}", b.connection_id);
+            let c = board
+                .connections
+                .iter()
+                .find(|c| c.from_hub && c.id == id)?;
+            let base = Url::parse(&c.base_url).ok()?;
+            let ask = |item: Option<&Item>| bot::ask_to(&b.tracker, &b.bot_login, &base, item).ok();
+            let asks = board
+                .items
+                .iter()
+                .filter(|i| i.bot.is_some() && i.connection_id.as_deref() == Some(id.as_str()))
+                .filter_map(|i| Some((i.id.clone(), ask(Some(i))?)))
+                .collect();
+            Some(BotView {
+                label: c.label.clone(),
+                bot_login: b.bot_login.clone(),
+                board_url: b.board_url.clone(),
+                agents: b
+                    .agents
+                    .as_ref()
+                    .map(|a| agent_runs(&id, a, status.schedule.stale, now)),
+                ask: ask(None)?,
+                asks,
+                from_hub: true,
+                connection_id: id,
+            })
+        })
+        .collect()
+}
+
+/// What the hub's bot connection `id` last read, as the companion shows
+/// it: stale if it was on the hub, or the hub's work is here, and its
+/// heartbeat as stale as it is at `now`.
+fn agent_runs(id: &str, a: &ExternalAgents, hub_stale: bool, now: Timestamp) -> AgentRuns {
+    AgentRuns {
+        connection_id: id.into(),
+        heartbeat: a.heartbeat.as_ref().map(|h| {
+            let mut heartbeat = Heartbeat {
+                updated_at: h.updated_at,
+                session: h.session.clone(),
+                loop_state: h.loop_state.clone(),
+                next_wake_at: h.next_wake_at,
+                runs: h
+                    .runs
+                    .iter()
+                    .map(|r| AgentRun {
+                        name: r.name.clone(),
+                        item_url: r.item_url.clone(),
+                        item_key: r.item_key.clone(),
+                        status: r.status.clone(),
+                        started_at: r.started_at,
+                        devspace: r.devspace.clone(),
+                    })
+                    .collect(),
+                skipped: h.skipped,
+                comment_url: h.comment_url.clone(),
+                stale: false,
+            };
+            heartbeat.stale = bot::heartbeat_stale(&heartbeat, now);
+            heartbeat
+        }),
+        error: a.failed.then(|| HUB_HEARTBEAT_ERROR.to_string()),
+        last_success: a.last_success,
+        stale: a.stale || hub_stale,
+        board: a.board.as_ref().map(|b| BoardSummary {
+            statuses: b.statuses.clone(),
+            fork_prs: b.fork_prs,
+            unreadable: b.unreadable,
+        }),
     }
 }
 
@@ -667,6 +932,7 @@ pub mod tests {
                 effort_id: (k == 0).then(|| "hub-effort".into()),
                 zone: Zone::External,
                 reasons: vec![crate::model::Reason::ReviewRequested],
+                bot: None,
             })
             .collect();
         ExternalSnapshot {
@@ -684,6 +950,388 @@ pub mod tests {
                     abandoned: 0,
                 },
             }],
+            bots: vec![],
+        }
+    }
+
+    /// When the exports below are checked: an hour after their syncs.
+    const NOW: Timestamp = Timestamp::from_unix(1_791_763_200 + 3600);
+
+    /// An export with a bot connection: its two items, one a fork pull
+    /// request linked from the other, and what it last read.
+    pub fn bot_export() -> ExternalSnapshot {
+        use crate::zone::{ExternalBoard, ExternalHeartbeat, ExternalRun};
+        let mut s = export(0);
+        s.efforts.clear();
+        s.connections[0] = ExternalConnection {
+            id: "hub-bot".into(),
+            provider: "bot".into(),
+            label: "Bot".into(),
+            account_id: Some("8".into()),
+            ..s.connections[0].clone()
+        };
+        let item = |n: u64, kind: &str, bot: ExternalBotFields| ExternalItem {
+            id: format!("hub-bot:bot:{n}"),
+            connection_id: "hub-bot".into(),
+            provider: "bot".into(),
+            key: format!("example-org/r#{n}"),
+            title: format!("Bot change {n}"),
+            url: format!("https://github.com/example-org/r/{kind}/{n}"),
+            status: "Needs human".into(),
+            outcome: Outcome::Open,
+            outcome_reason: "Open".into(),
+            action: "review".into(),
+            updated_at: "2026-10-12T00:00:00Z".into(),
+            effort_id: None,
+            zone: Zone::External,
+            reasons: vec![crate::model::Reason::BotWaiting],
+            bot: Some(bot),
+        };
+        s.items = vec![
+            item(
+                1,
+                "issues",
+                ExternalBotFields {
+                    kind: bot::BotKind::BoardItem,
+                    priority: Some("P0".into()),
+                    why: Some("Which default?".into()),
+                    news: Some("Asked".into()),
+                    branch: Some("https://github.com/example-org/r/pull/2".into()),
+                    board_item: None,
+                },
+            ),
+            item(
+                2,
+                "pull",
+                ExternalBotFields {
+                    kind: bot::BotKind::ForkPr,
+                    priority: None,
+                    why: None,
+                    news: None,
+                    branch: None,
+                    board_item: Some("https://github.com/example-org/r/issues/1".into()),
+                },
+            ),
+        ];
+        s.bots = vec![ExternalBot {
+            connection_id: "hub-bot".into(),
+            bot_login: "example-bot".into(),
+            tracker: "example-org/tracker".into(),
+            board_url: "https://github.com/orgs/example-org/projects/1".into(),
+            agents: Some(ExternalAgents {
+                heartbeat: Some(ExternalHeartbeat {
+                    updated_at: Timestamp::from_unix(1_791_763_200),
+                    session: "coordinator".into(),
+                    loop_state: "sleeping".into(),
+                    next_wake_at: None,
+                    runs: vec![ExternalRun {
+                        name: "wtp-one".into(),
+                        item_url: "https://github.com/example-org/r/issues/1".into(),
+                        item_key: "example-org/r#1".into(),
+                        status: "working".into(),
+                        started_at: Timestamp::from_unix(1_791_762_000),
+                        devspace: Some("devspace-1".into()),
+                    }],
+                    skipped: 0,
+                    comment_url: Some(
+                        "https://github.com/example-org/tracker/issues/1#issuecomment-1".into(),
+                    ),
+                }),
+                failed: false,
+                last_success: Some(Timestamp::from_unix(1_791_763_200)),
+                stale: false,
+                board: Some(ExternalBoard {
+                    statuses: [("Needs human".to_string(), 1), ("Draft".to_string(), 1)].into(),
+                    fork_prs: 1,
+                    unreadable: 0,
+                }),
+            }),
+        }];
+        s
+    }
+
+    #[test]
+    fn a_hubs_bot_shows_in_the_companions_bot_view() {
+        let export = checked(bot_export(), NOW).unwrap();
+        // A heartbeat from two hours before: stale by then.
+        let now = Timestamp::from_unix(1_791_763_200 + 2 * 3600);
+        for (failed, hub_stale) in [(false, false), (true, true)] {
+            let mut export = export.clone();
+            if let Some(a) = &mut export.bots[0].agents {
+                a.failed = failed;
+            }
+            let mut board = Snapshot {
+                connections: vec![],
+                items: vec![],
+                efforts: vec![],
+            };
+            merge(&mut board, &export, &status(hub_stale));
+            // The items keep their board fields.
+            let fields: Vec<_> = board.items.iter().map(|i| i.bot.clone().unwrap()).collect();
+            assert_eq!(
+                (
+                    fields[0].priority.as_deref(),
+                    fields[1].board_item.as_deref()
+                ),
+                (
+                    Some("P0"),
+                    Some("https://github.com/example-org/r/issues/1")
+                )
+            );
+            let [view] = &bot_views(&board, &export, &status(hub_stale), now)[..] else {
+                panic!()
+            };
+            assert_eq!(
+                (
+                    view.connection_id.as_str(),
+                    view.from_hub,
+                    view.bot_login.as_str(),
+                    view.board_url.as_str()
+                ),
+                (
+                    "hub:hub-bot",
+                    true,
+                    "example-bot",
+                    "https://github.com/orgs/example-org/projects/1"
+                )
+            );
+            // Ask links built here, for each of its items.
+            assert!(view
+                .ask
+                .issue_url
+                .starts_with("https://github.com/example-org/tracker/issues/new?"));
+            let keys: Vec<_> = view.asks.keys().map(String::as_str).collect();
+            assert_eq!(keys, ["hub:hub-bot:bot:1", "hub:hub-bot:bot:2"]);
+            let comment = &view.asks["hub:hub-bot:bot:2"];
+            assert_eq!(
+                (comment.comment_url.as_deref(), comment.comment.as_deref()),
+                (
+                    Some("https://github.com/example-org/r/pull/2"),
+                    Some("@example-bot ")
+                )
+            );
+            let agents = view.agents.as_ref().unwrap();
+            let heartbeat = agents.heartbeat.as_ref().unwrap();
+            assert_eq!(heartbeat.runs[0].name, "wtp-one");
+            assert!(heartbeat.stale);
+            assert_eq!(agents.stale, hub_stale);
+            assert_eq!(agents.error.is_some(), failed);
+            assert_eq!(agents.board.as_ref().unwrap().fork_prs, 1);
+        }
+    }
+
+    #[test]
+    fn a_hubs_bot_the_companion_connects_too_shows_once() {
+        let export = checked(bot_export(), NOW).unwrap();
+        let mut board = Snapshot {
+            connections: vec![Connection {
+                provider: "bot".into(),
+                account_id: "8".into(),
+                ..own("someone")
+            }],
+            items: vec![],
+            efforts: vec![],
+        };
+        merge(&mut board, &export, &status(false));
+        let now = Timestamp::from_unix(1_791_763_200);
+        assert!(bot_views(&board, &export, &status(false), now).is_empty());
+    }
+
+    #[test]
+    fn heartbeats_and_runs_ahead_of_the_clock_are_left_out() {
+        let ahead = NOW.after(std::time::Duration::from_secs(10 * 60));
+        let close = NOW.after(std::time::Duration::from_secs(60));
+        let heartbeat = |s: &mut ExternalSnapshot| {
+            s.bots[0]
+                .agents
+                .as_mut()
+                .unwrap()
+                .heartbeat
+                .as_mut()
+                .unwrap()
+                .clone()
+        };
+        // A run started ahead: left out and counted, the rest kept.
+        let mut s = bot_export();
+        let mut h = heartbeat(&mut s);
+        let mut later = h.runs[0].clone();
+        later.name = "wtp-later".into();
+        later.started_at = ahead;
+        h.runs[0].started_at = close;
+        h.runs.push(later);
+        s.bots[0].agents.as_mut().unwrap().heartbeat = Some(h);
+        let mut s = checked(s, NOW).unwrap();
+        let h = heartbeat(&mut s);
+        let names: Vec<_> = h.runs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!((names, h.skipped), (vec!["wtp-one"], 1));
+        assert!(!s.bots[0].agents.as_ref().unwrap().failed);
+        // A heartbeat ahead: left out as one that couldn't be read, and
+        // the rest of the export kept.
+        let mut s = bot_export();
+        s.bots[0]
+            .agents
+            .as_mut()
+            .unwrap()
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .updated_at = ahead;
+        let s = checked(s, NOW).unwrap();
+        let agents = s.bots[0].agents.as_ref().unwrap();
+        assert!(agents.heartbeat.is_none() && agents.failed);
+        assert!(agents.board.is_some());
+        assert_eq!(s.items.len(), 2);
+    }
+
+    #[test]
+    fn bot_parts_are_checked_and_cleaned() {
+        let mut s = bot_export();
+        let fields = s.items[0].bot.as_mut().unwrap();
+        fields.why = Some("Which\u{1b}[2J default?".into());
+        fields.branch = Some("HTTPS://GitHub.com/example-org/r/pull/2".into());
+        s.bots[0].board_url = "https://GitHub.com/orgs/example-org/projects/1".into();
+        let s = checked(s, NOW).unwrap();
+        let fields = s.items[0].bot.as_ref().unwrap();
+        assert_eq!(fields.why.as_deref(), Some("Which[2J default?"));
+        assert_eq!(
+            fields.branch.as_deref(),
+            Some("https://github.com/example-org/r/pull/2")
+        );
+        assert_eq!(
+            s.bots[0].board_url,
+            "https://github.com/orgs/example-org/projects/1"
+        );
+
+        // A wake time out of the heartbeat's window says nothing, and odd
+        // status names are cleaned, as the hub names them, rather than
+        // refusing the export.
+        let mut s = bot_export();
+        let updated_at = heartbeat(&mut s).updated_at;
+        heartbeat(&mut s).next_wake_at =
+            Some(updated_at.after(std::time::Duration::from_secs(3 * 60 * 60)));
+        board(&mut s).statuses = (0..150)
+            .map(|n| (format!("Status {n}"), 1))
+            .chain([
+                ("Done\u{7}".to_string(), 2),
+                ("x".repeat(bot::MAX_STATUS + 50), 3),
+            ])
+            .collect();
+        let s = checked(s, NOW).unwrap();
+        let agents = s.bots[0].agents.as_ref().unwrap();
+        assert_eq!(agents.heartbeat.as_ref().unwrap().next_wake_at, None);
+        let statuses = &agents.board.as_ref().unwrap().statuses;
+        assert_eq!(statuses.len(), bot::MAX_STATUSES);
+        assert_eq!(statuses.values().sum::<usize>(), 155);
+        assert!(statuses
+            .keys()
+            .all(|k| k.len() <= bot::MAX_STATUS && !k.contains(char::is_control)));
+
+        type Break = fn(&mut ExternalSnapshot);
+        fn heartbeat(s: &mut ExternalSnapshot) -> &mut crate::zone::ExternalHeartbeat {
+            s.bots[0]
+                .agents
+                .as_mut()
+                .unwrap()
+                .heartbeat
+                .as_mut()
+                .unwrap()
+        }
+        fn board(s: &mut ExternalSnapshot) -> &mut crate::zone::ExternalBoard {
+            s.bots[0].agents.as_mut().unwrap().board.as_mut().unwrap()
+        }
+        let cases: [(&str, Break); 26] = [
+            ("bot fields on another provider's item", |s| {
+                s.items[0].provider = "github".into()
+            }),
+            ("bot fields of a connection that isn't a bot's", |s| {
+                s.connections[0].provider = "github".into();
+                for i in &mut s.items {
+                    i.provider = "github".into();
+                }
+            }),
+            ("script branch", |s| {
+                s.items[0].bot.as_mut().unwrap().branch = Some("javascript:alert(1)".into())
+            }),
+            ("board item elsewhere", |s| {
+                s.items[1].bot.as_mut().unwrap().board_item =
+                    Some("https://evil.example/example-org/r/issues/1".into())
+            }),
+            ("overlong why", |s| {
+                s.items[0].bot.as_mut().unwrap().why = Some("x".repeat(MAX_FIELD + 1))
+            }),
+            ("overlong branch", |s| {
+                s.items[0].bot.as_mut().unwrap().branch =
+                    Some(format!("https://github.com/{}", "x".repeat(MAX_FIELD)))
+            }),
+            ("overlong comment link", |s| {
+                heartbeat(s).comment_url =
+                    Some(format!("https://github.com/{}", "x".repeat(MAX_FIELD)))
+            }),
+            ("bot of an unknown connection", |s| {
+                s.bots[0].connection_id = "elsewhere".into()
+            }),
+            ("repeated bot", |s| s.bots.push(s.bots[0].clone())),
+            ("login", |s| s.bots[0].bot_login = "bot is:open".into()),
+            ("tracker", |s| s.bots[0].tracker = "o/../r".into()),
+            ("board elsewhere", |s| {
+                s.bots[0].board_url = "https://evil.example/orgs/example-org/projects/1".into()
+            }),
+            ("board that isn't one", |s| {
+                s.bots[0].board_url = "https://github.com/example-org/r/issues/1".into()
+            }),
+            ("session", |s| heartbeat(s).session = "a b".into()),
+            ("loop state", |s| {
+                heartbeat(s).loop_state = "\u{1b}[2J".into()
+            }),
+            ("comment elsewhere", |s| {
+                heartbeat(s).comment_url = Some("https://evil.example/".into())
+            }),
+            ("too many runs", |s| {
+                let run = heartbeat(s).runs[0].clone();
+                heartbeat(s).runs = (0..=bot::MAX_WORKERS)
+                    .map(|n| crate::zone::ExternalRun {
+                        name: format!("run-{n}"),
+                        ..run.clone()
+                    })
+                    .collect();
+            }),
+            ("repeated run", |s| {
+                let run = heartbeat(s).runs[0].clone();
+                heartbeat(s).runs.push(run);
+            }),
+            ("run elsewhere", |s| {
+                heartbeat(s).runs[0].item_url = "https://evil.example/example-org/r/issues/1".into()
+            }),
+            ("run's key that isn't its link's", |s| {
+                heartbeat(s).runs[0].item_key = "example-org/r#2".into()
+            }),
+            ("run status", |s| {
+                heartbeat(s).runs[0].status = "Working!".into()
+            }),
+            ("devspace", |s| {
+                heartbeat(s).runs[0].devspace = Some("../x".into())
+            }),
+            ("counts that overflow", |s| {
+                board(s).statuses = [
+                    ("Todo".into(), usize::MAX / 2 + 1),
+                    ("Done".into(), usize::MAX / 2 + 1),
+                ]
+                .into()
+            }),
+            ("count over the most items", |s| {
+                board(s).statuses.insert("Todo".into(), MAX_COUNT + 1);
+            }),
+            ("fork pull requests over the most items", |s| {
+                board(s).fork_prs = usize::MAX
+            }),
+            ("unreadable items over the most items", |s| {
+                board(s).unreadable = MAX_COUNT + 1
+            }),
+        ];
+        for (what, break_it) in cases {
+            let mut s = bot_export();
+            break_it(&mut s);
+            assert!(checked(s, NOW).is_err(), "{what}");
         }
     }
 
@@ -1222,7 +1870,7 @@ pub mod tests {
         s.items[0].title = "Change \u{1b}[31m0\u{7}".into();
         s.connections[0].account_name = "some\none".into();
         s.efforts[0].title = "Effort\r".into();
-        let s = checked(s).unwrap();
+        let s = checked(s, NOW).unwrap();
         assert_eq!(s.items[0].url, "https://github.com/o/r/pull/0");
         assert_eq!(s.items[0].title, "Change [31m0");
         assert_eq!(s.connections[0].account_name, "someone");
@@ -1284,11 +1932,11 @@ pub mod tests {
                 s.connections[0].account_id = Some("1".repeat(21))
             }),
         ];
-        assert!(checked(export(2)).is_ok());
+        assert!(checked(export(2), NOW).is_ok());
         for (what, break_it) in cases {
             let mut s = export(2);
             break_it(&mut s);
-            assert!(checked(s).is_err(), "{what}");
+            assert!(checked(s, NOW).is_err(), "{what}");
         }
     }
 }

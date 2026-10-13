@@ -517,15 +517,32 @@ async fn mine(State(app): State<App>) -> ApiResult<crate::mine::Mine> {
     let (snapshot, watched, _) = board(&app)?;
     Ok(Json(crate::mine::mine(&snapshot, &watched)))
 }
-/// Each bot connection: where its board is, the agent runs of its
-/// heartbeat, and how many of its items there are. This machine's own
-/// connections only: a companion has no settings of the hub's.
-async fn bot_view(State(app): State<App>) -> ApiResult<Vec<bot::BotView>> {
-    let (snapshot, _) = fresh_snapshot(&app)?;
+/// What this machine's own bot connections last read of their heartbeats
+/// and boards, with how fresh it is.
+fn fresh_agents(app: &App, snapshot: &Snapshot) -> Result<Vec<bot::AgentRuns>> {
     let mut agents = app.db.lock().unwrap().agents()?;
     app.scheduler
         .annotate_agents(&snapshot.connections, &mut agents);
-    Ok(Json(bot::views(&snapshot, &agents)))
+    Ok(agents)
+}
+/// Each bot connection: where its board is, the agent runs of its
+/// heartbeat, and how many of its items there are. On a companion, the
+/// hub's bots too, read-only, as of the last pull, with Ask links built
+/// here from what the hub exported.
+async fn bot_view(State(app): State<App>) -> ApiResult<Vec<bot::BotView>> {
+    let (mut snapshot, _) = fresh_snapshot(&app)?;
+    let agents = fresh_agents(&app, &snapshot)?;
+    let mut views = bot::views(&snapshot, &agents);
+    if let Some((status, Some(export))) = app.scheduler.hub_view()? {
+        hub::merge(&mut snapshot, &export, &status);
+        views.extend(hub::bot_views(
+            &snapshot,
+            &export,
+            &status,
+            app.scheduler.now(),
+        ));
+    }
+    Ok(Json(views))
 }
 /// What may leave this machine: the external zone of this machine's own
 /// work only, never the work a companion pulled from a hub. A hub serves
@@ -535,7 +552,9 @@ async fn export_external(State(app): State<App>) -> ApiResult<zone::ExternalSnap
         Mode::Hub => zone::Exporter::Hub,
         Mode::Local => zone::Exporter::Local,
     };
-    Ok(Json(zone::external_only(&fresh_snapshot(&app)?.0, from)))
+    let (snapshot, _) = fresh_snapshot(&app)?;
+    let agents = fresh_agents(&app, &snapshot)?;
+    Ok(Json(zone::external_only(&snapshot, &agents, from)))
 }
 /// Fail if `id` names the hub's work, which is read-only on its companion.
 fn local(id: &str) -> Result<()> {

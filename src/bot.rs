@@ -181,6 +181,72 @@ pub struct BoardSummary {
     pub unreadable: usize,
 }
 
+/// Most statuses a board summary names, and the longest name kept, in
+/// bytes. A board's options are its owner's text, so a summary bounds
+/// them, as a hub's companion does again.
+pub const MAX_STATUSES: usize = 100;
+pub const MAX_STATUS: usize = 100;
+/// What a summary counts the statuses past [`MAX_STATUSES`] under.
+pub const OTHER_STATUSES: &str = "Other statuses";
+/// What an item without a status is counted under, and a status whose
+/// name is nothing printable.
+pub const NO_STATUS: &str = "No status";
+
+/// `status` as a summary names it: without control characters, which a
+/// terminal could take as escapes, trimmed, and at most [`MAX_STATUS`]
+/// bytes.
+pub fn status_name(status: &str) -> String {
+    let printable: String = status.chars().filter(|c| !c.is_control()).collect();
+    let mut name = printable.trim();
+    if name.len() > MAX_STATUS {
+        let mut end = MAX_STATUS;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name = name[..end].trim_end();
+    }
+    if name.is_empty() {
+        NO_STATUS.into()
+    } else {
+        name.into()
+    }
+}
+
+impl BoardSummary {
+    /// Count `n` items of board status `status`, named by [`status_name`],
+    /// and under [`OTHER_STATUSES`] once all but one of [`MAX_STATUSES`]
+    /// names are taken. Counts saturate rather than overflow. Adding a
+    /// summary's statuses again, in any order, gives the same summary.
+    pub fn add(&mut self, status: &str, n: usize) {
+        let mut name = status_name(status);
+        let named = self.statuses.len() - usize::from(self.statuses.contains_key(OTHER_STATUSES));
+        if name != OTHER_STATUSES && !self.statuses.contains_key(&name) && named >= MAX_STATUSES - 1
+        {
+            name = OTHER_STATUSES.into();
+        }
+        let count = self.statuses.entry(name).or_default();
+        *count = count.saturating_add(n);
+    }
+    /// The items on the board, by status, without overflowing.
+    pub fn total(&self) -> usize {
+        self.statuses
+            .values()
+            .fold(0, |total, n| total.saturating_add(*n))
+    }
+}
+
+/// Whether `t` is no further ahead of `now` than clocks may disagree.
+pub fn not_ahead(t: Timestamp, now: Timestamp) -> bool {
+    t <= now.after(MAX_SKEW)
+}
+
+/// `wake`, if it is a wake time a heartbeat updated at `updated_at` can
+/// give: not before it, nor more than the longest sleep after it. Any
+/// other says nothing.
+pub fn wake_after(updated_at: Timestamp, wake: Option<Timestamp>) -> Option<Timestamp> {
+    wake.filter(|wake| *wake >= updated_at && *wake <= updated_at.after(MAX_SLEEP))
+}
+
 /// What a bot item is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -394,6 +460,25 @@ pub fn item_on(url: &str, base: &Url) -> Option<(String, String)> {
     }
 }
 
+/// `url`, if it is the address of a Projects board on the instance whose
+/// web address is `base`, as [`BotConfig::board_url`] writes one.
+pub fn board_on(url: &str, base: &Url) -> Option<Url> {
+    let parsed = Url::parse(url).ok()?;
+    if parsed.origin() != base.origin()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let (kind, owner, number) = parse_board(parsed.path().strip_prefix(base.path())?).ok()?;
+    let board = base
+        .join(&format!("{}/{owner}/projects/{number}", kind.path()))
+        .ok()?;
+    (board == parsed).then_some(board)
+}
+
 /// `url`, if it is a link to a comment, or any page, on the instance whose
 /// web address is `base`, without credentials.
 pub fn page_on(url: &str, base: &Url) -> Option<String> {
@@ -434,9 +519,8 @@ pub fn parse_heartbeat(body: &str, base: &Url, now: Timestamp) -> Result<Heartbe
     if v["schema"] != HEARTBEAT_SCHEMA {
         return Err("the heartbeat is of an unknown schema".into());
     }
-    let latest = now.after(MAX_SKEW);
     let updated_at = time(&v["updated_at"]).ok_or("the heartbeat has no valid updated_at")?;
-    if updated_at > latest {
+    if !not_ahead(updated_at, now) {
         return Err("the heartbeat is from the future".into());
     }
     let coordinator = &v["coordinator"];
@@ -448,10 +532,7 @@ pub fn parse_heartbeat(body: &str, base: &Url, now: Timestamp) -> Result<Heartbe
         .as_str()
         .filter(|s| valid_word(s))
         .ok_or("the heartbeat has no valid loop state")?;
-    // A wake time from before the heartbeat, or too far after it, says
-    // nothing.
-    let next_wake_at = time(&coordinator["next_wake_at"])
-        .filter(|wake| *wake >= updated_at && *wake <= updated_at.after(MAX_SLEEP));
+    let next_wake_at = wake_after(updated_at, time(&coordinator["next_wake_at"]));
     let workers = v["workers"]
         .as_array()
         .ok_or("the heartbeat lists no workers")?;
@@ -460,7 +541,7 @@ pub fn parse_heartbeat(body: &str, base: &Url, now: Timestamp) -> Result<Heartbe
         let run = (|| {
             let name = w["name"].as_str().filter(|n| valid_name(n))?;
             let (item_url, item_key) = item_on(w["item_url"].as_str()?, base)?;
-            let started_at = time(&w["started_at"]).filter(|t| *t <= latest)?;
+            let started_at = time(&w["started_at"]).filter(|t| not_ahead(*t, now))?;
             let status = w["status"].as_str().filter(|s| valid_word(s))?;
             let devspace = w["devspace"].as_str().filter(|d| valid_devspace(d));
             Some(AgentRun {
@@ -616,6 +697,10 @@ pub struct BotView {
     pub ask: Ask,
     /// Ask it about one of its items, by the item's ID.
     pub asks: BTreeMap<String, Ask>,
+    /// It is the hub's bot, as of the companion's last pull, and read-only
+    /// here.
+    #[serde(default)]
+    pub from_hub: bool,
 }
 
 /// Each bot connection of `snapshot`, with what it read of its heartbeat
@@ -643,6 +728,7 @@ pub fn views(snapshot: &Snapshot, agents: &[AgentRuns]) -> Vec<BotView> {
                 agents: agents.iter().find(|a| a.connection_id == c.id).cloned(),
                 ask: ask(config, &base, None).ok()?,
                 asks,
+                from_hub: false,
             })
         })
         .collect()
@@ -719,6 +805,123 @@ pub mod tests {
             config().board_url(&base).unwrap().as_str(),
             "https://github.com/orgs/example-org/projects/1"
         );
+    }
+
+    #[test]
+    fn boards_on_the_instance() {
+        let base = Url::parse("https://github.com/").unwrap();
+        let ghe = Url::parse("https://ghe.example.com/github/").unwrap();
+        // (URL, instance, the board it is)
+        for (url, base, board) in [
+            (
+                "https://github.com/orgs/example-org/projects/1",
+                &base,
+                Some("https://github.com/orgs/example-org/projects/1"),
+            ),
+            (
+                "https://GitHub.com/users/someone/projects/3",
+                &base,
+                Some("https://github.com/users/someone/projects/3"),
+            ),
+            (
+                "https://ghe.example.com/github/orgs/o/projects/2",
+                &ghe,
+                Some("https://ghe.example.com/github/orgs/o/projects/2"),
+            ),
+            ("https://ghe.example.com/orgs/o/projects/2", &ghe, None),
+            (
+                "https://evil.example/orgs/example-org/projects/1",
+                &base,
+                None,
+            ),
+            ("http://github.com/orgs/example-org/projects/1", &base, None),
+            (
+                "https://me@github.com/orgs/example-org/projects/1",
+                &base,
+                None,
+            ),
+            (
+                "https://github.com/orgs/example-org/projects/1?x=1",
+                &base,
+                None,
+            ),
+            (
+                "https://github.com/orgs/example-org/projects/1#x",
+                &base,
+                None,
+            ),
+            ("https://github.com/orgs/example-org/1", &base, None),
+            (
+                "https://github.com/orgs/example-org/projects/1/",
+                &base,
+                None,
+            ),
+            (
+                "https://github.com/orgs/example-org/projects/01",
+                &base,
+                None,
+            ),
+            (
+                "https://github.com/teams/example-org/projects/1",
+                &base,
+                None,
+            ),
+            ("orgs/example-org/projects/1", &base, None),
+        ] {
+            assert_eq!(
+                board_on(url, base).as_ref().map(Url::as_str),
+                board,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn board_summaries_bound_and_clean_their_statuses() {
+        let long = "é".repeat(MAX_STATUS);
+        // (status, its name in a summary)
+        for (status, name) in [
+            ("Todo", "Todo"),
+            ("  In Progress ", "In Progress"),
+            ("Done\u{1b}[2J", "Done[2J"),
+            ("\u{7}", NO_STATUS),
+            ("", NO_STATUS),
+            (long.as_str(), &long[..MAX_STATUS]),
+        ] {
+            assert_eq!(status_name(status), name, "{status:?}");
+        }
+        let mut summary = BoardSummary::default();
+        for n in 0..MAX_STATUSES + 10 {
+            summary.add(&format!("Status {n}"), 2);
+        }
+        summary.add("Status 0", usize::MAX);
+        assert_eq!(summary.statuses.len(), MAX_STATUSES);
+        assert_eq!(summary.statuses[OTHER_STATUSES], 2 * 11);
+        assert_eq!(summary.statuses["Status 0"], usize::MAX);
+        assert_eq!(summary.total(), usize::MAX);
+    }
+
+    #[test]
+    fn a_full_summary_cleaned_again_is_unchanged() {
+        // Names that sort before and after "Other statuses", so it comes
+        // in the middle when they are added again in order.
+        let mut summary = BoardSummary::default();
+        for n in 0..MAX_STATUSES + 20 {
+            let name = if n % 2 == 0 { "A" } else { "Z" };
+            summary.add(&format!("{name} {n}"), n + 1);
+        }
+        assert_eq!(summary.statuses.len(), MAX_STATUSES);
+        assert!(summary.statuses.contains_key(OTHER_STATUSES));
+        let mut again = BoardSummary::default();
+        for (status, n) in &summary.statuses {
+            again.add(status, *n);
+        }
+        assert_eq!(again, summary);
+        let mut reversed = BoardSummary::default();
+        for (status, n) in summary.statuses.iter().rev() {
+            reversed.add(status, *n);
+        }
+        assert_eq!(reversed, summary);
     }
 
     /// A heartbeat comment as `bot-heartbeat` writes it, around `json`.

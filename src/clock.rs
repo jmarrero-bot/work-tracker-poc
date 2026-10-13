@@ -54,7 +54,7 @@ pub struct Timestamp(i64);
 const DAY: i64 = 86_400;
 
 impl Timestamp {
-    pub fn from_unix(seconds: i64) -> Self {
+    pub const fn from_unix(seconds: i64) -> Self {
         Self(seconds)
     }
     pub fn unix(self) -> i64 {

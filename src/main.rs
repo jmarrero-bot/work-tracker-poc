@@ -1358,8 +1358,13 @@ fn open_in_browser(url: &str) -> Result<()> {
 /// A bot connection: its board's counts, its coordinator's heartbeat and
 /// the agent runs it lists, and how fresh that is.
 fn print_bot(v: &bot::BotView, now: Timestamp) {
+    let from_hub = if v.from_hub {
+        "  (the hub's, read-only)"
+    } else {
+        ""
+    };
     println!(
-        "{}  {}  {}  {}",
+        "{}  {}  {}  {}{from_hub}",
         v.connection_id, v.label, v.bot_login, v.board_url
     );
     let Some(agents) = &v.agents else {
@@ -1368,7 +1373,7 @@ fn print_bot(v: &bot::BotView, now: Timestamp) {
     };
     match &agents.board {
         Some(board) => {
-            let items: usize = board.statuses.values().sum();
+            let items = board.total();
             let statuses: Vec<_> = board
                 .statuses
                 .iter()
