@@ -207,9 +207,13 @@ pub fn is_plugin(provider: &str) -> bool {
 fn plugin_path(plugins: &Path, provider: &str) -> Result<std::path::PathBuf> {
     let program = std::path::absolute(plugins.join(provider))?;
     if !program.exists() {
-        bail!(
-            "Live connection currently supports Jira Data Center, GitLab, GitHub and Fedora Forge, and connector plugins such as {}",
+        // The data directory's path stays in the service's log.
+        eprintln!(
+            "No connector plugin for {provider} at {}",
             program.display()
+        );
+        bail!(
+            "Live connection currently supports Jira Data Center, GitLab, GitHub and Fedora Forge, and connector plugins installed in the data directory's plugins directory; the service's log says where it looked"
         )
     }
     Ok(program)

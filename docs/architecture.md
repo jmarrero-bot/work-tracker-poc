@@ -140,12 +140,12 @@ All `/api` routes require the service's private socket, which only its own user 
 | `DELETE /api/hub` | Stop pulling from the hub, and forget its token and work |
 | `POST /api/hub/login` | Sign in to a hub (`url`) with GitHub's device flow: the code to enter, and where |
 | `POST /api/hub/login/poll` | Whether that sign-in is done; once it is, pull from the hub with what it gave |
-| `GET /api/companion-token` | A hub's companion token |
-| `POST /api/companion-token` | Replace a hub's companion token, and revoke the companion credentials its sign-ins gave |
+| `GET /api/companion-token` | A hub's companion token; for the CLI only |
+| `POST /api/companion-token` | Replace a hub's companion token, and revoke the companion credentials its sign-ins gave; for the CLI only |
 | `GET /api/mine` | What waits on each connection's account, and apart from it what watching found |
 | `GET /api/bot` | Each bot connection: its board's counts, its heartbeat's agent runs, and links that ask it for something |
-| `POST /api/connections` | Verify an account and store its credential |
-| `PATCH /api/connections/:id` | Watch another GitHub user from a connection, or stop; change how often it syncs (`sync_interval` in seconds, null for the default); for a plugin, which variables of the service's environment it gets (`plugin_env`) |
+| `POST /api/connections` | Verify an account and store its credential; to a plugin's source, for the CLI and the GNOME app only |
+| `PATCH /api/connections/:id` | Watch another GitHub user from a connection, or stop; change how often it syncs (`sync_interval` in seconds, null for the default); for a plugin, which variables of the service's environment it gets (`plugin_env`, for the CLI and the GNOME app only) |
 | `POST /api/connections/:id/verify` | Check a connection's credential again, or replace it (`token`) with one for the same account; resumes its scheduled syncs |
 | `GET /api/connections/:id/plugin` | Which plugin file a plugin connection trusts, and what its plugin hashes to now (SHA-256) |
 | `POST /api/connections/:id/plugin` | Trust the plugin file with this SHA-256 (`sha256`), if the plugin still hashes to it, and verify the connection |

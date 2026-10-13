@@ -511,11 +511,8 @@ fn pairing_urls(access: &Access, token: Option<u64>) -> Option<Vec<String>> {
 /// A new one-time pairing URL, for the CLI or the GNOME app alone: never
 /// for a browser, which could pair others with it.
 async fn new_pairing(State(app): State<App>, Extension(caller): Extension<Caller>) -> Response {
-    if !matches!(caller, Caller::Local { .. }) {
-        return refused(
-            StatusCode::FORBIDDEN,
-            "Only the CLI and the GNOME app ask for a pairing URL",
-        );
+    if let Some(refused) = local_only(caller) {
+        return refused;
     }
     let Caller::Local { token } = caller else {
         unreachable!("only the CLI and the GNOME app get here")
@@ -582,6 +579,35 @@ async fn pair(
     );
     response
 }
+/// Refuse a caller that isn't the CLI or the GNOME app: what it asked for
+/// is a credential, or makes one, that no browser should hold.
+fn local_only(caller: Caller) -> Option<Response> {
+    (!matches!(caller, Caller::Local { .. })).then(|| {
+        refused(
+            StatusCode::FORBIDDEN,
+            "Only the CLI and the GNOME app may do this",
+        )
+    })
+}
+/// The routes of the companion token, for the CLI on the hub alone.
+async fn companion_token_route(
+    State(app): State<App>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    match local_only(caller) {
+        Some(refused) => refused,
+        None => companion_token(State(app)).await.into_response(),
+    }
+}
+async fn rotate_companion_token_route(
+    State(app): State<App>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    match local_only(caller) {
+        Some(refused) => refused,
+        None => rotate_companion_token(State(app)).await.into_response(),
+    }
+}
 /// A hub's companion token, which a companion uses to read the external
 /// export.
 async fn companion_token(State(app): State<App>) -> ApiResult<Value> {
@@ -613,11 +639,8 @@ async fn rotate_app_token(
     State(app): State<App>,
     Extension(caller): Extension<Caller>,
 ) -> Response {
-    if !matches!(caller, Caller::Local { .. }) {
-        return refused(
-            StatusCode::FORBIDDEN,
-            "Only the CLI and the GNOME app rotate the application token",
-        );
+    if let Some(refused) = local_only(caller) {
+        return refused;
     }
     let token = new_token();
     let root = app.db.lock().unwrap().root.clone();
@@ -896,7 +919,25 @@ fn local(id: &str) -> Result<()> {
     }
     Ok(())
 }
-async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> ApiResult<Connection> {
+async fn connect(
+    State(app): State<App>,
+    Extension(caller): Extension<Caller>,
+    Json(input): Json<ConnectInput>,
+) -> Response {
+    // Connecting to a plugin's source runs the plugin file there now, and
+    // trusts it, with what it is given of the service's environment: the
+    // CLI's decisions, like `workboard plugin trust`. Before anything runs.
+    if connectors::is_plugin(&input.provider) {
+        if let Some(refused) = local_only(caller) {
+            return refused;
+        }
+    }
+    match connect_as_asked(app, input).await {
+        Ok(c) => c.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+async fn connect_as_asked(app: App, input: ConnectInput) -> ApiResult<Connection> {
     if input.label.trim().is_empty() || input.label.len() > 100 {
         bail_api("Enter a connection name of 1–100 characters")?
     }
@@ -1016,8 +1057,26 @@ struct ConnectionPatch {
 /// finds shows as theirs, never as the connection's account's.
 async fn patch_connection(
     State(app): State<App>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(input): Json<ConnectionPatch>,
+) -> Response {
+    // What a plugin gets of the service's environment is the CLI's to
+    // decide, like trusting its file.
+    if input.plugin_env.is_some() {
+        if let Some(refused) = local_only(caller) {
+            return refused;
+        }
+    }
+    match patch_connection_as_asked(app, id, input).await {
+        Ok(c) => c.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+async fn patch_connection_as_asked(
+    app: App,
+    id: String,
+    input: ConnectionPatch,
 ) -> ApiResult<Connection> {
     local(&id)?;
     // Every field is checked before any is written.
@@ -1074,13 +1133,20 @@ async fn verify(
     ))
 }
 /// Which plugin file a plugin connection trusts, and what its plugin
-/// hashes to now.
+/// hashes to now. Trust is the CLI's to decide, so this is its alone.
 async fn plugin_trust(
     State(app): State<App>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
-) -> ApiResult<schedule::PluginTrust> {
-    local(&id)?;
-    Ok(Json(app.scheduler.plugin_trust(&id)?))
+) -> Response {
+    if let Some(refused) = local_only(caller) {
+        return refused;
+    }
+    let trust = local(&id).and_then(|()| app.scheduler.plugin_trust(&id));
+    match trust {
+        Ok(trust) => Json(trust).into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
 }
 #[derive(Deserialize)]
 struct TrustInput {
@@ -1091,11 +1157,20 @@ struct TrustInput {
 /// and verify the connection with it.
 async fn trust_plugin(
     State(app): State<App>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(input): Json<TrustInput>,
-) -> ApiResult<Connection> {
-    local(&id)?;
-    Ok(Json(app.scheduler.trust_plugin(&id, &input.sha256).await?))
+) -> Response {
+    if let Some(refused) = local_only(caller) {
+        return refused;
+    }
+    if let Err(e) = local(&id) {
+        return ApiError(e).into_response();
+    }
+    match app.scheduler.trust_plugin(&id, &input.sha256).await {
+        Ok(c) => Json(c).into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
 }
 async fn disconnect(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Value> {
     local(&id)?;
@@ -1672,7 +1747,7 @@ fn router(app: App) -> Router {
         .route("/hub/login/poll", post(hub_login_poll))
         .route(
             "/companion-token",
-            get(companion_token).post(rotate_companion_token),
+            get(companion_token_route).post(rotate_companion_token_route),
         )
         .route("/connections", post(connect))
         .route(
@@ -3341,6 +3416,139 @@ mod tests {
         // gets no code after it; one with the new token does.
         assert!(app.access.pairing_code(before).is_none());
         assert!(app.access.pairing_code(Some(2)).is_some());
+    }
+
+    #[tokio::test]
+    async fn only_the_cli_decides_what_a_plugin_runs_with() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path(), Mode::Local, LOCAL, None);
+        app.access = Arc::new(access(false));
+        let tcp = router(app.clone());
+        let socket = on_socket(router(app), "this-service").unwrap();
+        let paired = format!("{SESSION_COOKIE}={PAIRED}");
+        let origin = format!("http://{LOCAL}");
+        let bearer = format!("Bearer {TOKEN}");
+        let browser = [
+            (HOST, LOCAL),
+            (COOKIE, paired.as_str()),
+            (ORIGIN, origin.as_str()),
+        ];
+        let id = "00000000-0000-4000-8000-000000000001";
+        let plugin = format!("/api/connections/{id}/plugin");
+        let connection = format!("/api/connections/{id}");
+        let trust = json!({ "sha256": "0".repeat(64) });
+        let env = json!({ "plugin_env": ["HOME"] });
+        // (method, path, body)
+        // Connecting to a plugin's source, which would run it: with what
+        // it gets of the service's environment, or without.
+        let connect = |plugin_env: &[&str]| {
+            Some(json!({
+                "provider": "errata",
+                "label": "Errata",
+                "base_url": "https://errata.example/",
+                "token": "test-only-token",
+                "plugin_env": plugin_env,
+            }))
+        };
+        let asks = [
+            (Method::GET, plugin.as_str(), None),
+            (Method::POST, plugin.as_str(), Some(trust)),
+            (Method::PATCH, connection.as_str(), Some(env)),
+            (Method::POST, "/api/connections", connect(&["HTTPS_PROXY"])),
+            (Method::POST, "/api/connections", connect(&[])),
+        ];
+        for (method, path, body) in asks {
+            let (status, _, body_text) =
+                call(&tcp, method.clone(), path, &browser, body.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path}: {body_text}"
+            );
+            // The CLI gets past that, to the connection that isn't there.
+            for (router, headers) in [
+                (&socket, vec![(HOST, "workboard")]),
+                (&tcp, vec![(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())]),
+            ] {
+                let (status, _, body_text) =
+                    call(router, method.clone(), path, &headers, body.clone()).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{method} {path}: {body_text}"
+                );
+                // Without the data directory's path, which only the log has.
+                let root = root.path().to_str().unwrap();
+                assert!(!body_text.contains(root), "{body_text}");
+            }
+        }
+        // A browser still connects a source with a built-in connector: here
+        // it gets as far as the address it gave.
+        let builtin = json!({
+            "provider": "jira",
+            "label": "Jira",
+            "base_url": "not a URL",
+            "token": "test-only-token",
+        });
+        let (status, _, body_text) = call(
+            &tcp,
+            Method::POST,
+            "/api/connections",
+            &browser,
+            Some(builtin),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body_text}");
+        // A browser still changes how often a connection syncs.
+        let (status, _, body_text) = call(
+            &tcp,
+            Method::PATCH,
+            &connection,
+            &browser,
+            Some(json!({ "sync_interval": 3600 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body_text}");
+        assert!(body_text.contains("not found"), "{body_text}");
+    }
+
+    #[tokio::test]
+    async fn only_the_cli_reads_or_rotates_the_companion_token() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        // A hub started with --pairing, with a paired browser.
+        let mut app = test_app(root.path(), Mode::Hub, LOCAL, None);
+        app.access = Arc::new(access(true));
+        let tcp = router(app.clone());
+        let paired = format!("{SESSION_COOKIE}={PAIRED}");
+        let bearer = format!("Bearer {TOKEN}");
+        let origin = format!("http://{LOCAL}");
+        let browser = [
+            (HOST, LOCAL),
+            (COOKIE, paired.as_str()),
+            (ORIGIN, origin.as_str()),
+        ];
+        for method in [Method::GET, Method::POST] {
+            let (status, _, body) =
+                call(&tcp, method.clone(), "/api/companion-token", &browser, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+            assert!(!body.contains(COMPANION), "{body}");
+        }
+        let cli = [(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())];
+        let (status, _, body) = call(&tcp, Method::GET, "/api/companion-token", &cli, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(COMPANION), "{body}");
+        let socket = router(app).layer(Extension(ViaSocket));
+        let (status, _, body) = call(
+            &socket,
+            Method::POST,
+            "/api/companion-token",
+            &[(HOST, "workboard")],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// The hub credential a companion keeps, from its data directory.
