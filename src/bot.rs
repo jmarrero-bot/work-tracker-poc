@@ -88,8 +88,7 @@ impl BotConfig {
     }
     /// The tracker's owner and repository.
     pub fn tracker_parts(&self) -> Option<(&str, &str)> {
-        let (owner, repo) = self.tracker.split_once('/')?;
-        (valid_github_login(owner) && valid_github_name(repo)).then_some((owner, repo))
+        tracker_parts(&self.tracker)
     }
     /// The board's address on the instance whose web address is `base`.
     pub fn board_url(&self, base: &Url) -> Result<Url> {
@@ -100,6 +99,13 @@ impl BotConfig {
             self.board_number
         ))?)
     }
+}
+
+/// A tracker's owner and repository, if `tracker` is `OWNER/REPO`, each
+/// what it can be on GitHub.
+pub fn tracker_parts(tracker: &str) -> Option<(&str, &str)> {
+    let (owner, repo) = tracker.split_once('/')?;
+    (valid_github_login(owner) && valid_github_name(repo)).then_some((owner, repo))
 }
 
 /// Where a bot's work is, as a person gives it when connecting: the board
@@ -223,7 +229,7 @@ pub const MAX_COMMENT: usize = 64 * 1024;
 /// Longest heartbeat JSON parsed, in bytes.
 const MAX_JSON: usize = 32 * 1024;
 /// Most workers listed, as `bot-heartbeat` allows.
-const MAX_WORKERS: usize = 32;
+pub const MAX_WORKERS: usize = 32;
 /// How far a time may be ahead of this machine's clock.
 const MAX_SKEW: Duration = Duration::from_secs(5 * 60);
 /// The longest the coordinator says it sleeps, after `updated_at`.
@@ -315,7 +321,7 @@ fn word(text: &str, max: usize, first: fn(char) -> bool, rest: fn(char) -> bool)
 }
 /// A worker or session name: 1-64 of `[A-Za-z0-9_.-]`, not starting with
 /// punctuation.
-fn valid_name(text: &str) -> bool {
+pub fn valid_name(text: &str) -> bool {
     word(
         text,
         64,
@@ -325,7 +331,7 @@ fn valid_name(text: &str) -> bool {
 }
 /// A loop state or worker status: `bot-heartbeat`'s words, or newer ones,
 /// shown as they are.
-fn valid_word(text: &str) -> bool {
+pub fn valid_word(text: &str) -> bool {
     word(
         text,
         24,
@@ -334,7 +340,7 @@ fn valid_word(text: &str) -> bool {
     )
 }
 /// A `bot-devspace` name.
-fn valid_devspace(text: &str) -> bool {
+pub fn valid_devspace(text: &str) -> bool {
     word(
         text,
         63,
@@ -386,6 +392,17 @@ pub fn item_on(url: &str, base: &Url) -> Option<(String, String)> {
         }
         _ => None,
     }
+}
+
+/// `url`, if it is a link to a comment, or any page, on the instance whose
+/// web address is `base`, without credentials.
+pub fn page_on(url: &str, base: &Url) -> Option<String> {
+    Url::parse(url)
+        .ok()
+        .filter(|u| {
+            u.origin() == base.origin() && u.username().is_empty() && u.password().is_none()
+        })
+        .map(String::from)
 }
 
 /// The heartbeat in the body of the bot's comment, read at `now` from the
@@ -490,11 +507,7 @@ pub fn find_heartbeat(
             continue;
         }
         let mut heartbeat = parse_heartbeat(body, base, now)?;
-        heartbeat.comment_url = c["html_url"]
-            .as_str()
-            .and_then(|u| Url::parse(u).ok())
-            .filter(|u| u.origin() == base.origin() && u.username().is_empty())
-            .map(String::from);
+        heartbeat.comment_url = c["html_url"].as_str().and_then(|u| page_on(u, base));
         return Ok(Some(heartbeat));
     }
     Ok(None)
@@ -541,9 +554,18 @@ fn encode(text: &str) -> String {
 /// How to ask the bot of `config`, on the instance whose web address is
 /// `base`, for something: about `item`, if given, or anything at all.
 pub fn ask(config: &BotConfig, base: &Url, item: Option<&Item>) -> Result<Ask> {
-    let (owner, repo) = config
-        .tracker_parts()
-        .context("The bot's tracker isn't a repository")?;
+    ask_to(&config.tracker, &config.bot_login, base, item)
+}
+
+/// How to ask the bot `bot_login`, whose tracker is `tracker`, on the
+/// instance whose web address is `base`, for something: about `item`, if
+/// given, or anything at all. A companion builds the links for its hub's
+/// bot with this, from the tracker and login the hub exported.
+pub fn ask_to(tracker: &str, bot_login: &str, base: &Url, item: Option<&Item>) -> Result<Ask> {
+    let (owner, repo) = tracker_parts(tracker).context("The bot's tracker isn't a repository")?;
+    if !valid_github_login(bot_login) {
+        bail!("The bot's login isn't a GitHub login")
+    }
     let mut url = base.join(&format!("{owner}/{repo}/issues/new"))?;
     let what = "<!-- Opened from Workboard. Say what the bot should do, and why; it triages this issue. -->";
     let template = "## What to do\n\n\n## Why\n\n";
@@ -574,9 +596,7 @@ pub fn ask(config: &BotConfig, base: &Url, item: Option<&Item>) -> Result<Ask> {
     let comment_url = item.and_then(|i| item_on(&i.url, base)).map(|(url, _)| url);
     Ok(Ask {
         issue_url: url.into(),
-        comment: comment_url
-            .as_ref()
-            .map(|_| format!("@{} ", config.bot_login)),
+        comment: comment_url.as_ref().map(|_| format!("@{bot_login} ")),
         comment_url,
     })
 }
