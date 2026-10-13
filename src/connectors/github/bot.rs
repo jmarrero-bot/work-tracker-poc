@@ -24,7 +24,7 @@ use super::{
     current_user, github_item, readonly::ReadOnly, refresh_issues, search_issues, Got, Memory,
 };
 use crate::{
-    bot::{find_heartbeat, BoardSummary, BotConfig, BotFields, BotKind, Heartbeat},
+    bot::{find_heartbeat, BoardSummary, BotConfig, BotFields, BotKind, Heartbeat, NO_STATUS},
     connector::{
         Account, BoxFuture, Connector, ConnectorError, ConnectorResult, ErrorKind, Reason,
         Refreshed, RemoteItem, Requests, Target, Tracked,
@@ -54,8 +54,6 @@ const BOARD_ITEM_ID: &str = "PVTI_";
 /// (Needs human), or a review of a draft (Draft).
 const NEEDS_HUMAN: &str = "Needs human";
 const DRAFT: &str = "Draft";
-/// How an item without a board status reads.
-const NO_STATUS: &str = "No status";
 /// The GraphQL error GitHub answers for an ID that names nothing.
 const NOT_FOUND: &str = "NOT_FOUND";
 /// Comments per page of the heartbeat issue, GitHub's largest.
@@ -506,7 +504,9 @@ impl Bot {
             ..BoardSummary::default()
         };
         for i in &items {
-            *summary.statuses.entry(i.status.clone()).or_default() += 1;
+            // Bounded and printable: the board's own option names leave
+            // with the export, and a companion checks them again.
+            summary.add(&i.status, 1);
         }
         // Each fork pull request, linked to the board item whose Branch is
         // its address. One that is a board item itself is that item.
@@ -1424,35 +1424,42 @@ mod tests {
         assert_eq!(bot.requests().unwrap().sent["POST /graphql (query)"], 10);
     }
 
+    /// The fixture, also serving the heartbeat issue's comments: someone
+    /// else's, and the bot's heartbeat, with a worker on this instance and
+    /// one elsewhere.
+    fn with_heartbeat() -> Router {
+        router().route(
+            "/api/v3/repos/example-org/tracker/issues/1/comments",
+            get(heartbeat_comments),
+        )
+    }
+    async fn heartbeat_comments(headers: HeaderMap) -> Json<Value> {
+        let base = base(&headers);
+        let heartbeat = json!({
+            "schema": "bot-heartbeat/v1", "updated_at": "2026-10-12T03:58:44Z",
+            "coordinator": {"session": "s1", "loop_state": "working"},
+            "workers": [
+                {"name": "wtp-slice8", "item_url": format!("{base}example-org/app/issues/9"),
+                 "started_at": "2026-10-12T03:28:44Z", "status": "working"},
+                // Not on this instance.
+                {"name": "elsewhere", "item_url": "https://github.com/o/r/issues/1",
+                 "started_at": "2026-10-12T03:28:44Z", "status": "working"},
+            ],
+        });
+        let body = format!(
+            "{}\nCoordinator.\n\n```json\n{heartbeat}\n```\n",
+            crate::bot::HEARTBEAT_MARKER
+        );
+        Json(json!([
+            {"user": {"login": "someone", "id": 9}, "body": "Hi"},
+            {"user": {"login": "example-bot", "id": 7}, "body": body,
+             "html_url": format!("{base}example-org/tracker/issues/1#issuecomment-1")},
+        ]))
+    }
+
     #[tokio::test]
     async fn the_heartbeat_is_read_as_agent_runs_apart_from_items() {
-        let comments = |headers: HeaderMap| async move {
-            let base = base(&headers);
-            let heartbeat = json!({
-                "schema": "bot-heartbeat/v1", "updated_at": "2026-10-12T03:58:44Z",
-                "coordinator": {"session": "s1", "loop_state": "working"},
-                "workers": [
-                    {"name": "wtp-slice8", "item_url": format!("{base}example-org/app/issues/9"),
-                     "started_at": "2026-10-12T03:28:44Z", "status": "working"},
-                    // Not on this instance.
-                    {"name": "elsewhere", "item_url": "https://github.com/o/r/issues/1",
-                     "started_at": "2026-10-12T03:28:44Z", "status": "working"},
-                ],
-            });
-            let body = format!(
-                "{}\nCoordinator.\n\n```json\n{heartbeat}\n```\n",
-                crate::bot::HEARTBEAT_MARKER
-            );
-            Json(json!([
-                {"user": {"login": "someone", "id": 9}, "body": "Hi"},
-                {"user": {"login": "example-bot", "id": 7}, "body": body,
-                 "html_url": format!("{base}example-org/tracker/issues/1#issuecomment-1")},
-            ]))
-        };
-        let with_comments = router().route(
-            "/api/v3/repos/example-org/tracker/issues/1/comments",
-            get(comments),
-        );
+        let with_comments = with_heartbeat();
         let (target, task) = crate::connectors::fixture(with_comments, "test-only-token").await;
         let bot = Bot::new(Arc::default(), config()).unwrap();
         let at = Timestamp::parse("2026-10-12T04:00:00Z").unwrap();
@@ -1493,6 +1500,73 @@ mod tests {
         let requests = bot.requests().unwrap();
         assert_eq!((requests.sent["GET"], requests.refused), (2, 0));
         assert!(!requests.sent.contains_key("POST /graphql (query)"));
+    }
+
+    /// What a hub exports of a real sync of its bot passes its companion's
+    /// checks whole, board fields, heartbeat and board counts included.
+    #[tokio::test]
+    async fn a_hubs_synced_bot_passes_its_companions_checks() {
+        use crate::zone::{external_only, Exporter, Zone};
+        let (target, task) = crate::connectors::fixture(with_heartbeat(), "test-only-token").await;
+        let bot = Bot::new(Arc::default(), config()).unwrap();
+        // On GitHub, as far as the export says: see below.
+        let c = Connection {
+            zone: Zone::External,
+            base_url: "https://github.com/".into(),
+            ..connection()
+        };
+        let mut items = connector::sync(&bot, &target, &c, &[]).await.unwrap();
+        let at = Timestamp::parse("2026-10-12T04:00:00Z").unwrap();
+        let mut runs = connector::agents(&bot, &target, &c, None, at)
+            .await
+            .unwrap();
+        task.abort();
+        runs.board = bot.board();
+        for i in &mut items {
+            i.zone = c.zone;
+        }
+        let snapshot = Snapshot {
+            connections: vec![c.clone()],
+            items: items.clone(),
+            efforts: vec![],
+        };
+        let export = external_only(&snapshot, std::slice::from_ref(&runs), Exporter::Hub);
+        // The test's one allowance: the fixture serves plain HTTP on
+        // loopback, which no hub's export may name as an instance, so its
+        // answers are taken as GitHub's own.
+        let json = serde_json::to_string(&export)
+            .unwrap()
+            .replace(target.base_url.as_str(), "https://github.com/");
+        let checked = crate::hub::checked(serde_json::from_str(&json).unwrap(), at).unwrap();
+        assert_eq!(checked.items.len(), items.len());
+        let with_fields = checked.items.iter().filter(|i| i.bot.is_some()).count();
+        assert_eq!(with_fields, items.len());
+        assert!(checked
+            .items
+            .iter()
+            .any(|i| i.bot.as_ref().is_some_and(|b| b.branch.is_some())));
+        assert!(checked
+            .items
+            .iter()
+            .any(|i| i.bot.as_ref().is_some_and(|b| b.board_item.is_some())));
+        let [b] = &checked.bots[..] else {
+            panic!("{checked:?}")
+        };
+        assert_eq!(
+            b.board_url,
+            "https://github.com/orgs/example-org/projects/1"
+        );
+        let agents = b.agents.as_ref().unwrap();
+        let heartbeat = agents.heartbeat.as_ref().unwrap();
+        assert_eq!(heartbeat.runs.len(), 1);
+        assert!(heartbeat
+            .comment_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("https://github.com/example-org/tracker/issues/1")));
+        assert_eq!(
+            agents.board.as_ref().unwrap().statuses,
+            runs.board.unwrap().statuses
+        );
     }
 
     #[tokio::test]

@@ -757,7 +757,12 @@ fn heartbeat_subtitle(v: &BotView, now: i64) -> Option<String> {
 }
 
 fn bot_view_rows(board: &Board, v: &BotView, ctx: &Ctx) -> gtk::Widget {
-    let group = widgets::group(&v.label, Some(&format!("@{}", v.bot_login)));
+    let subtitle = if v.from_hub {
+        format!("@{} · on the hub, as of its last pull", v.bot_login)
+    } else {
+        format!("@{}", v.bot_login)
+    };
+    let group = widgets::group(&v.label, Some(&subtitle));
     let ask = gtk::Button::builder()
         .label("Ask the Bot")
         .valign(gtk::Align::Center)
@@ -812,7 +817,7 @@ fn bot_view_rows(board: &Board, v: &BotView, ctx: &Ctx) -> gtk::Widget {
     // The board.
     match &agents.board {
         Some(board_summary) => {
-            let items: usize = board_summary.statuses.values().sum();
+            let items = board_summary.total();
             let statuses: Vec<String> = board_summary
                 .statuses
                 .iter()
@@ -993,7 +998,7 @@ fn bot(board: &Board, ctx: &Ctx) -> Content {
         children.push(
             widgets::group(
                 "Agent runs",
-                Some("The bot is connected on the hub; its heartbeat and agent runs show in the hub's web page."),
+                Some("No bot's heartbeat to show. A bot connected on the hub shows here once the companion pulls from a hub that exports it."),
             )
             .upcast(),
         );

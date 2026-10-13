@@ -285,6 +285,16 @@ pub struct BoardSummary {
     pub unreadable: usize,
 }
 
+impl BoardSummary {
+    /// The items on the board, by status, without overflowing, whatever
+    /// counts the service, or a hub before it, sent.
+    pub fn total(&self) -> usize {
+        self.statuses
+            .values()
+            .fold(0, |total, n| total.saturating_add(*n))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct AgentRuns {
@@ -316,6 +326,8 @@ pub struct BotView {
     pub agents: Option<AgentRuns>,
     pub ask: Ask,
     pub asks: BTreeMap<String, Ask>,
+    /// The hub's bot, as of the companion's last pull: read-only here.
+    pub from_hub: bool,
 }
 
 /// Everything the app shows, read together.
@@ -741,6 +753,31 @@ mod tests {
             serde_json::from_str(include_str!("../fixtures/bot.json")).unwrap();
         let heartbeat = bots[0].agents.as_ref().unwrap().heartbeat.as_ref().unwrap();
         assert_eq!(heartbeat.runs.len(), 2);
+        // A service that predates the hub's bots doesn't say.
+        assert_eq!(
+            bots.iter().map(|b| b.from_hub).collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn board_totals_saturate() {
+        for (counts, total) in [
+            (vec![], 0),
+            (vec![2, 3], 5),
+            (vec![usize::MAX, 1], usize::MAX),
+            (vec![usize::MAX / 2 + 1, usize::MAX / 2 + 1], usize::MAX),
+        ] {
+            let summary = BoardSummary {
+                statuses: counts
+                    .iter()
+                    .enumerate()
+                    .map(|(n, c)| (format!("s{n}"), *c))
+                    .collect(),
+                ..BoardSummary::default()
+            };
+            assert_eq!(summary.total(), total, "{counts:?}");
+        }
     }
 
     #[test]

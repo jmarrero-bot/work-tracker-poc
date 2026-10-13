@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         # So none of them leaves: the export for the hub is empty.
         assert call('/api/export/external')[0] == 401
         exported = subprocess.check_output(command + ['export','--external'], text=True)
-        assert json.loads(exported) == {'zone':'external','connections':[],'items':[],'efforts':[]}, exported
+        assert json.loads(exported) == {'zone':'external','connections':[],'items':[],'efforts':[],'bots':[]}, exported
         assert subprocess.run(command + ['export'], capture_output=True).returncode != 0
         # Effort titles stay unless shared.
         def demo_sharing():
