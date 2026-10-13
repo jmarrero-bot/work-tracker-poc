@@ -161,6 +161,16 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         # A plugin that echoes the credential as the account name isn't connected.
         echo = subprocess.run(command + ['connect','errata','--url','https://echo-account.example/','--token-env','WORKBOARD_SMOKE_TOKEN'], env=plugin_env, capture_output=True, text=True)
         assert echo.returncode != 0 and 'test-only-token' not in echo.stdout + echo.stderr, echo
+        # A plugin gets only the proxy, CA bundle and time zone variables of
+        # the service's environment, and only a plugin gets any.
+        for provider, name, why in [
+            ('errata', 'LD_PRELOAD', 'It may get only HTTP_PROXY'),
+            ('errata', 'GH_TOKEN', 'It may get only HTTP_PROXY'),
+            ('errata', 'HOME', 'private, empty home'),
+            ('github', 'HTTPS_PROXY', 'connector plugin'),
+        ]:
+            refused = subprocess.run(command + ['connect',provider,'--url','https://env.example/','--token-env','WORKBOARD_SMOKE_TOKEN','--plugin-env',name], env=plugin_env, capture_output=True, text=True)
+            assert refused.returncode != 0 and why in refused.stderr, (name, refused)
         subprocess.check_call(command + ['sync'], stdout=subprocess.DEVNULL)
         body = call('/api/snapshot', token=token)[2]
         assert b'test-only-token' not in body
@@ -313,6 +323,12 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert changed in subprocess.check_output(command + ['plugin', 'trust', forge['id'], '--sha256', changed], text=True)
         subprocess.check_call(command + ['sync', forge['id']], stdout=subprocess.DEVNULL)
         assert 'trusts the file there now' in subprocess.check_output(command + ['plugin', 'trust', forge['id']], text=True)
+        # Which variables a plugin gets is the connection's setting.
+        allowed = subprocess.check_output(command + ['plugin', 'env', forge['id'], 'NO_PROXY', 'HTTPS_PROXY'], text=True)
+        assert 'gets HTTPS_PROXY, NO_PROXY from' in allowed, allowed
+        assert 'gets HTTPS_PROXY, NO_PROXY from' in subprocess.check_output(command + ['plugin', 'env', forge['id']], text=True)
+        assert call(f"/api/connections/{forge['id']}", 'PATCH', {'plugin_env': ['LD_PRELOAD']}, token=token)[0] == 400
+        assert 'nothing from' in subprocess.check_output(command + ['plugin', 'env', forge['id'], '--clear'], text=True)
         states = {c['id']: c['sync'] for c in json.loads(call('/api/snapshot', token=token)[2])['connections']}
         if os.name == 'posix':
             assert (root.stat().st_mode & 0o777) == 0o700

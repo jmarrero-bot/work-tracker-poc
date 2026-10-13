@@ -3,7 +3,8 @@
 docs/plugins.md from canned data, and refuses to work unless Workboard runs it
 as promised: no arguments, nothing in the environment but PATH and LANG, and
 the credential on standard input only. Some instance hosts make it misbehave
-on purpose."""
+on purpose, and env.example answers with the rest of its environment, as
+its connection allowed it. Its HOME has to be a private, empty directory."""
 import json
 import os
 import subprocess
@@ -13,7 +14,7 @@ import urllib.parse
 
 TOKEN = 'test-only-token'
 # Python may add LC_CTYPE itself when it coerces a C locale.
-ALLOWED_ENV = {'PATH', 'LANG', 'LC_CTYPE'}
+ALLOWED_ENV = {'PATH', 'LANG', 'LC_CTYPE', 'HOME', 'PYTHONNOUSERSITE'}
 
 
 def answer(body):
@@ -53,14 +54,25 @@ def item(remote_id, outcome, action='next', reasons=()):
 request = json.load(sys.stdin)
 if len(sys.argv) != 1:
     error('invalid', 'Unexpected arguments')
+base_url = urllib.parse.urlsplit(request['instance']['base_url'])
+host = base_url.hostname
 leaked = sorted(set(os.environ) - ALLOWED_ENV)
+home = os.environ.get('HOME', '')
+if not os.path.isdir(home) or os.listdir(home) or os.stat(home).st_mode & 0o777 != 0o700:
+    error('invalid', 'HOME is not a private, empty directory')
+if os.environ.get('PYTHONNOUSERSITE') != '1' or sys.flags.no_user_site != 1:
+    error('invalid', 'The user site-packages are on')
+if host == 'home.example':
+    answer({'account': {'id': '42', 'name': home}})
+if host == 'env.example':
+    # What else it got, as NAME=VALUE pairs, as its account's name.
+    got = ';'.join(f'{name}={os.environ[name]}' for name in leaked)
+    answer({'account': {'id': '42', 'name': got or 'nothing else'}})
 if leaked:
     error('invalid', 'Unexpected environment: ' + ', '.join(leaked))
 if request['protocol'] != 1:
     error('invalid', 'Unknown protocol version')
 
-base_url = urllib.parse.urlsplit(request['instance']['base_url'])
-host = base_url.hostname
 label = host.split('.')[0]
 marked = label.startswith('marked-')
 if host == 'slow.example':

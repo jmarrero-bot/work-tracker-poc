@@ -649,10 +649,15 @@ struct ConnectionPatch {
     /// service's default.
     #[serde(default, deserialize_with = "present")]
     sync_interval: Option<Option<u64>>,
+    /// For a plugin connection: the variables of the service's environment
+    /// its plugin gets, by name, replacing those it got.
+    #[serde(default)]
+    plugin_env: Option<Vec<String>>,
 }
 /// Watch another user's activity visible to a GitHub connection's token, or
-/// stop, and change how often a connection syncs. What watching finds shows
-/// as theirs, never as the connection's account's.
+/// stop, change how often a connection syncs, and which variables of the
+/// service's environment a plugin connection's plugin gets. What watching
+/// finds shows as theirs, never as the connection's account's.
 async fn patch_connection(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -673,6 +678,10 @@ async fn patch_connection(
         if login.eq_ignore_ascii_case(&c.account_name) {
             bail_api(OWN_ACCOUNT)?
         }
+    }
+    // First: it is refused for a connection that has no plugin.
+    if let Some(env) = &input.plugin_env {
+        app.scheduler.set_plugin_env(&id, env).await?;
     }
     if let Some(interval) = interval {
         app.scheduler.set_interval(&id, interval).await?;

@@ -423,10 +423,14 @@ impl Scheduler {
         target: &Target,
     ) -> Result<Verified> {
         let plugin = if connectors::is_plugin(&input.provider) {
+            let env = connectors::check_plugin_env(&input.plugin_env)?;
             let sha256 = self.sources.plugin_sha256(&input.provider)?;
             Some(PluginConfig {
                 sha256: Some(sha256),
+                env,
             })
+        } else if !input.plugin_env.is_empty() {
+            bail!("Only a source served by a connector plugin takes variables of the service's environment")
         } else {
             None
         };
@@ -961,6 +965,26 @@ impl Scheduler {
         drop(db);
         self.annotate(std::slice::from_mut(&mut c));
         self.wake();
+        Ok(c)
+    }
+    /// Let the connector plugin of connection `id` get the variables named
+    /// in `env` of the service's environment, and no others, from its next
+    /// run on.
+    pub async fn set_plugin_env(&self, id: &str, env: &[String]) -> Result<Connection> {
+        let env = connectors::check_plugin_env(env)?;
+        let _held = self.hold(id).await;
+        let db = self.db();
+        let mut c = db.connection(id)?;
+        if !connectors::is_plugin(&c.provider) {
+            bail!(
+                "{} uses a built-in connector, which gets no variables of the service's environment",
+                c.label
+            )
+        }
+        c.plugin.get_or_insert_with(PluginConfig::default).env = env;
+        db.save_connection(&c)?;
+        drop(db);
+        self.annotate(std::slice::from_mut(&mut c));
         Ok(c)
     }
     /// Give connection `id` its own sync interval, or with `None` the
