@@ -49,6 +49,11 @@ enum CredentialsCommand {
         #[arg(long, value_enum)]
         to: secrets::Backend,
     },
+    /// Give a copy of a data directory a GNOME Keyring store of its own, in
+    /// place of the one it shares with the original, which keeps its own
+    /// credentials. Run it with the service stopped. Cut short, running it
+    /// again finishes it.
+    Rekey,
 }
 #[derive(Subcommand)]
 enum Command {
@@ -574,6 +579,12 @@ async fn main() -> Result<()> {
     } = args.command
     {
         return migrate_credentials(&root, to);
+    }
+    if let Command::Credentials {
+        command: CredentialsCommand::Rekey,
+    } = args.command
+    {
+        return rekey_credentials(&root);
     }
     let client = local_client(&root)?;
     let get = |path: &str| path.to_string();
@@ -1276,6 +1287,19 @@ async fn trust_plugin(client: &Local, connection: &str, sha256: Option<String>) 
     println!(
         "{} trusts its plugin {sha256} from now on. It syncs again soon, and on schedule",
         c.label
+    );
+    Ok(())
+}
+/// `workboard credentials rekey`: offline, under the data directory's lock,
+/// in a local service's data directory only.
+fn rekey_credentials(root: &std::path::Path) -> Result<()> {
+    db::private_dir(root)?;
+    let _lock = db::lock(root)?;
+    db::Db::open_as(root, db::Mode::Local)
+        .context("Credentials are re-keyed only in a local service's data directory")?;
+    let copied = secrets::rekey(root)?;
+    println!(
+        "This data directory has a GNOME Keyring store of its own now, with {copied} credentials copied into it; the original's are as they were"
     );
     Ok(())
 }
