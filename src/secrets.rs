@@ -58,6 +58,23 @@
 //! first of two directories to start with a marker from before paths were
 //! recorded. Keep copies of a keyring data directory out of the way of the
 //! original, or re-key them first.
+//!
+//! # A call that times out
+//!
+//! A call to the Secret Service that times out may still complete later on
+//! the bus, such as a `CreateItem` or `Delete` that GNOME Keyring finishes
+//! late. Nothing can check it then: the call still holds the thread that
+//! would ask. The next calls fail at once until it finished, so none of this
+//! service's later changes can land before it; a new service starts only
+//! once this one exited and released the data directory's lock, after the
+//! call was sent. A late landing does what its caller meant: a credential
+//! created for a connection that wasn't saved is one no connection uses, which
+//! the next start drops; a verify reported failed may still have put in place
+//! the new credential, which was checked to be the same account's; a removal
+//! finishes. The risk left is GNOME Keyring itself finishing an older call
+//! after a newer one from the next start, which would take it reordering
+//! calls, such as one held on a prompt; the service never causes a prompt
+//! once it runs.
 
 use crate::connector::{ConnectorError, ErrorKind};
 use anyhow::{bail, Context, Result};

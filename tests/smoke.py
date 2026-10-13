@@ -412,6 +412,24 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         for c in snapshot['connections']:
             if c['id'] in last_success:
                 assert c['sync']['last_success'] == states[c['id']]['last_success'], (c, states)
+        # A service killed outright, as by SIGKILL or the OOM killer, holds
+        # the data directory's lock no longer: a service starts, and once
+        # that one is killed too, so does a migration.
+        process.kill(); process.wait(timeout=5)
+        process = subprocess.Popen(command + ['serve'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(100):
+            if process.poll() is not None:
+                raise RuntimeError('No start after a killed service: ' + process.stderr.read().decode())
+            try:
+                if call('/')[0] == 200: break
+            except OSError: pass
+            time.sleep(.05)
+        else: raise RuntimeError('No start after a killed service')
+        # The CLI reaches it: the socket the killed one left was replaced.
+        assert subprocess.run(command + ['inbox'], capture_output=True).returncode == 0
+        process.kill(); process.wait(timeout=5)
+        migrated = subprocess.run(command + ['credentials', 'migrate', '--to', 'files'], capture_output=True, text=True, timeout=20)
+        assert migrated.returncode == 0, migrated
         # A service on another data directory that takes over the socket
         # of one that was killed, here while the CLI waits for a token on
         # standard input, gets nothing: the CLI checks the service on its
@@ -459,7 +477,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
             print('Checked that another user is refused on the socket')
         else:
             print('Not checking another user on the socket: no `podman unshare` here')
-        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin and its pinning, the external export, the Mine view, scheduled sync and freshness, permissions and restart persistence')
+        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin and its pinning, the external export, the Mine view, scheduled sync and freshness, permissions, restart persistence, the lock of a killed service, and a socket another service took over')
     finally:
         if process.poll() is None:
             process.terminate()
