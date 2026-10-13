@@ -88,11 +88,11 @@ pub struct ExternalItem {
 
 /// An effort as the external zone sees it. Its title and note are free text
 /// that may describe internal work: the note stays behind, and the title
-/// leaves only when a person shared it.
+/// leaves only when a person shared it, or from a hub ([`Exporter::Hub`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalEffort {
     pub id: String,
-    /// The effort's title if shared, otherwise a neutral label.
+    /// The effort's title if shared or a hub's, otherwise a neutral label.
     pub title: String,
     /// Over its external items only.
     pub progress: ExternalProgress,
@@ -122,6 +122,20 @@ impl ExternalProgress {
     }
 }
 
+/// Whose export it is, which decides whether an effort's title leaves
+/// without being shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exporter {
+    /// A hub, which serves its export to its companions. A hub holds
+    /// external work only, and a companion is trusted more than its hub, so
+    /// hiding a title typed on the hub from it would protect nothing: its
+    /// efforts' titles always leave.
+    Hub,
+    /// Any other service, whose efforts may mix internal work with
+    /// external, so a title leaves only once a person shared it.
+    Local,
+}
+
 /// How an effort whose title isn't shared is labeled: "Effort" and the start
 /// of its random ID.
 pub fn neutral_title(id: &str) -> String {
@@ -141,10 +155,10 @@ pub fn neutral_title(id: &str) -> String {
 ///   so a manual item, an item of an internal or unknown connection, or a
 ///   row that disagrees with its connection stays behind;
 /// - efforts with at least one of those items, with their progress over
-///   those items only, and their title only if shared. An effort that mixes
-///   zones shows no trace of its internal items: no count, no placeholder,
-///   no link.
-pub fn external_only(snapshot: &Snapshot) -> ExternalSnapshot {
+///   those items only, and their title only if shared, or if `from` is a
+///   hub. An effort that mixes zones shows no trace of its internal items:
+///   no count, no placeholder, no link.
+pub fn external_only(snapshot: &Snapshot, from: Exporter) -> ExternalSnapshot {
     let connections: Vec<ExternalConnection> = snapshot
         .connections
         .iter()
@@ -187,7 +201,7 @@ pub fn external_only(snapshot: &Snapshot) -> ExternalSnapshot {
                 .collect();
             (!linked.is_empty()).then(|| ExternalEffort {
                 id: e.effort.id.clone(),
-                title: if e.effort.share_title {
+                title: if e.effort.share_title || from == Exporter::Hub {
                     e.effort.title.clone()
                 } else {
                     neutral_title(&e.effort.id)
@@ -429,7 +443,7 @@ mod tests {
                 vec![item(n, c, zone, Outcome::Open, None)],
                 vec![],
             );
-            let out = external_only(&s);
+            let out = external_only(&s, Exporter::Local);
             assert_eq!(out.items.len(), usize::from(exported), "case {n}");
             assert_eq!(out.connections.len(), 1);
             assert_eq!(out.connections[0].id, external.id);
@@ -458,7 +472,7 @@ mod tests {
             );
             // The full snapshot counts all five.
             assert_eq!(s.efforts[0].progress.total, 5);
-            let out = external_only(&s);
+            let out = external_only(&s, Exporter::Local);
             assert_eq!(
                 out.efforts.len(),
                 1,
@@ -494,6 +508,40 @@ mod tests {
     }
 
     #[test]
+    fn a_hubs_effort_titles_always_leave() {
+        let external = connection(1, Zone::External);
+        for share_title in [false, true] {
+            let e = Effort {
+                title: "hub effort title".into(),
+                ..effort(0, share_title)
+            };
+            let s = snapshot(
+                vec![external.clone()],
+                vec![item(
+                    0,
+                    Some(&external),
+                    Zone::External,
+                    Outcome::Open,
+                    Some(&e.id),
+                )],
+                vec![e],
+            );
+            let hub = external_only(&s, Exporter::Hub);
+            assert_eq!(hub.efforts[0].title, "hub effort title");
+            // The note still stays behind.
+            let json = serde_json::to_string(&hub).unwrap();
+            assert!(!json.contains(INTERNAL), "{json}");
+            let local = external_only(&s, Exporter::Local);
+            let title = if share_title {
+                "hub effort title".to_string()
+            } else {
+                neutral_title("effort-0")
+            };
+            assert_eq!(local.efforts[0].title, title);
+        }
+    }
+
+    #[test]
     fn unshared_titles_are_neutral() {
         let uuid = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
         assert_eq!(neutral_title(uuid), "Effort 1a2b3c4d");
@@ -516,7 +564,7 @@ mod tests {
             )],
             vec![e],
         );
-        let out = serde_json::to_value(external_only(&s)).unwrap();
+        let out = serde_json::to_value(external_only(&s, Exporter::Local)).unwrap();
         let keys = |v: &serde_json::Value| {
             let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
             keys.sort();
@@ -628,7 +676,7 @@ mod tests {
                 })
                 .collect();
             let s = snapshot(known.clone(), items.clone(), efforts.clone());
-            let out = external_only(&s);
+            let out = external_only(&s, Exporter::Local);
             let json = serde_json::to_string(&out).unwrap();
             assert!(!json.contains(INTERNAL), "seed {seed}: {json}");
             assert_eq!(out.zone, Zone::External);

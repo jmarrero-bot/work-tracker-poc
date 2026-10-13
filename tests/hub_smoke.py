@@ -185,7 +185,8 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         assert [c['zone'] for c in board['connections']] == ['external'], board
         hub_items = sorted(i['id'] for i in board['items'])
         assert len(hub_items) == 2 and all(i['zone'] == 'external' for i in board['items']), board
-        status, _, body = hub_call('/api/efforts', 'POST', {'title': 'Hub effort', 'item_ids': hub_items[:1], 'share_title': True})
+        # Not shared: a hub's effort titles go to its companions anyway.
+        status, _, body = hub_call('/api/efforts', 'POST', {'title': 'Hub effort', 'item_ids': hub_items[:1]})
         assert status == 200, body
 
         # Reached by its tailnet name through an HTTPS front: that name is
@@ -211,7 +212,11 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         # The companion token reads the export, and nothing else.
         companion_token = hub.cli('companion-token').stdout.strip()
         assert companion_token and companion_token != hub.token
-        assert hub_call('/api/export/external', token=companion_token)[0] == 200
+        status, _, body = hub_call('/api/export/external', token=companion_token)
+        assert status == 200, body
+        # With the effort's title, unshared.
+        export = json.loads(body)
+        assert [e['title'] for e in export['efforts']] == ['Hub effort'], export
         assert hub_call('/api/snapshot', token=companion_token)[0] == 403
         assert hub_call('/api/efforts', 'POST', {'title': 'No'}, token=companion_token)[0] == 403
         assert hub_call('/api/companion-token', token=companion_token)[0] == 403
@@ -255,7 +260,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         assert all(i['zone'] == 'external' and not i['stale'] for i in from_hub), from_hub
         assert {i['id'] for i in board['items'] if not i['from_hub']} == set(internal_items), board
         assert [c['from_hub'] for c in board['connections']] == [False, False, True], board['connections']
-        # Only efforts with external work leave the hub.
+        # Only efforts with external work leave the hub, with their titles.
         assert [e['title'] for e in board['efforts'] if e['from_hub']] == ['Hub effort'], board['efforts']
         inbox = json.loads(companion.cli('inbox', '--json').stdout)
         assert {i['from_hub'] for i in inbox} == {True, False}, inbox

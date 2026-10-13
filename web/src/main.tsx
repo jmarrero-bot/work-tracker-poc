@@ -1833,17 +1833,26 @@ function App() {
                         The hub's effort, over its external work only.
                         Read-only here.
                       </p>
+                    ) : hub ? (
+                      <p>
+                        Companions see this title with the effort's work: they
+                        are trusted more than the hub, which holds external
+                        work only. The note stays here.
+                      </p>
                     ) : (
-                      <label className="zone-choice">
+                      <label
+                        className="zone-choice subtle"
+                        title="Nothing reads this machine's export today: a companion pulls from its hub and sends it nothing. This only shapes what workboard export --external prints. A hub's effort titles always reach its companions."
+                      >
                         <input
                           type="checkbox"
                           checked={e.share_title}
                           onChange={(ev) => shareTitle(e, ev.target.checked)}
                         />
                         <span>
-                          {hub
-                            ? "Show this title to companions with the effort's work. Otherwise they see a neutral label."
-                            : "Let this title leave this machine with the effort's external work, in the external export. Otherwise the export shows a neutral label. The note always stays on this machine."}
+                          Share the title in this machine's own external
+                          export, which nothing reads today. The note never
+                          leaves.
                         </span>
                       </label>
                     )}

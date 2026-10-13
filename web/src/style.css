@@ -910,6 +910,13 @@ h1 {
 .zone-choice input {
   margin-top: 4px;
 }
+/* A switch that changes little, such as sharing a title in an export that
+   nothing reads: there, but quiet. */
+.zone-choice.subtle {
+  font-size: 0.7rem;
+  opacity: 0.75;
+  margin: 8px 0;
+}
 .connected-account p {
   font-size: 0.75rem;
   color: #aeb8c9;

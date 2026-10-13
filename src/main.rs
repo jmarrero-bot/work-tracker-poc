@@ -239,9 +239,10 @@ enum Command {
         share_title: bool,
     },
     /// Let an effort's title leave this machine with its external items, in
-    /// the external export, as a hub serves it to its companions. Titles are
-    /// not shared unless you do this, since they can describe internal
-    /// work; the note never leaves.
+    /// the external export. Titles are not shared unless you do this, since
+    /// they can describe internal work; the note never leaves. A hub's
+    /// titles always go to its companions, so this matters only on another
+    /// service, whose export nothing reads today.
     ShareTitle {
         effort: String,
         /// Stop sharing it.

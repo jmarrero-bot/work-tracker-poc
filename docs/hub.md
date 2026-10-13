@@ -111,7 +111,7 @@ A hub address is HTTPS, or plain HTTP only to the laptop's own loopback, so the 
 
 ## What the companion shows
 
-The board, the Mine view and the CLI show the hub's connections, items and efforts next to the companion's own, marked as the hub's and read-only: grouping, abandoning, sharing a title, verifying or disconnecting them is done on the hub. Their IDs start with `hub:`.
+The board, the Mine view and the CLI show the hub's connections, items and efforts next to the companion's own, marked as the hub's and read-only: grouping, abandoning, verifying or disconnecting them is done on the hub. Their efforts show their titles: a hub always exports them. Their IDs start with `hub:`.
 
 The hub's work is as fresh as the hub's connection that synced it was at the last pull. It is stale as soon as a pull fails, not only after three intervals as a connection's work: while the hub can't be reached, its work is never shown as current. The companion's own work isn't affected.
 
@@ -139,4 +139,4 @@ Tokens are files of mode `0600` in the data directory, not encrypted at rest, as
 
 ## What crosses the boundary
 
-From the hub to the companion, and nothing the other way: the hub's external export, as `docs/architecture.md` lists it field by field. It is the hub's external connections without their error messages, their items, and the efforts that have such items, with their progress over those items and their title only if shared.
+From the hub to the companion, and nothing the other way: the hub's external export, as `docs/architecture.md` lists it field by field. It is the hub's external connections without their error messages, their items, and the efforts that have such items, with their progress over those items and their titles. A hub always exports its efforts' titles: it holds external work only, and its companions are trusted more than it is.
