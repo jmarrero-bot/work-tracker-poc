@@ -8,7 +8,7 @@
 //! [`Item`], so a plugin can't store an unsafe link or a person's decision.
 
 use crate::{
-    bot::{AgentRuns, BoardSummary, Heartbeat},
+    bot::{AgentRuns, BoardSummary, BotConfig, Heartbeat},
     connectors::source_url,
     model::{BotFields, Connection, Item, Outcome, Timestamp, WatchList},
     outcome,
@@ -387,9 +387,52 @@ pub trait Connector: Send + Sync {
     ) -> Option<BoxFuture<'a, ConnectorResult<Option<Heartbeat>>>> {
         None
     }
+    /// For the bot connector: the numeric account ID its bot's login names
+    /// now, looked up with one read, as when connecting and verifying.
+    fn look_up_bot_id<'a>(
+        &'a self,
+        _target: &'a Target,
+    ) -> Option<BoxFuture<'a, ConnectorResult<u64>>> {
+        None
+    }
+    /// For the bot connector: the bot's numeric account ID it used, as its
+    /// settings gave it, or as it looked it up for settings without one.
+    fn bot_id(&self) -> Option<u64> {
+        None
+    }
     /// What it has sent to its source, if it counts.
     fn requests(&self) -> Option<Requests> {
         None
+    }
+}
+
+/// Settle a bot connection's numeric account ID when it is connected or
+/// verified: look up the account the bot's login names now, with one read
+/// through `connector`, and keep its ID in `config`. One that differs from
+/// the ID `config` already keeps is refused: the login was renamed, or
+/// freed and taken by another account, which isn't the bot that was
+/// connected.
+pub async fn settle_bot(
+    connector: &dyn Connector,
+    target: &Target,
+    mut config: BotConfig,
+) -> ConnectorResult<BotConfig> {
+    let Some(look_up) = connector.look_up_bot_id(target) else {
+        return Ok(config);
+    };
+    let id = look_up.await.map_err(|e| e.redact(&target.credential))?;
+    match config.bot_id {
+        Some(kept) if kept != id => Err(ConnectorError::new(
+            ErrorKind::Auth,
+            format!(
+                "The bot's login {} now names GitHub account {id}, not account {kept}, which was connected: the login was renamed, or freed and taken by someone else. Its heartbeat is still matched by account {kept}. If the bot's account changed, disconnect it and connect it again with its current login",
+                config.bot_login
+            ),
+        )),
+        _ => {
+            config.bot_id = Some(id);
+            Ok(config)
+        }
     }
 }
 

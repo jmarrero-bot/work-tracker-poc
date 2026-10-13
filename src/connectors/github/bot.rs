@@ -11,6 +11,11 @@
 //!   heartbeat issue, with REST: the coordinator's loop state, and each of
 //!   its workers as an agent run. Agent runs are not items.
 //!
+//! The bot's pull requests and heartbeat are matched by its numeric account
+//! ID, not its login, which can be renamed and taken by someone else. The
+//! ID is kept in its settings, and looked up by its login with one REST
+//! read when it is connected or verified, or when a sync finds none kept.
+//!
 //! Outcomes follow the rule every connector does: closed is not delivered,
 //! and neither is the board saying Done (see `outcome::bot_board_item`).
 
@@ -339,6 +344,9 @@ pub struct Bot {
     config: BotConfig,
     /// What its last listing found.
     summary: Mutex<Option<BoardSummary>>,
+    /// The bot's numeric account ID: as its settings keep it, or as it was
+    /// looked up for settings without one.
+    id: Mutex<Option<u64>>,
 }
 
 impl Bot {
@@ -346,9 +354,46 @@ impl Bot {
         config.check()?;
         Ok(Self {
             client: ReadOnly::new(memory)?,
+            id: Mutex::new(config.bot_id),
             config,
             summary: Mutex::default(),
         })
+    }
+    /// The numeric ID of the account the bot's login names now, read with
+    /// `GET users/{login}`.
+    async fn look_up(&self, target: &Target) -> ConnectorResult<u64> {
+        let login = &self.config.bot_login;
+        let user = match self
+            .client
+            .get(target, &format!("users/{login}"), &[])
+            .await?
+        {
+            Got::Found(user) => user,
+            Got::Moved(..) | Got::Inaccessible(_) => {
+                return Err(ConnectorError::invalid(format!(
+                    "GitHub has no account {login} that this token can see; check the bot's login"
+                )))
+            }
+        };
+        let named = user["login"]
+            .as_str()
+            .is_some_and(|l| l.eq_ignore_ascii_case(login));
+        match user["id"].as_u64() {
+            Some(id) if named && id != 0 => Ok(id),
+            _ => Err(ConnectorError::invalid(format!(
+                "GitHub's answer about the account {login} isn't that account"
+            ))),
+        }
+    }
+    /// The bot's numeric account ID: as its settings keep it, or else
+    /// looked up once.
+    async fn account_id(&self, target: &Target) -> ConnectorResult<u64> {
+        if let Some(id) = *self.id.lock().unwrap_or_else(PoisonError::into_inner) {
+            return Ok(id);
+        }
+        let id = self.look_up(target).await?;
+        *self.id.lock().unwrap_or_else(PoisonError::into_inner) = Some(id);
+        Ok(id)
     }
     /// The board's address, which the queries check that they read.
     fn board_url(&self, target: &Target) -> ConnectorResult<String> {
@@ -477,7 +522,13 @@ impl Bot {
             "is:pr author:{} org:{}",
             self.config.bot_login, self.config.forge_org
         );
+        let bot = self.account_id(target).await?;
         for row in search_issues(&self.client, target, &query).await? {
+            // The search goes by login: one that was renamed and taken
+            // finds another account's pull requests, which aren't the bot's.
+            if row["user"]["id"].as_u64() != Some(bot) {
+                continue;
+            }
             let mut pr = github_item(&row, "review").map_err(ConnectorError::invalid)?;
             if on_board.contains(&key(&pr.url)) {
                 continue;
@@ -566,6 +617,7 @@ impl Bot {
             .tracker_parts()
             .ok_or_else(|| ConnectorError::invalid("Invalid tracker repository"))?;
         let issue = self.config.heartbeat_issue;
+        let bot = self.account_id(target).await?;
         let path = format!("repos/{owner}/{repo}/issues/{issue}/comments");
         for page in 1..=COMMENT_PAGES {
             let query = [
@@ -585,7 +637,7 @@ impl Bot {
                     "GitHub's answer about the heartbeat issue isn't its comments",
                 )
             })?;
-            let found = find_heartbeat(comments, &self.config.bot_login, &target.base_url, at)
+            let found = find_heartbeat(comments, bot, &target.base_url, at)
                 .map_err(|why| ConnectorError::invalid(format!("Not a heartbeat: {why}")))?;
             if found.is_some() || comments.len() < COMMENTS_PAGE {
                 return Ok(found);
@@ -675,6 +727,15 @@ impl Connector for Bot {
         at: Timestamp,
     ) -> Option<BoxFuture<'a, ConnectorResult<Option<Heartbeat>>>> {
         Some(Box::pin(self.heartbeat(target, at)))
+    }
+    fn look_up_bot_id<'a>(
+        &'a self,
+        target: &'a Target,
+    ) -> Option<BoxFuture<'a, ConnectorResult<u64>>> {
+        Some(Box::pin(self.look_up(target)))
+    }
+    fn bot_id(&self) -> Option<u64> {
+        *self.id.lock().unwrap_or_else(PoisonError::into_inner)
     }
     fn requests(&self) -> Option<Requests> {
         Some(self.client.requests())
@@ -890,6 +951,7 @@ mod tests {
             "repository_url": format!("{base}api/v3/repos/{repo}"),
             "state": "open", "draft": draft, "updated_at": "2026-10-12T00:00:00Z",
             "pull_request": {"merged_at": null},
+            "user": {"login": "jmarrero-bot", "id": 7},
         })
     }
     async fn search(headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
@@ -898,13 +960,17 @@ mod tests {
             q["q"],
             "is:pr author:jmarrero-bot org:jmarrero-forge is:open archived:false"
         );
+        // By another account that took the bot's login: not the bot's.
+        let mut squatter = found_pr(&base, "jmarrero-forge/r", 19, false);
+        squatter["user"]["id"] = 666.into();
         let items = [
             found_pr(&base, "jmarrero-forge/r", 11, true),
             // On the board itself, as item l.
             found_pr(&base, "jmarrero-forge/homegit", 12, false),
             found_pr(&base, "jmarrero-forge/r", 14, false),
+            squatter,
         ];
-        Json(json!({"total_count": 3, "incomplete_results": false, "items": items})).into_response()
+        Json(json!({"total_count": 4, "incomplete_results": false, "items": items})).into_response()
     }
     fn router() -> Router {
         let pull = |merged: bool| {
@@ -916,6 +982,10 @@ mod tests {
             .route(
                 "/api/v3/user",
                 get(|| async { Json(json!({"id": 7, "login": "jmarrero-bot"})) }),
+            )
+            .route(
+                "/api/v3/users/jmarrero-bot",
+                get(|| async { Json(json!({"id": 7, "login": "jmarrero-bot", "type": "User"})) }),
             )
             .route("/api/graphql", post(graphql))
             .route("/api/v3/search/issues", get(search))
@@ -1258,6 +1328,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_bot_is_matched_by_its_account_id() {
+        let (target, task) = crate::connectors::fixture(router(), "test-only-token").await;
+        // Settings kept before the ID was: one read looks it up, and the
+        // sync goes by it.
+        let unsettled = BotConfig {
+            bot_id: None,
+            ..config()
+        };
+        let bot = Bot::new(Arc::default(), unsettled.clone()).unwrap();
+        let items = connector::sync(&bot, &target, &connection(), &[])
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 12, "{items:#?}");
+        assert_eq!(bot.bot_id(), Some(7));
+        assert_eq!(bot.requests().unwrap().sent["GET"], 6);
+        // Connecting and verifying look it up, to keep it.
+        let settled = connector::settle_bot(&bot, &target, unsettled)
+            .await
+            .unwrap();
+        assert_eq!(settled.bot_id, Some(7));
+        // A login that names another account than the one kept now is
+        // refused, and so is one that names none.
+        let other = BotConfig {
+            bot_id: Some(8),
+            ..config()
+        };
+        let error = connector::settle_bot(&bot, &target, other)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Auth, "{error}");
+        assert!(error.message.contains("account 8"), "{error}");
+        let gone = BotConfig {
+            bot_login: "gone-bot".into(),
+            bot_id: None,
+            ..config()
+        };
+        let looking = Bot::new(Arc::default(), gone.clone()).unwrap();
+        let error = connector::settle_bot(&looking, &target, gone)
+            .await
+            .unwrap_err();
+        task.abort();
+        assert!(error.message.contains("no account gone-bot"), "{error}");
+    }
+
+    #[tokio::test]
     async fn a_board_the_token_cant_read_fails_the_sync() {
         for answer in [
             json!({"data": {"owner": null}, "errors": [{"type": NOT_FOUND}]}),
@@ -1329,8 +1444,8 @@ mod tests {
                 crate::bot::HEARTBEAT_MARKER
             );
             Json(json!([
-                {"user": {"login": "someone"}, "body": "Hi"},
-                {"user": {"login": "jmarrero-bot"}, "body": body,
+                {"user": {"login": "someone", "id": 9}, "body": "Hi"},
+                {"user": {"login": "jmarrero-bot", "id": 7}, "body": body,
                  "html_url": format!("{base}jmarrero-forge/tracker/issues/1#issuecomment-1")},
             ]))
         };

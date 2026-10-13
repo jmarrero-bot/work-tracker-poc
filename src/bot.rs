@@ -51,6 +51,13 @@ pub struct BotConfig {
     /// The bot's login: the author of its fork pull requests and of its
     /// heartbeat.
     pub bot_login: String,
+    /// The bot's numeric account ID, which its login named when it was
+    /// connected or verified, looked up with one read. Its heartbeat and
+    /// fork pull requests are matched by it, since a login can be renamed,
+    /// and then taken by someone else. None for a connection made before
+    /// it was kept, until its next sync looks it up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_id: Option<u64>,
     /// The organization that holds the bot's forks.
     pub forge_org: String,
 }
@@ -70,6 +77,9 @@ impl BotConfig {
         }
         if !valid_github_login(&self.bot_login) {
             bail!("Enter the bot's GitHub login")
+        }
+        if self.bot_id == Some(0) {
+            bail!("A GitHub account ID is never 0")
         }
         if !valid_github_login(&self.forge_org) {
             bail!("Enter the organization that holds the bot's forks")
@@ -114,6 +124,8 @@ impl BotInput {
             tracker: self.tracker.trim().to_string(),
             heartbeat_issue: self.heartbeat_issue,
             bot_login: self.bot_login.trim().to_string(),
+            // Looked up with the connection's token, once it is verified.
+            bot_id: None,
             forge_org: self.forge_org.trim().to_string(),
         };
         config.check()?;
@@ -461,19 +473,18 @@ pub fn parse_heartbeat(body: &str, base: &Url, now: Timestamp) -> Result<Heartbe
 }
 
 /// The bot's heartbeat among an issue's comments, as the REST API lists
-/// them: the first comment by `login` that is one. None if there is none.
-/// A comment that is one, but malformed, is an error rather than no
+/// them: the first comment by the account whose numeric ID is `bot_id`
+/// that is one, whatever its login is now. None if there is none. A
+/// comment that is one, but malformed, is an error rather than no
 /// heartbeat.
 pub fn find_heartbeat(
     comments: &[Value],
-    login: &str,
+    bot_id: u64,
     base: &Url,
     now: Timestamp,
 ) -> Result<Option<Heartbeat>, String> {
     for c in comments {
-        let by_bot = c["user"]["login"]
-            .as_str()
-            .is_some_and(|l| l.eq_ignore_ascii_case(login));
+        let by_bot = c["user"]["id"].as_u64() == Some(bot_id);
         let body = c["body"].as_str().unwrap_or_default();
         if !by_bot || !body.starts_with(HEARTBEAT_MARKER) {
             continue;
@@ -630,6 +641,7 @@ pub mod tests {
             tracker: "jmarrero-forge/tracker".into(),
             heartbeat_issue: 1,
             bot_login: "jmarrero-bot".into(),
+            bot_id: Some(7),
             forge_org: "jmarrero-forge".into(),
         }
     }
@@ -667,13 +679,14 @@ pub mod tests {
     fn configs_are_checked_whole() {
         config().check().unwrap();
         type Break = fn(&mut BotConfig);
-        let cases: [(&str, Break); 7] = [
+        let cases: [(&str, Break); 8] = [
             ("owner", |c| c.board_owner = "a/b".into()),
             ("number", |c| c.board_number = 0),
             ("tracker", |c| c.tracker = "tracker".into()),
             ("tracker path", |c| c.tracker = "o/../r".into()),
             ("heartbeat", |c| c.heartbeat_issue = 0),
             ("login", |c| c.bot_login = "bot is:open".into()),
+            ("account ID", |c| c.bot_id = Some(0)),
             ("forge", |c| c.forge_org = "@me".into()),
         ];
         for (what, break_it) in cases {
@@ -763,15 +776,20 @@ pub mod tests {
                 ("review", "o/r#12", "working", None),
             ]
         );
-        // The first comment by the bot that is one, wherever it is.
+        // The first comment by the bot's account that is one, wherever it
+        // is, and whatever that account's login is now. Another account
+        // that took the bot's login is no one.
+        let empty = comment(&heartbeat(vec![]).to_string());
         let comments = [
-            serde_json::json!({"user": {"login": "someone"}, "body": comment(&heartbeat(vec![]).to_string())}),
-            serde_json::json!({"user": {"login": "jmarrero-bot"}, "body": "Not a heartbeat"}),
-            serde_json::json!({"user": {"login": "JMarrero-Bot"}, "body": body,
+            serde_json::json!({"user": {"login": "someone", "id": 9}, "body": empty}),
+            serde_json::json!({"user": {"login": "jmarrero-bot", "id": 666}, "body": empty}),
+            serde_json::json!({"user": {"login": "jmarrero-bot"}, "body": empty}),
+            serde_json::json!({"user": {"login": "jmarrero-bot", "id": 7}, "body": "Not a heartbeat"}),
+            serde_json::json!({"user": {"login": "renamed-bot", "id": 7}, "body": body,
                                "html_url": "https://github.com/jmarrero-forge/tracker/issues/1#issuecomment-1"}),
-            serde_json::json!({"user": {"login": "jmarrero-bot"}, "body": comment("{}")}),
+            serde_json::json!({"user": {"login": "jmarrero-bot", "id": 7}, "body": comment("{}")}),
         ];
-        let found = find_heartbeat(&comments, "jmarrero-bot", &github(), now())
+        let found = find_heartbeat(&comments, 7, &github(), now())
             .unwrap()
             .unwrap();
         assert_eq!(found.runs.len(), 2);
@@ -780,7 +798,7 @@ pub mod tests {
             Some("https://github.com/jmarrero-forge/tracker/issues/1#issuecomment-1")
         );
         assert_eq!(
-            find_heartbeat(&comments[..2], "jmarrero-bot", &github(), now()),
+            find_heartbeat(&comments[..4], 7, &github(), now()),
             Ok(None)
         );
     }
@@ -869,9 +887,9 @@ pub mod tests {
         // A comment by the bot that says it is one, but isn't well formed,
         // is an error, not a missing heartbeat.
         let comments = [
-            serde_json::json!({"user": {"login": "jmarrero-bot"}, "body": with("schema", "x".into())}),
+            serde_json::json!({"user": {"login": "jmarrero-bot", "id": 7}, "body": with("schema", "x".into())}),
         ];
-        assert!(find_heartbeat(&comments, "jmarrero-bot", &github(), now()).is_err());
+        assert!(find_heartbeat(&comments, 7, &github(), now()).is_err());
     }
 
     #[test]

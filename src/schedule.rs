@@ -415,7 +415,8 @@ impl Scheduler {
     /// for, built with its bot settings `bot`, already checked. Its
     /// settings come back as they are to be stored. A plugin is trusted as
     /// it is now: the file hashed here is the one that must run to verify
-    /// the credential, and the one its later runs must be.
+    /// the credential, and the one its later runs must be. A bot's
+    /// numeric account ID is looked up by its login, to be kept.
     pub async fn verify_new(
         &self,
         input: &ConnectInput,
@@ -440,6 +441,10 @@ impl Scheduler {
         };
         let source = self.sources.connector(&input.provider, settings)?;
         let account = connector::verify(source.as_ref(), target).await?;
+        let bot = match bot {
+            Some(bot) => Some(connector::settle_bot(source.as_ref(), target, bot).await?),
+            None => None,
+        };
         Ok(Verified {
             account,
             bot,
@@ -822,11 +827,24 @@ impl Scheduler {
                 Ok((db.secret(&c.id), db.items()?, last, runs, c))
             })
         };
-        let (token, old, last, runs, c) = match loaded {
+        let (token, old, last, runs, mut c) = match loaded {
             Ok(loaded) => loaded,
             // Its label is unknown too, so its ID stands in.
             Err(e) => return Report::new(id, id, trigger).failed(&e),
         };
+        // A bot connection kept from before its bot's account ID was. When
+        // its own account is the bot, as with the bot's own token, the ID is
+        // the one its credential was verified as, which this sync checks
+        // again; otherwise the sync looks it up by the bot's login.
+        let unsettled = c.bot.as_ref().is_some_and(|bot| bot.bot_id.is_none());
+        let own_id = c
+            .bot
+            .as_ref()
+            .filter(|bot| unsettled && bot.bot_login.eq_ignore_ascii_case(&c.account_name))
+            .and_then(|_| c.account_id.parse::<u64>().ok());
+        if let (Some(own), Some(bot)) = (own_id, c.bot.as_mut()) {
+            bot.bot_id = Some(own);
+        }
         let mut report = Report::new(id, &c.label, trigger);
         let source = self.sources.connector(&c.provider, Settings::of(&c));
         let result = async {
@@ -852,6 +870,33 @@ impl Scheduler {
         let finished = self.now();
         let sample = (self.sample)();
         let mut db = self.db();
+        // The ID of a bot connection kept from before, as this sync found
+        // it, kept from now on, whatever became of the rest of the sync.
+        let settled = c.bot.as_ref().filter(|_| unsettled).and_then(|bot| {
+            let id = own_id.or_else(|| source.as_ref()?.bot_id())?;
+            Some(BotConfig {
+                bot_id: Some(id),
+                ..bot.clone()
+            })
+        });
+        if let Some(bot) = settled {
+            let login = bot.bot_login.clone();
+            let id = bot.bot_id.unwrap_or_default();
+            match db.save_connection(&Connection {
+                bot: Some(bot),
+                ..c.clone()
+            }) {
+                Ok(()) if own_id.is_some() => eprintln!(
+                    "{}: the bot {login} is this connection's own account, GitHub account {id}, as its credential was verified; its heartbeat and pull requests are matched by that ID from now on",
+                    c.label
+                ),
+                Ok(()) => eprintln!(
+                    "warning: {}: the bot's login {login} names GitHub account {id} now, looked up at this sync rather than when the bot was connected. A person should confirm that account is the bot's (GitHub's `GET /user/{id}` names its login), or connect the bot again; its heartbeat and pull requests are matched by that ID from now on",
+                    c.label
+                ),
+                Err(e) => eprintln!("{}: cannot keep the bot's account ID {id}: {e:#}", c.label),
+            }
+        }
         let saved = match result {
             Ok((synced, watched, agents)) => {
                 let mut state = c.sync.succeeded(started);
@@ -923,6 +968,11 @@ impl Scheduler {
                 c.account_name
             )
         }
+        // The bot's login still names the account kept, or one is kept now.
+        let bot = match &c.bot {
+            Some(bot) => Some(connector::settle_bot(source.as_ref(), &target, bot.clone()).await?),
+            None => None,
+        };
         let state = SyncState {
             next_due: Some(self.now()),
             failures: 0,
@@ -938,6 +988,9 @@ impl Scheduler {
         // the new credential with the schedule stopped; verifying again
         // recovers either way. The connection's lock keeps its syncs out
         // until the credential is in place.
+        if bot != c.bot {
+            db.save_connection(&Connection { bot, ..c.clone() })?;
+        }
         let staged = token.is_some();
         if staged {
             db.stage_secret(id, target.credential.expose())?;
@@ -1053,6 +1106,8 @@ mod tests {
         gates: Mutex<HashMap<String, Arc<Semaphore>>>,
         /// Told when a gated `list` starts waiting.
         entered: Notify,
+        /// The account a bot's login names, if not 7.
+        bot_account: Mutex<Option<u64>>,
     }
 
     impl World {
@@ -1168,6 +1223,16 @@ mod tests {
                     .map(|t| Refreshed::inaccessible(&t.remote_id, "Gone"))
                     .collect())
             })
+        }
+        fn look_up_bot_id<'a>(
+            &'a self,
+            _: &'a Target,
+        ) -> Option<BoxFuture<'a, ConnectorResult<u64>>> {
+            let id = self.bot_id();
+            Some(Box::pin(async move { Ok(id.unwrap_or_default()) }))
+        }
+        fn bot_id(&self) -> Option<u64> {
+            Some(lock(&self.0.bot_account).unwrap_or(7))
         }
     }
 
@@ -1497,6 +1562,49 @@ mod tests {
         h.tick().await;
         assert_eq!(h.state("a.example").next_due, Some(at(22)));
         assert_eq!(h.world.lists("a.example"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_bot_kept_without_its_account_id_gets_it_at_its_next_sync() {
+        let h = Harness::new(&[("a.example", None), ("b.example", None)]);
+        let id = h.id("a.example");
+        let bot = |id: Option<u64>| BotConfig {
+            bot_id: id,
+            ..bot::tests::config()
+        };
+        {
+            let db = lock(&h.db);
+            let mut c = db.connection(id).unwrap();
+            c.bot = Some(bot(None));
+            db.save_connection(&c).unwrap();
+        }
+        let kept = || lock(&h.db).connection(id).unwrap().bot;
+        let report = h.scheduler.sync(id, Trigger::Explicit).await;
+        assert_eq!(report.error, None);
+        assert_eq!(kept(), Some(bot(Some(7))));
+        // When the connection's own account is the bot, that is the ID,
+        // as its credential is verified, with nothing looked up.
+        let other = h.id("b.example");
+        {
+            let db = lock(&h.db);
+            let mut c = db.connection(other).unwrap();
+            c.account_name = bot(None).bot_login;
+            c.bot = Some(bot(None));
+            db.save_connection(&c).unwrap();
+        }
+        let report = h.scheduler.sync(other, Trigger::Explicit).await;
+        assert_eq!(report.error, None);
+        let own = lock(&h.db).connection(other).unwrap().bot;
+        assert_eq!(own, Some(bot(Some(42))));
+        // Verifying looks it up again, and refuses a login that names
+        // another account now, keeping the one it had.
+        *lock(&h.world.bot_account) = Some(8);
+        let error = h.scheduler.verify(id, None).await.unwrap_err();
+        assert!(format!("{error:#}").contains("not account 7"), "{error:#}");
+        assert_eq!(kept(), Some(bot(Some(7))));
+        *lock(&h.world.bot_account) = None;
+        h.scheduler.verify(id, None).await.unwrap();
+        assert_eq!(kept(), Some(bot(Some(7))));
     }
 
     #[tokio::test]
