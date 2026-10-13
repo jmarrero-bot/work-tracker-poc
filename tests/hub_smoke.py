@@ -214,9 +214,11 @@ with tempfile.TemporaryDirectory(prefix='workboard-hub-smoke-') as folder:
         assert companion_token and companion_token != hub.token
         status, _, body = hub_call('/api/export/external', token=companion_token)
         assert status == 200, body
-        # With the effort's title, unshared.
+        # With the effort's title, unshared, and the account's numeric ID,
+        # by which a companion tells its own copy of the account.
         export = json.loads(body)
         assert [e['title'] for e in export['efforts']] == ['Hub effort'], export
+        assert [c['account_id'] for c in export['connections']] == ['42'], export
         assert hub_call('/api/snapshot', token=companion_token)[0] == 403
         assert hub_call('/api/efforts', 'POST', {'title': 'No'}, token=companion_token)[0] == 403
         assert hub_call('/api/companion-token', token=companion_token)[0] == 403

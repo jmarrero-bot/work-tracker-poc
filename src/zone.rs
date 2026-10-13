@@ -55,6 +55,12 @@ pub struct ExternalConnection {
     pub label: String,
     pub base_url: String,
     pub account_name: String,
+    /// The account's numeric ID, which the instance shows anyone and which
+    /// survives renames, so a companion matches its own connections by it
+    /// ([`numeric_account_id`]). None for an account whose ID isn't
+    /// numeric, and from hubs that predate it.
+    #[serde(default)]
+    pub account_id: Option<String>,
     /// When its last successful sync started: how fresh its items are.
     pub last_success: Option<Timestamp>,
     /// Whether that was too long ago for its items to be current, so the
@@ -136,6 +142,17 @@ pub enum Exporter {
     Local,
 }
 
+/// Most digits in an exported account ID: a 64-bit number's.
+pub const MAX_ACCOUNT_ID: usize = 20;
+
+/// `id`, if it is a numeric account ID, such as GitHub's, GitLab's and
+/// Forgejo's, which they show anyone. Any other, such as a plugin's or
+/// Jira's user key, which can be a name or a mail address, stays behind.
+pub fn numeric_account_id(id: &str) -> Option<String> {
+    (!id.is_empty() && id.len() <= MAX_ACCOUNT_ID && id.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| id.to_string())
+}
+
 /// How an effort whose title isn't shared is labeled: "Effort" and the start
 /// of its random ID.
 pub fn neutral_title(id: &str) -> String {
@@ -169,6 +186,7 @@ pub fn external_only(snapshot: &Snapshot, from: Exporter) -> ExternalSnapshot {
             label: c.label.clone(),
             base_url: c.base_url.clone(),
             account_name: c.account_name.clone(),
+            account_id: numeric_account_id(&c.account_id),
             last_success: c.sync.last_success,
             stale: c.schedule.stale,
             error_kind: c
@@ -307,8 +325,12 @@ mod tests {
             provider: "gitlab-public".into(),
             label: format!("{tag} label {n}"),
             base_url: format!("https://{tag}-{n}.example/"),
-            // Never needed outside, so never exported.
-            account_id: format!("{INTERNAL}-account-{n}"),
+            // Numeric, so exported if external.
+            account_id: if zone == Zone::External {
+                format!("{}", 1000 + n)
+            } else {
+                format!("{INTERNAL}-account-{n}")
+            },
             account_name: format!("{tag} account {n}"),
             zone,
             watch_user: Some(format!("{INTERNAL}-watched")),
@@ -579,6 +601,7 @@ mod tests {
             (
                 &out["connections"][0],
                 &[
+                    "account_id",
                     "account_name",
                     "base_url",
                     "error_kind",
@@ -622,6 +645,31 @@ mod tests {
             "2026-10-12T00:00:01Z"
         );
         assert_eq!(out["connections"][0]["stale"], true);
+        assert_eq!(out["connections"][0]["account_id"], "1001");
+    }
+
+    #[test]
+    fn only_numeric_account_ids_leave() {
+        for (id, exported) in [
+            ("1894", Some("1894")),
+            ("0", Some("0")),
+            ("12345678901234567890", Some("12345678901234567890")),
+            ("123456789012345678901", None),
+            ("", None),
+            ("JIRAUSER1234", None),
+            ("someone@example.com", None),
+            ("12 34", None),
+            ("-1", None),
+            ("١٢٣", None),
+        ] {
+            assert_eq!(numeric_account_id(id).as_deref(), exported, "{id}");
+            let c = Connection {
+                account_id: id.into(),
+                ..connection(1, Zone::External)
+            };
+            let out = external_only(&snapshot(vec![c], vec![], vec![]), Exporter::Local);
+            assert_eq!(out.connections[0].account_id.as_deref(), exported, "{id}");
+        }
     }
 
     /// A small deterministic generator (xorshift64), so a failing case is
@@ -685,6 +733,13 @@ mod tests {
             let expected: Vec<_> = known.iter().filter(external).map(|c| &c.id).collect();
             let shown: Vec<_> = out.connections.iter().map(|c| &c.id).collect();
             assert_eq!(shown, expected, "seed {seed}");
+            // With their numeric account IDs: an internal one is tagged.
+            for c in &out.connections {
+                let known = known.iter().find(|k| k.id == c.id).unwrap();
+                let id = numeric_account_id(&known.account_id);
+                assert!(id.is_some(), "seed {seed}");
+                assert_eq!(c.account_id, id, "seed {seed}");
+            }
             // Everything external does leave.
             let expected: Vec<_> = items
                 .iter()
