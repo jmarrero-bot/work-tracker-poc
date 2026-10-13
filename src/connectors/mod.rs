@@ -18,6 +18,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, Response, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     path::Path,
@@ -86,12 +87,27 @@ pub struct Shared {
     forgejo: Arc<forgejo::Memory>,
 }
 
+/// A plugin connection's own settings: which plugin file it trusts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginConfig {
+    /// The SHA-256 of the plugin executable the person trusts, as
+    /// lowercase hex, as `sha256sum` prints it: recorded when connecting,
+    /// and changed only when the person trusts another
+    /// (`workboard plugin trust`). The plugin runs only while its file
+    /// hashes to it. None for a connection made before plugins were
+    /// pinned, whose plugin doesn't run until the person trusts one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
 /// What a connector is built from besides its provider: its connection's
 /// own settings.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Settings<'a> {
     /// For the bot: where its board, tracker and heartbeat are.
     pub bot: Option<&'a BotConfig>,
+    /// For a plugin: which file it trusts.
+    pub plugin: Option<&'a PluginConfig>,
 }
 
 impl<'a> Settings<'a> {
@@ -99,8 +115,49 @@ impl<'a> Settings<'a> {
     pub fn of(c: &'a Connection) -> Self {
         Self {
             bot: c.bot.as_ref(),
+            plugin: c.plugin.as_ref(),
         }
     }
+}
+
+/// Whether `provider` is served by a connector plugin: a source Workboard
+/// knows, with no built-in connector.
+pub fn is_plugin(provider: &str) -> bool {
+    valid_provider(provider)
+        && !is_gitlab(provider)
+        && !matches!(provider, "jira" | "github" | "fedora" | "bot")
+}
+
+/// The executable that serves `provider` in `plugins`, which has to be
+/// there.
+fn plugin_path(plugins: &Path, provider: &str) -> Result<std::path::PathBuf> {
+    let program = std::path::absolute(plugins.join(provider))?;
+    if !program.exists() {
+        bail!(
+            "Live connection currently supports Jira Data Center, GitLab, GitHub and Fedora Forge, and connector plugins such as {}",
+            program.display()
+        )
+    }
+    Ok(program)
+}
+
+/// The SHA-256 of the plugin in `plugins` that serves `provider`, as it
+/// would run now, once it passes the checks every run makes.
+pub fn plugin_sha256(plugins: &Path, provider: &str) -> Result<String> {
+    if !is_plugin(provider) {
+        bail!("{provider} has a built-in connector, not a plugin")
+    }
+    plugin_hash(&plugin_path(plugins, provider)?)
+}
+
+#[cfg(unix)]
+fn plugin_hash(program: &Path) -> Result<String> {
+    plugin::sha256_of(program)
+}
+
+#[cfg(not(unix))]
+fn plugin_hash(_: &Path) -> Result<String> {
+    bail!("Connector plugins need Linux or macOS")
 }
 
 /// The connector for a provider: built in for Jira, GitLab, GitHub, Fedora
@@ -123,31 +180,27 @@ pub fn for_provider(
             Box::new(github::Bot::new(shared.github.clone(), config.clone())?)
         }
         "fedora" => Box::new(forgejo::Forgejo::new(shared.forgejo.clone())?),
-        p if valid_provider(p) => {
-            let program = std::path::absolute(plugins.join(p))?;
-            if !program.exists() {
-                bail!(
-                    "Live connection currently supports Jira Data Center, GitLab, GitHub and Fedora Forge, and connector plugins such as {}",
-                    program.display()
-                )
-            }
-            plugin(p, &program)?
-        }
+        p if is_plugin(p) => plugin(p, &plugin_path(plugins, p)?, settings.plugin)?,
         _ => bail!("Choose a supported source"),
     })
 }
 
 #[cfg(unix)]
-fn plugin(provider: &str, program: &Path) -> Result<Box<dyn Connector>> {
+fn plugin(
+    provider: &str,
+    program: &Path,
+    config: Option<&PluginConfig>,
+) -> Result<Box<dyn Connector>> {
     Ok(Box::new(plugin::Plugin::new(
         provider,
         program,
         plugin::DEFAULT_TIMEOUT,
+        config.and_then(|c| c.sha256.clone()),
     )?))
 }
 
 #[cfg(not(unix))]
-fn plugin(_: &str, _: &Path) -> Result<Box<dyn Connector>> {
+fn plugin(_: &str, _: &Path, _: Option<&PluginConfig>) -> Result<Box<dyn Connector>> {
     bail!("Connector plugins need Linux or macOS")
 }
 
@@ -396,7 +449,10 @@ mod tests {
             ("bot", Some(&wrong), None),
             ("bugzilla", None, None),
         ] {
-            let settings = Settings { bot };
+            let settings = Settings {
+                bot,
+                ..Settings::default()
+            };
             assert_eq!(
                 for_provider(provider, settings, plugins.path(), &Shared::default())
                     .ok()
@@ -409,7 +465,10 @@ mod tests {
         // The built-in GitHub, Forgejo and bot connectors, which count what
         // they send, and not the plugins of those names.
         for (provider, bot) in [("github", None), ("fedora", None), ("bot", Some(&config))] {
-            let settings = Settings { bot };
+            let settings = Settings {
+                bot,
+                ..Settings::default()
+            };
             let connector =
                 for_provider(provider, settings, plugins.path(), &Shared::default()).unwrap();
             assert!(connector.requests().is_some(), "{provider}");

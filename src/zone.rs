@@ -321,6 +321,10 @@ mod tests {
                 forge_org: format!("{INTERNAL}-forge"),
                 ..crate::bot::tests::config()
             }),
+            // Not exported either: which plugin file it trusts.
+            plugin: Some(crate::model::PluginConfig {
+                sha256: Some(format!("{INTERNAL}-sha256")),
+            }),
         }
     }
     /// An item of `connection`, or a manual one, whose row says `zone`.

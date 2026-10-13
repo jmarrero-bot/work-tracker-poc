@@ -16,7 +16,7 @@ Why not just one of them:
 - Because both kinds answer with the same types, everything Workboard checks happens in one place, on the host side (`connector::sync_and_watch`), whichever connector answered: that the credential still belongs to the connection's account, which items get fetched again, that links are HTTP(S), that an inaccessible item becomes unknown and never done, and that no connector can mark work abandoned. A built-in connector could move out of process without any change there.
 - WebAssembly would isolate plugins better than a process does, but needs a runtime and host functions for HTTP. The protocol can be carried over to it later if that's needed.
 
-A separate process is isolation from crashes, hangs and the service's memory, not a sandbox: a plugin runs as the same user as the service and can read what that user can. Install only plugins you trust.
+A separate process is isolation from crashes, hangs and the service's memory, not a sandbox. A plugin runs as the same user as the service and can read whatever that user can: the data directory, with every connection's credential, the service's own environment in `/proc/$PPID/environ`, and the session bus, which reaches the keyring. Pinning, the minimal environment and the credential on standard input keep a careless plugin from mishandling what it gets; they don't stop a malicious one. Install only plugins you trust. Sandboxing plugins is [#50](https://github.com/jmarrero-bot/work-tracker-poc/issues/50).
 
 ## Installing a plugin
 
@@ -28,9 +28,26 @@ workboard connect errata --url https://errata.example.com/ --label Errata --toke
 
 Jira, GitLab, GitHub and Fedora Forge always use their built-in connectors. `tests/plugins/fake-forge` is a small plugin in Python, used by the tests.
 
+## Trusting a plugin file
+
+Each plugin connection trusts one plugin file, by its SHA-256. Connecting records the SHA-256 of the plugin as it is then, and that is the file that runs to verify the credential. From then on, every run hashes the file it is about to run, and runs it only if it is that file. An upgraded, edited or replaced plugin isn't run with the connection's credential: the call fails as `auth`, naming the new SHA-256 and the trusted one, and the connection's scheduled syncs stop until you decide.
+
+To decide, check the new file (`sha256sum ~/.local/share/workboard/plugins/errata` prints the same hash), then trust it:
+
+```sh
+workboard plugin trust CONNECTION_ID                    # shows the trusted and the new SHA-256, and asks
+workboard plugin trust CONNECTION_ID --sha256 NEW_HASH  # trusts that file without asking
+```
+
+Trusting is explicit and names the file: Workboard pins the new hash only if the plugin still hashes to the one you saw, then verifies the connection with it, which brings its scheduled syncs back. Each connection trusts its own file, so several connections that share a plugin are each trusted again. A plugin connection made before plugins were pinned trusts no file, and its plugin doesn't run until you trust one the same way. `workboard connections` says which command a stopped connection needs. The API is `GET` and `POST /api/connections/:id/plugin`.
+
+Pinning says which file you agreed to run with a credential, not that the file is safe: check what you trust, as you would any program you install. It covers the plugin file only, not the interpreter its first line names, nor the libraries and modules that interpreter loads, which are as trusted as anything else installed for your user.
+
+## How a plugin runs
+
 Workboard runs a plugin:
 
-- only if it is a regular file, not a symbolic link, owned by the user running Workboard and not writable by its group or others, in a directory that is the same. On Linux, Workboard opens the file, checks it through the open descriptor, and runs that descriptor (`/proc/self/fd/N`), so the file checked is the file run even if the path is replaced in between. Elsewhere it runs the path again, and only those ownership checks keep it from being swapped;
+- only if it is a regular file, not a symbolic link, owned by the user running Workboard and not writable by its group or others, in a directory that is the same, and only while it hashes to the SHA-256 its connection trusts. On Linux, Workboard opens the file, checks it and hashes it through the open descriptor, and runs that descriptor (`/proc/self/fd/N`), so the file checked and hashed is the file run even if the path is replaced in between. Rewriting the same file in place after it was hashed takes its owner, the user Workboard runs as. Elsewhere Workboard runs the path again, and only those ownership checks keep it from being swapped after it was hashed;
 - by its absolute path, never one looked up in `PATH`;
 - with no arguments, `/` as its working directory, and an environment of only `PATH=/usr/local/bin:/usr/bin:/bin` and `LANG=C.UTF-8`. There is no `HOME`, no proxy variables such as `HTTPS_PROXY`, and no CA bundle variables such as `SSL_CERT_FILE`, so a plugin that needs them has to find them on its own for now;
 - with its standard error discarded, since a plugin's own diagnostics could echo the credential;

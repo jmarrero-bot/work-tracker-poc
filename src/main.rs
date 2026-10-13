@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use clock::{format_interval, relative};
 use model::*;
 use std::{
-    io::{self, Read},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::PathBuf,
     time::{Duration, SystemTime},
 };
@@ -324,6 +324,24 @@ enum Command {
         #[command(subcommand)]
         command: GithubAppCommand,
     },
+    /// A connection's connector plugin.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+}
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// Show which plugin file a connection trusts, by its SHA-256, and what
+    /// its plugin hashes to now, and trust that file once you checked it.
+    /// A plugin that changed doesn't run until then.
+    Trust {
+        connection: String,
+        /// Trust the file with this SHA-256, as `sha256sum` prints it,
+        /// without asking. Refused if the plugin hashes to anything else.
+        #[arg(long, value_name = "SHA256")]
+        sha256: Option<String>,
+    },
 }
 #[derive(Subcommand)]
 enum GithubAppCommand {
@@ -573,6 +591,12 @@ async fn main() -> Result<()> {
                 c.id,
                 c.zone.label()
             );
+            if let Some(sha256) = c.plugin.as_ref().and_then(|p| p.sha256.as_deref()) {
+                println!(
+                    "It trusts its plugin file by its SHA-256, {sha256}, which `sha256sum` prints for it too; a changed plugin doesn't run until you trust it with `workboard plugin trust {}`",
+                    c.id
+                );
+            }
             if let Some(login) = &c.watch_user {
                 println!(
                     "Also watching {login}'s activity visible to this token; it is listed as theirs, not yours"
@@ -1112,6 +1136,9 @@ async fn main() -> Result<()> {
             let token = v["token"].as_str().context("The hub sent no token")?;
             println!("{token}");
         }
+        Command::Plugin {
+            command: PluginCommand::Trust { connection, sha256 },
+        } => trust_plugin(&client, &root, args.port, &connection, sha256).await?,
         Command::Serve { .. } | Command::GithubApp { .. } | Command::Credentials { .. } => {
             unreachable!()
         }
@@ -1187,6 +1214,62 @@ fn migrate_credentials(root: &std::path::Path, to: secrets::Backend) -> Result<(
     println!(
         "The credentials are kept in {store}: {} copied, {} old copies dropped",
         migrated.copied, migrated.dropped
+    );
+    Ok(())
+}
+/// `workboard plugin trust`: show the plugin file a connection trusts and
+/// the one there now, and trust the one there now if the person says so,
+/// at the terminal or with `sha256`.
+async fn trust_plugin(
+    client: &reqwest::Client,
+    root: &std::path::Path,
+    port: u16,
+    connection: &str,
+    sha256: Option<String>,
+) -> Result<()> {
+    let path = format!("connections/{connection}/plugin");
+    let trust: serde_json::Value =
+        request(client, root, port, reqwest::Method::GET, &path, None).await?;
+    let label = trust["label"].as_str().unwrap_or(connection);
+    let current = trust["current"]
+        .as_str()
+        .context("The service sent no SHA-256")?;
+    let trusted = trust["trusted"].as_str();
+    println!("{label}'s connector plugin");
+    println!("  trusted:  {}", trusted.unwrap_or("none yet"));
+    println!("  on disk:  {current}");
+    let sha256 = match sha256 {
+        Some(sha256) => sha256,
+        None if trusted == Some(current) => {
+            println!("It trusts the file there now");
+            return Ok(());
+        }
+        None if io::stdin().is_terminal() => {
+            print!("Run this file with {label}'s credential from now on? [y/N] ");
+            io::stdout().flush()?;
+            let mut answer = String::new();
+            io::stdin().lock().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                bail!("Not trusted; the plugin doesn't run until you trust it")
+            }
+            current.to_string()
+        }
+        None => bail!(
+            "Check the file, then trust it with `workboard plugin trust {connection} --sha256 {current}`"
+        ),
+    };
+    let c: Connection = request(
+        client,
+        root,
+        port,
+        reqwest::Method::POST,
+        &path,
+        Some(serde_json::json!({ "sha256": sha256 })),
+    )
+    .await?;
+    println!(
+        "{} trusts its plugin {sha256} from now on. It syncs again soon, and on schedule",
+        c.label
     );
     Ok(())
 }
@@ -1331,8 +1414,17 @@ fn sync_status(c: &Connection, now: Timestamp) -> String {
         }
     });
     if c.schedule.needs_user {
+        // A plugin that changed needs trusting, not a credential.
+        let plugin = if connectors::is_plugin(&c.provider) {
+            format!(
+                ", or if its plugin changed, check it and run `workboard plugin trust {}`",
+                c.id
+            )
+        } else {
+            String::new()
+        };
         return format!(
-            "Needs you: {error}. Scheduled syncs stopped until the credential works: fix it, then run `workboard verify {}` (add --token-stdin to give a new one). {}",
+            "Needs you: {error}. Scheduled syncs stopped until the credential works: fix it, then run `workboard verify {}` (add --token-stdin to give a new one){plugin}. {}",
             c.id,
             capitalized(&last)
         );

@@ -553,6 +553,7 @@ pub fn merge(snapshot: &mut Snapshot, export: &ExternalSnapshot, status: &Status
             },
             from_hub: true,
             bot: None,
+            plugin: None,
         });
     }
     // The hub's efforts with work shown here: one whose items are all

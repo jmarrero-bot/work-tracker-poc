@@ -583,6 +583,7 @@ async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> Api
         watch_user: watch_user.map(str::to_string),
         sync_interval: input.sync_interval,
         bot: verified.bot,
+        plugin: verified.plugin,
         sync: SyncState::default(),
         schedule: Schedule::default(),
         from_hub: false,
@@ -706,6 +707,30 @@ async fn verify(
     Ok(Json(
         app.scheduler.verify(&id, input.token.as_deref()).await?,
     ))
+}
+/// Which plugin file a plugin connection trusts, and what its plugin
+/// hashes to now.
+async fn plugin_trust(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> ApiResult<schedule::PluginTrust> {
+    local(&id)?;
+    Ok(Json(app.scheduler.plugin_trust(&id)?))
+}
+#[derive(Deserialize)]
+struct TrustInput {
+    /// The SHA-256 of the plugin file the person checked.
+    sha256: String,
+}
+/// Trust the plugin file the person checked, by its SHA-256, from now on,
+/// and verify the connection with it.
+async fn trust_plugin(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(input): Json<TrustInput>,
+) -> ApiResult<Connection> {
+    local(&id)?;
+    Ok(Json(app.scheduler.trust_plugin(&id, &input.sha256).await?))
 }
 async fn disconnect(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Value> {
     local(&id)?;
@@ -1225,6 +1250,10 @@ fn router(app: App) -> Router {
             axum::routing::delete(disconnect).patch(patch_connection),
         )
         .route("/connections/{id}/verify", post(verify))
+        .route(
+            "/connections/{id}/plugin",
+            get(plugin_trust).post(trust_plugin),
+        )
         .route("/sync", post(sync))
         .route("/efforts", post(effort))
         .route("/efforts/{id}", axum::routing::patch(share_effort))

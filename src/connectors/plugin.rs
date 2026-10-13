@@ -3,7 +3,8 @@
 //! A plugin gets the credential on standard input only, an environment with
 //! nothing but `PATH` and `LANG`, and a time limit, after which its whole
 //! process group is killed. Only a file owned by the user and writable by
-//! nobody else is run, and on Linux exactly the file that was checked.
+//! nobody else is run, only while it hashes to the SHA-256 its connection
+//! trusts, and on Linux exactly the file that was checked and hashed.
 
 use crate::connector::{
     Account, BoxFuture, Connector, ConnectorError, ConnectorResult, ErrorKind, Refreshed,
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::{
     fs::{self, File},
+    io::{Read, Seek},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
@@ -81,6 +83,10 @@ pub struct Plugin {
     kind: String,
     program: PathBuf,
     timeout: Duration,
+    /// The SHA-256 its connection trusts, as lowercase hex: it runs only
+    /// while its file hashes to it. None for a connection that trusts no
+    /// file yet, whose plugin doesn't run.
+    pinned: Option<String>,
 }
 
 /// Open the plugin at `program` and check what was opened: a regular file,
@@ -122,6 +128,34 @@ fn open_checked(program: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// The SHA-256 of what the open `file` holds, as lowercase hex, read
+/// through the descriptor that is run, so what is hashed is what runs.
+fn sha256(mut file: &File) -> std::io::Result<String> {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+    }
+    file.rewind()?;
+    Ok(context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// The SHA-256 of the plugin at `program`, if it passes the checks of
+/// [`open_checked`], as it would run now.
+pub fn sha256_of(program: &Path) -> Result<String> {
+    let file = open_checked(program)?;
+    sha256(&file).with_context(|| format!("Cannot read connector plugin {}", program.display()))
+}
+
 /// A plugin's process group, killed once, at the latest when dropped, so a
 /// helper the plugin started can't outlive the call with its credential.
 struct ProcessGroup(Option<Pid>);
@@ -157,9 +191,15 @@ fn exited(pid: Pid) {
 
 impl Plugin {
     /// The plugin at `program`, whose item IDs are namespaced by `kind`.
-    /// Only an absolute path is run, never one looked up in `PATH`, and only
-    /// a file that passes [`open_checked`].
-    pub fn new(kind: &str, program: &Path, timeout: Duration) -> Result<Self> {
+    /// Only an absolute path is run, never one looked up in `PATH`, only a
+    /// file that passes [`open_checked`], and only while it hashes to
+    /// `pinned`.
+    pub fn new(
+        kind: &str,
+        program: &Path,
+        timeout: Duration,
+        pinned: Option<String>,
+    ) -> Result<Self> {
         let valid_kind = !kind.is_empty()
             && kind.len() <= 64
             && kind
@@ -176,6 +216,7 @@ impl Plugin {
             kind: kind.into(),
             program: program.into(),
             timeout,
+            pinned,
         })
     }
 
@@ -185,6 +226,30 @@ impl Plugin {
 
     fn invalid(&self, problem: &str) -> ConnectorError {
         ConnectorError::invalid(format!("{} {problem}", self.name()))
+    }
+
+    /// Fail unless the open plugin `file` hashes to the SHA-256 its
+    /// connection trusts. A plugin that changed, or one no file is trusted
+    /// for yet, needs the person: an auth error, which stops the
+    /// connection's scheduled syncs until they trust it.
+    fn check_pin(&self, file: &File) -> ConnectorResult<()> {
+        let found = sha256(file).map_err(|e| self.invalid(&format!("cannot be read: {e}")))?;
+        let why = match &self.pinned {
+            Some(pinned) if *pinned == found => return Ok(()),
+            Some(pinned) => format!(
+                "changed since this connection trusted it, so it was not run: its SHA-256 is {found}, not {pinned}"
+            ),
+            None => format!(
+                "was not run: this connection, made before plugins were pinned, trusts no plugin file yet. Its SHA-256 is {found}"
+            ),
+        };
+        Err(ConnectorError::new(
+            ErrorKind::Auth,
+            format!(
+                "{} {why}. If you trust it, run `workboard plugin trust` with this connection",
+                self.name()
+            ),
+        ))
     }
 
     /// The command that runs the opened plugin `file`, in a process group
@@ -252,6 +317,7 @@ impl Plugin {
         .map_err(ConnectorError::invalid)?;
         let file = open_checked(&self.program)
             .map_err(|e| self.invalid(&format!("cannot be run: {e:#}")))?;
+        self.check_pin(&file)?;
         let response = self.run(file, &request).await?;
         if let Some(e) = response.error {
             if e.kind == ErrorKind::Inaccessible {
@@ -399,7 +465,12 @@ mod tests {
     /// arguments, the minimal environment and the test credential.
     fn fake_forge(timeout: Duration) -> Plugin {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
-        Plugin::new("fake-forge", &path, timeout).unwrap()
+        pinned(&path, timeout)
+    }
+    /// The plugin at `path`, trusted as it is now.
+    fn pinned(path: &Path, timeout: Duration) -> Plugin {
+        let sha256 = sha256_of(path).unwrap();
+        Plugin::new("fake-forge", path, timeout, Some(sha256)).unwrap()
     }
     fn target(base_url: &str, credential: &str) -> Target {
         Target::new(base_url, credential).unwrap()
@@ -597,12 +668,12 @@ mod tests {
     #[test]
     fn only_trusted_executables_are_plugins() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
-        assert!(Plugin::new("Fake Forge", &script, DEFAULT_TIMEOUT).is_err());
-        assert!(Plugin::new("fake-forge", Path::new("fake-forge"), DEFAULT_TIMEOUT).is_err());
+        assert!(Plugin::new("Fake Forge", &script, DEFAULT_TIMEOUT, None).is_err());
+        assert!(Plugin::new("fake-forge", Path::new("fake-forge"), DEFAULT_TIMEOUT, None).is_err());
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
         let error = |name: &str| {
-            Plugin::new("fake-forge", &dir.join(name), DEFAULT_TIMEOUT)
+            Plugin::new("fake-forge", &dir.join(name), DEFAULT_TIMEOUT, None)
                 .err()
                 .map(|e| format!("{e:#}"))
         };
@@ -631,7 +702,7 @@ mod tests {
         let path = temp.path().join("plugin");
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
         fs::copy(&script, &path).unwrap();
-        let plugin = Plugin::new("fake-forge", &path, DEFAULT_TIMEOUT).unwrap();
+        let plugin = pinned(&path, DEFAULT_TIMEOUT);
         let file = open_checked(&path).unwrap();
         // Replace the plugin after it was checked.
         let other = temp.path().join("other");
@@ -645,12 +716,64 @@ mod tests {
         let response = plugin.run(file, VERIFY).await.unwrap();
         assert_eq!(response.account.unwrap().id, "42");
         assert!(response.error.is_none());
-        // The next call checks and runs the new file.
-        let error = plugin
-            .verify(&target("https://forge.example/", "test-only-token"))
+        // The next call checks the new file, which isn't the one trusted;
+        // once it is, that call runs it.
+        let target = target("https://forge.example/", "test-only-token");
+        let error = plugin.verify(&target).await.unwrap_err();
+        assert!(error.message.contains("changed since"), "{error}");
+        let error = pinned(&path, DEFAULT_TIMEOUT)
+            .verify(&target)
             .await
             .unwrap_err();
         assert!(error.message.contains("swapped"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn only_the_trusted_file_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("plugin");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/fake-forge");
+        fs::copy(&script, &path).unwrap();
+        let target = target("https://forge.example/", "test-only-token");
+        let trusted = sha256_of(&path).unwrap();
+        // As `sha256sum` prints it.
+        assert_eq!(trusted.len(), 64);
+        assert!(trusted.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+        let plugin = Plugin::new("fake-forge", &path, DEFAULT_TIMEOUT, Some(trusted.clone()));
+        let plugin = plugin.unwrap();
+        assert_eq!(plugin.verify(&target).await.unwrap().id, "42");
+        // Another file in its place, which would leave a mark if it ran,
+        // is refused unrun, and the error names its hash.
+        let ran = temp.path().join("ran");
+        let other = temp.path().join("other");
+        fs::write(
+            &other,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho '{{\"protocol\":1,\"account\":{{\"id\":\"42\",\"name\":\"other\"}}}}'\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&other, &path).unwrap();
+        let swapped = sha256_of(&path).unwrap();
+        assert_ne!(swapped, trusted);
+        let error = plugin.verify(&target).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Auth, "{error}");
+        assert!(error.message.contains(&swapped), "{error}");
+        assert!(error.message.contains(&trusted), "{error}");
+        assert!(error.message.contains("workboard plugin trust"), "{error}");
+        assert!(!ran.exists(), "the changed plugin ran");
+        // So is any file, for a connection that trusts none yet.
+        let unpinned = Plugin::new("fake-forge", &path, DEFAULT_TIMEOUT, None).unwrap();
+        let error = unpinned.verify(&target).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Auth, "{error}");
+        assert!(error.message.contains("trusts no plugin file"), "{error}");
+        assert!(!ran.exists(), "an untrusted plugin ran");
+        // Trusting the new file runs it.
+        let plugin = Plugin::new("fake-forge", &path, DEFAULT_TIMEOUT, Some(swapped)).unwrap();
+        assert_eq!(plugin.verify(&target).await.unwrap().name, "other");
+        assert!(ran.exists());
     }
 
     /// Whether process `pid` is gone (or a zombie, killed and waiting to be
