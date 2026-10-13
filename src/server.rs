@@ -2120,7 +2120,7 @@ mod tests {
         let Json(done) = poll().await.ok().unwrap();
         assert_eq!(
             (done["status"].as_str(), done["login"].as_str()),
-            (Some("done"), Some("jmarrero"))
+            (Some("done"), Some("octocat"))
         );
         assert_eq!(done["hub"]["url"], url);
         assert!(poll().await.is_err(), "nothing waits any more");

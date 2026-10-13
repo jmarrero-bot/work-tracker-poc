@@ -131,9 +131,9 @@ class Service:
 # its heartbeat's agent runs, and links that ask it for something.
 BOT_ID = 'bot-demo'
 BOT_ITEMS = [
-    ('31', 'jmarrero-forge/tracker#31', 'bootc: Support composefs in the install config', 'Needs human', 'P0',
+    ('31', 'example-org/tracker#31', 'bootc: Support composefs in the install config', 'Needs human', 'P0',
      'Which default should --composefs take? Two options in the question issue.'),
-    ('32', 'jmarrero-forge/bootc#9', 'lint: Warn about /var content in images', 'Draft', 'P1',
+    ('32', 'example-org/bootc#9', 'lint: Warn about /var content in images', 'Draft', 'P1',
      'Ready for review: the fork pull request, tested on a devspace.'),
 ]
 
@@ -155,36 +155,36 @@ def bot_answers(now):
         i['synced_at'] = now
     connection = {
         'id': BOT_ID, 'provider': 'bot', 'label': 'Bot', 'base_url': 'https://github.com/', 'account_id': '1',
-        'account_name': 'jmarrero', 'zone': 'external', 'watch_user': None, 'sync_interval': None,
+        'account_name': 'octocat', 'zone': 'external', 'watch_user': None, 'sync_interval': None,
         'sync': {'last_success': now, 'last_attempt': now, 'next_due': None, 'failures': 0, 'error_kind': None, 'error': None, 'held_until': None},
         'schedule': {'interval_secs': 300, 'running': False, 'needs_user': False, 'stale': False}, 'from_hub': False,
     }
     rows = [{
         'id': i['id'], 'provider': 'bot', 'key': i['key'], 'title': i['title'], 'url': i['url'], 'status': i['status'],
         'outcome': 'open', 'outcome_reason': i['outcome_reason'], 'zone': 'external', 'updated_at': i['updated_at'],
-        'waits_on': [{'account': 'jmarrero', 'connection_id': BOT_ID, 'reasons': ['bot_waiting'], 'synced_at': now, 'stale': False}],
+        'waits_on': [{'account': 'octocat', 'connection_id': BOT_ID, 'reasons': ['bot_waiting'], 'synced_at': now, 'stale': False}],
         'synced_at': now, 'stale': False, 'from_hub': False,
     } for i in items]
-    tracker = 'https://github.com/jmarrero-forge/tracker/issues/new?labels=triage&body=...'
+    tracker = 'https://github.com/example-org/tracker/issues/new?labels=triage&body=...'
     run = lambda name, key, status, devspace: {
         'name': name, 'item_url': f'https://github.com/{key.replace("#", "/issues/")}', 'item_key': key,
         'status': status, 'started_at': now, 'devspace': devspace}
     view = {
-        'connection_id': BOT_ID, 'label': 'Bot', 'bot_login': 'jmarrero-bot',
-        'board_url': 'https://github.com/orgs/jmarrero-forge/projects/1',
+        'connection_id': BOT_ID, 'label': 'Bot', 'bot_login': 'example-bot',
+        'board_url': 'https://github.com/orgs/example-org/projects/1',
         'agents': {
             'connection_id': BOT_ID,
             'heartbeat': {
                 'updated_at': now, 'session': 'coordinator', 'loop_state': 'polling', 'next_wake_at': None,
-                'runs': [run('wtp-gnome', 'jmarrero-bot/work-tracker-poc#10', 'testing', 'devspace-2'),
-                         run('wtp-login', 'jmarrero-bot/work-tracker-poc#12', 'working', None)],
-                'skipped': 0, 'comment_url': 'https://github.com/jmarrero-forge/tracker/issues/1#issuecomment-1', 'stale': False,
+                'runs': [run('wtp-gnome', 'example-org/app#10', 'testing', 'devspace-2'),
+                         run('wtp-login', 'example-org/app#12', 'working', None)],
+                'skipped': 0, 'comment_url': 'https://github.com/example-org/tracker/issues/1#issuecomment-1', 'stale': False,
             },
             'error': None, 'last_success': now, 'stale': False,
             'board': {'statuses': {'Todo': 6, 'In Progress': 2, 'Draft': 3, 'Needs human': 1, 'Done': 40}, 'fork_prs': 3, 'unreadable': 0},
         },
         'ask': {'issue_url': tracker, 'comment_url': None, 'comment': None},
-        'asks': {i['id']: {'issue_url': tracker, 'comment_url': i['url'], 'comment': '@jmarrero-bot '} for i in items},
+        'asks': {i['id']: {'issue_url': tracker, 'comment_url': i['url'], 'comment': '@example-bot '} for i in items},
     }
     return connection, items, rows, [view]
 

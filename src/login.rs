@@ -887,7 +887,7 @@ pub mod tests {
         {
             let mut fake = fake.lock().unwrap();
             fake.users
-                .insert("ghu_allowed".into(), (ALLOWED, "jmarrero".into()));
+                .insert("ghu_allowed".into(), (ALLOWED, "octocat".into()));
             fake.users
                 .insert("ghu_other".into(), (OTHER, "someone".into()));
         }
@@ -1023,7 +1023,7 @@ pub mod tests {
             user,
             Identity {
                 id: ALLOWED,
-                login: "jmarrero".into()
+                login: "octocat".into()
             }
         );
         assert_eq!(logins.session(&session, true), Some(user));
@@ -1062,7 +1062,7 @@ pub mod tests {
         fake.lock()
             .unwrap()
             .users
-            .insert("ghu_squatter".into(), (OTHER, "jmarrero".into()));
+            .insert("ghu_squatter".into(), (OTHER, "octocat".into()));
         for token in ["ghu_squatter", "ghu_other"] {
             let refused = sign_in(&logins, &fake, token).await.unwrap_err();
             assert_eq!(refused, LoginError::not_allowed(), "{token}");
@@ -1331,7 +1331,7 @@ pub mod tests {
         else {
             panic!("not done")
         };
-        assert_eq!(login, "jmarrero");
+        assert_eq!(login, "octocat");
         assert!(logins.companion(&token));
         assert!(!logins.companion("anything-else"));
         // Kept by its hash only, and the handle is used up.

@@ -77,7 +77,7 @@ if request['credential'] != TOKEN:
     error('auth', 'Credential rejected')
 method = request['method']
 if method == 'verify':
-    answer({'account': {'id': '42', 'name': 'jmarrero'}})
+    answer({'account': {'id': '42', 'name': 'octocat'}})
 # Verifies, then fails every sync, as a credential that expired does.
 if host == 'staging.errata.example.invalid':
     error('auth', 'The staging token expired')

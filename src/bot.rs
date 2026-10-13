@@ -1,4 +1,4 @@
-//! A harness bot as a source of work, such as jmarrero-bot: where its
+//! A harness bot as a source of work: where its
 //! board, tracker and heartbeat are, and what the bot connector reads
 //! besides an item's usual fields. The connector itself is
 //! `connectors/github/bot.rs`; like every GitHub connector, it only reads.
@@ -632,44 +632,44 @@ pub fn views(snapshot: &Snapshot, agents: &[AgentRuns]) -> Vec<BotView> {
 pub mod tests {
     use super::*;
 
-    /// jmarrero's bot, as `bot-operator --json` describes it.
+    /// An example bot's settings, as `bot-operator --json` describes one.
     pub fn config() -> BotConfig {
         BotConfig {
             board_owner_type: OwnerType::Orgs,
-            board_owner: "jmarrero-forge".into(),
+            board_owner: "example-org".into(),
             board_number: 1,
-            tracker: "jmarrero-forge/tracker".into(),
+            tracker: "example-org/tracker".into(),
             heartbeat_issue: 1,
-            bot_login: "jmarrero-bot".into(),
+            bot_login: "example-bot".into(),
             bot_id: Some(7),
-            forge_org: "jmarrero-forge".into(),
+            forge_org: "example-org".into(),
         }
     }
 
     #[test]
     fn boards_as_people_write_them() {
-        let org = Some((OwnerType::Orgs, "jmarrero-forge".to_string(), 1));
+        let org = Some((OwnerType::Orgs, "example-org".to_string(), 1));
         for (text, parsed) in [
-            ("orgs/jmarrero-forge/1", org.clone()),
-            ("orgs/jmarrero-forge/projects/1", org.clone()),
+            ("orgs/example-org/1", org.clone()),
+            ("orgs/example-org/projects/1", org.clone()),
             (
-                "https://github.com/orgs/jmarrero-forge/projects/1",
+                "https://github.com/orgs/example-org/projects/1",
                 org.clone(),
             ),
             (
-                "https://github.com/orgs/jmarrero-forge/projects/1/views/2",
+                "https://github.com/orgs/example-org/projects/1/views/2",
                 None,
             ),
             (
                 "users/someone/3",
                 Some((OwnerType::Users, "someone".to_string(), 3)),
             ),
-            ("teams/jmarrero-forge/1", None),
-            ("orgs/jmarrero-forge/0", None),
-            ("orgs/jmarrero-forge/x", None),
+            ("teams/example-org/1", None),
+            ("orgs/example-org/0", None),
+            ("orgs/example-org/x", None),
             ("orgs/a b/1", None),
             ("orgs/../1", None),
-            ("jmarrero-forge/1", None),
+            ("example-org/1", None),
         ] {
             assert_eq!(parse_board(text).ok(), parsed, "{text}");
         }
@@ -697,7 +697,7 @@ pub mod tests {
         let base = Url::parse("https://github.com/").unwrap();
         assert_eq!(
             config().board_url(&base).unwrap().as_str(),
-            "https://github.com/orgs/jmarrero-forge/projects/1"
+            "https://github.com/orgs/example-org/projects/1"
         );
     }
 
@@ -730,10 +730,7 @@ pub mod tests {
 
     #[test]
     fn heartbeats_are_read_as_agent_runs() {
-        let mut first = worker(
-            "wtp-slice8",
-            "https://github.com/jmarrero-bot/work-tracker-poc/issues/9",
-        );
+        let mut first = worker("wtp-slice8", "https://github.com/example-org/app/issues/9");
         first["devspace"] = "wtp-8".into();
         // Newer keys and words are shown as they are, or left out.
         first["engine"] = "claude".into();
@@ -767,12 +764,7 @@ pub mod tests {
         assert_eq!(
             runs,
             [
-                (
-                    "wtp-slice8",
-                    "jmarrero-bot/work-tracker-poc#9",
-                    "working",
-                    Some("wtp-8")
-                ),
+                ("wtp-slice8", "example-org/app#9", "working", Some("wtp-8")),
                 ("review", "o/r#12", "working", None),
             ]
         );
@@ -782,12 +774,12 @@ pub mod tests {
         let empty = comment(&heartbeat(vec![]).to_string());
         let comments = [
             serde_json::json!({"user": {"login": "someone", "id": 9}, "body": empty}),
-            serde_json::json!({"user": {"login": "jmarrero-bot", "id": 666}, "body": empty}),
-            serde_json::json!({"user": {"login": "jmarrero-bot"}, "body": empty}),
-            serde_json::json!({"user": {"login": "jmarrero-bot", "id": 7}, "body": "Not a heartbeat"}),
+            serde_json::json!({"user": {"login": "example-bot", "id": 666}, "body": empty}),
+            serde_json::json!({"user": {"login": "example-bot"}, "body": empty}),
+            serde_json::json!({"user": {"login": "example-bot", "id": 7}, "body": "Not a heartbeat"}),
             serde_json::json!({"user": {"login": "renamed-bot", "id": 7}, "body": body,
-                               "html_url": "https://github.com/jmarrero-forge/tracker/issues/1#issuecomment-1"}),
-            serde_json::json!({"user": {"login": "jmarrero-bot", "id": 7}, "body": comment("{}")}),
+                               "html_url": "https://github.com/example-org/tracker/issues/1#issuecomment-1"}),
+            serde_json::json!({"user": {"login": "example-bot", "id": 7}, "body": comment("{}")}),
         ];
         let found = find_heartbeat(&comments, 7, &github(), now())
             .unwrap()
@@ -795,7 +787,7 @@ pub mod tests {
         assert_eq!(found.runs.len(), 2);
         assert_eq!(
             found.comment_url.as_deref(),
-            Some("https://github.com/jmarrero-forge/tracker/issues/1#issuecomment-1")
+            Some("https://github.com/example-org/tracker/issues/1#issuecomment-1")
         );
         assert_eq!(
             find_heartbeat(&comments[..4], 7, &github(), now()),
@@ -887,7 +879,7 @@ pub mod tests {
         // A comment by the bot that says it is one, but isn't well formed,
         // is an error, not a missing heartbeat.
         let comments = [
-            serde_json::json!({"user": {"login": "jmarrero-bot", "id": 7}, "body": with("schema", "x".into())}),
+            serde_json::json!({"user": {"login": "example-bot", "id": 7}, "body": with("schema", "x".into())}),
         ];
         assert!(find_heartbeat(&comments, 7, &github(), now()).is_err());
     }
@@ -978,7 +970,7 @@ pub mod tests {
         let url = Url::parse(&a.issue_url).unwrap();
         assert_eq!(
             (url.host_str(), url.path()),
-            (Some("github.com"), "/jmarrero-forge/tracker/issues/new")
+            (Some("github.com"), "/example-org/tracker/issues/new")
         );
         let q = query(&a.issue_url);
         assert_eq!(q["labels"], "needs-triage");
@@ -989,7 +981,7 @@ pub mod tests {
         let ghes = Url::parse("https://ghe.example.com/github/").unwrap();
         let url = ask(&config(), &ghes, None).unwrap().issue_url;
         assert!(
-            url.starts_with("https://ghe.example.com/github/jmarrero-forge/tracker/issues/new?"),
+            url.starts_with("https://ghe.example.com/github/example-org/tracker/issues/new?"),
             "{url}"
         );
     }
@@ -1020,7 +1012,7 @@ pub mod tests {
             a.comment_url.as_deref(),
             Some("https://github.com/o/r/issues/7")
         );
-        assert_eq!(a.comment.as_deref(), Some("@jmarrero-bot "));
+        assert_eq!(a.comment.as_deref(), Some("@example-bot "));
         // A long title is cut, by characters.
         let long = bot_item(&"ü".repeat(500), "https://github.com/o/r/issues/7");
         let q = query(&ask(&config(), &github(), Some(&long)).unwrap().issue_url);
