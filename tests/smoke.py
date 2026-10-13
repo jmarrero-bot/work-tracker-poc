@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the actual Rust service and CLI without contacting any live sources."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -153,7 +154,9 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         plugin_env = dict(os.environ, WORKBOARD_SMOKE_TOKEN='test-only-token')
         def connect(url, *extra):
             return subprocess.check_output(command + ['connect','errata','--url',url,'--label',url,'--token-env','WORKBOARD_SMOKE_TOKEN',*extra], env=plugin_env, text=True)
-        assert 'internal' in connect('https://errata.example.invalid/')
+        connected = connect('https://errata.example.invalid/')
+        # It says which plugin file it trusts, as sha256sum would.
+        assert 'internal' in connected and hashlib.sha256((plugins / 'errata').read_bytes()).hexdigest() in connected, connected
         assert 'external' in connect('https://forge.example/', '--external')
         # A plugin that echoes the credential as the account name isn't connected.
         echo = subprocess.run(command + ['connect','errata','--url','https://echo-account.example/','--token-env','WORKBOARD_SMOKE_TOKEN'], env=plugin_env, capture_output=True, text=True)
@@ -289,6 +292,27 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
             time.sleep(.05)
         else: raise RuntimeError('No scheduled sync after verify: ' + json.dumps(failing()))
         assert failing()['https://list-denied.example/']['schedule']['needs_user']
+        # A plugin runs only while it is the file its connection trusts:
+        # once it changes, the connection stops until the person trusts the
+        # new file, which they see by its hash first.
+        forge = next(c for c in json.loads(call('/api/snapshot', token=token)[2])['connections'] if c['base_url'] == 'https://forge.example/')
+        trusted = hashlib.sha256((plugins / 'errata').read_bytes()).hexdigest()
+        assert forge['plugin'] == {'sha256': trusted}, forge
+        with open(plugins / 'errata', 'a') as script: script.write('\n# Changed after it was trusted.\n')
+        changed = hashlib.sha256((plugins / 'errata').read_bytes()).hexdigest()
+        result = subprocess.run(command + ['sync', forge['id']], capture_output=True, text=True)
+        assert result.returncode != 0, result
+        [report] = json.loads(result.stdout)['results']
+        assert report['error_kind'] == 'auth' and changed in report['error'] and trusted in report['error'], report
+        assert f"workboard plugin trust {forge['id']}" in subprocess.check_output(command + ['connections'], text=True)
+        shown = subprocess.run(command + ['plugin', 'trust', forge['id']], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        assert shown.returncode != 0 and trusted in shown.stdout and changed in shown.stdout, shown
+        assert f'--sha256 {changed}' in shown.stderr, shown
+        stale = subprocess.run(command + ['plugin', 'trust', forge['id'], '--sha256', trusted], capture_output=True, text=True)
+        assert stale.returncode != 0 and 'changed again' in stale.stderr, stale
+        assert changed in subprocess.check_output(command + ['plugin', 'trust', forge['id'], '--sha256', changed], text=True)
+        subprocess.check_call(command + ['sync', forge['id']], stdout=subprocess.DEVNULL)
+        assert 'trusts the file there now' in subprocess.check_output(command + ['plugin', 'trust', forge['id']], text=True)
         states = {c['id']: c['sync'] for c in json.loads(call('/api/snapshot', token=token)[2])['connections']}
         if os.name == 'posix':
             assert (root.stat().st_mode & 0o777) == 0o700
@@ -314,7 +338,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         for c in snapshot['connections']:
             if c['id'] in last_success:
                 assert c['sync']['last_success'] == states[c['id']]['last_success'], (c, states)
-        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin, the external export, the Mine view, scheduled sync and freshness, permissions and restart persistence')
+        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin and its pinning, the external export, the Mine view, scheduled sync and freshness, permissions and restart persistence')
     finally:
         if process.poll() is None:
             process.terminate()

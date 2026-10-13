@@ -19,8 +19,8 @@ use crate::{
     db::Db,
     hub::{self, Pull},
     model::{
-        BotConfig, ConnectInput, Connection, ErrorKind, Item, Schedule, Snapshot, SyncState,
-        WatchList,
+        BotConfig, ConnectInput, Connection, ErrorKind, Item, PluginConfig, Schedule, Snapshot,
+        SyncState, WatchList,
     },
     zone::ExternalSnapshot,
 };
@@ -169,6 +169,9 @@ pub trait Sources: Send + Sync {
     /// The connector for `provider`, built with its connection's
     /// `settings`: for the bot, reading where they say.
     fn connector(&self, provider: &str, settings: Settings) -> Result<Box<dyn Connector>>;
+    /// The SHA-256 of the plugin that serves `provider`, as it would run
+    /// now.
+    fn plugin_sha256(&self, provider: &str) -> Result<String>;
     fn hub(&self) -> Result<Box<dyn Pull>>;
 }
 
@@ -183,6 +186,9 @@ impl Sources for Builtin {
     fn connector(&self, provider: &str, settings: Settings) -> Result<Box<dyn Connector>> {
         connectors::for_provider(provider, settings, &self.plugins, &self.shared)
     }
+    fn plugin_sha256(&self, provider: &str) -> Result<String> {
+        connectors::plugin_sha256(&self.plugins, provider)
+    }
     fn hub(&self) -> Result<Box<dyn Pull>> {
         Ok(Box::new(hub::HubClient::new()?))
     }
@@ -193,6 +199,27 @@ impl Sources for Builtin {
 pub struct Verified {
     pub account: Account,
     pub bot: Option<BotConfig>,
+    pub plugin: Option<PluginConfig>,
+}
+
+/// Which plugin file a plugin connection trusts, and what its plugin
+/// hashes to now, each a SHA-256 as `sha256sum` prints it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PluginTrust {
+    /// The connection's name.
+    pub label: String,
+    /// None for a connection made before plugins were pinned.
+    pub trusted: Option<String>,
+    pub current: String,
+}
+
+/// Fail unless `sha256` is a SHA-256 as `sha256sum` prints it.
+fn check_sha256(sha256: &str) -> Result<()> {
+    let hex = sha256.len() == 64 && sha256.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
+    if !hex {
+        bail!("Give the plugin's SHA-256 as `sha256sum` prints it: 64 lowercase hexadecimal digits")
+    }
+    Ok(())
 }
 
 /// What started a sync.
@@ -386,17 +413,73 @@ impl Scheduler {
     /// Check a new connection before it is stored: whose account the
     /// credential in `target` belongs to, with the connector `input` asks
     /// for, built with its bot settings `bot`, already checked. Its
-    /// settings come back as they are to be stored.
+    /// settings come back as they are to be stored. A plugin is trusted as
+    /// it is now: the file hashed here is the one that must run to verify
+    /// the credential, and the one its later runs must be.
     pub async fn verify_new(
         &self,
         input: &ConnectInput,
         bot: Option<BotConfig>,
         target: &Target,
     ) -> Result<Verified> {
-        let settings = Settings { bot: bot.as_ref() };
+        let plugin = if connectors::is_plugin(&input.provider) {
+            let sha256 = self.sources.plugin_sha256(&input.provider)?;
+            Some(PluginConfig {
+                sha256: Some(sha256),
+            })
+        } else {
+            None
+        };
+        let settings = Settings {
+            bot: bot.as_ref(),
+            plugin: plugin.as_ref(),
+        };
         let source = self.sources.connector(&input.provider, settings)?;
         let account = connector::verify(source.as_ref(), target).await?;
-        Ok(Verified { account, bot })
+        Ok(Verified {
+            account,
+            bot,
+            plugin,
+        })
+    }
+    /// Which plugin file connection `id` trusts, and what its plugin hashes
+    /// to now.
+    pub fn plugin_trust(&self, id: &str) -> Result<PluginTrust> {
+        let c = self.db().connection(id)?;
+        if !connectors::is_plugin(&c.provider) {
+            bail!(
+                "{} uses a built-in connector, not a plugin, so it trusts no plugin file",
+                c.label
+            )
+        }
+        Ok(PluginTrust {
+            label: c.label,
+            trusted: c.plugin.and_then(|p| p.sha256),
+            current: self.sources.plugin_sha256(&c.provider)?,
+        })
+    }
+    /// Trust the plugin file of connection `id` whose SHA-256 is `sha256`,
+    /// as the person checked it, from now on, and verify the connection
+    /// with it, which brings back its scheduled syncs. Refused if the file
+    /// changed again since.
+    pub async fn trust_plugin(&self, id: &str, sha256: &str) -> Result<Connection> {
+        check_sha256(sha256)?;
+        {
+            // Not while it syncs with the plugin trusted before.
+            let _held = self.hold(id).await;
+            let trust = self.plugin_trust(id)?;
+            if trust.current != sha256 {
+                bail!(
+                    "The plugin changed again: its SHA-256 is now {}, not {sha256}. Check it, then trust it again",
+                    trust.current
+                )
+            }
+            let db = self.db();
+            let mut c = db.connection(id)?;
+            c.plugin.get_or_insert_with(PluginConfig::default).sha256 = Some(trust.current);
+            db.save_connection(&c)?;
+        }
+        self.verify(id, None).await
     }
     /// Look at the schedule again, as after a connection was added or
     /// changed.
@@ -1095,6 +1178,9 @@ mod tests {
     impl Sources for FakeSources {
         fn connector(&self, _: &str, _: Settings) -> Result<Box<dyn Connector>> {
             Ok(Box::new(Fake(self.0.clone())))
+        }
+        fn plugin_sha256(&self, _: &str) -> Result<String> {
+            bail!("The fake sources have no plugins")
         }
         fn hub(&self) -> Result<Box<dyn Pull>> {
             Ok(Box::new(Fake(self.0.clone())))

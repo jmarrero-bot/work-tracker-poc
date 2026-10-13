@@ -2,6 +2,7 @@ pub use crate::{
     bot::{BotConfig, BotFields, BotInput},
     clock::Timestamp,
     connector::{ConnectorError, ErrorKind, Reason},
+    connectors::PluginConfig,
     outcome::{Outcome, Progress},
     zone::Zone,
 };
@@ -32,6 +33,11 @@ pub struct Connection {
     /// are.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot: Option<BotConfig>,
+    /// For a source served by a connector plugin: which plugin file it
+    /// trusts. A plugin connection made before plugins were pinned has
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginConfig>,
     /// What its syncs did. Kept in a table of its own, saved with what a
     /// sync found, and never stored with the connection.
     #[serde(default)]
