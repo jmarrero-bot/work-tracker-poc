@@ -293,7 +293,10 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         if os.name == 'posix':
             assert (root.stat().st_mode & 0o777) == 0o700
             assert ((root / 'service.token').stat().st_mode & 0o777) == 0o600
-            assert ((root / 'work.sqlite').stat().st_mode & 0o777) == 0o600
+            # SQLite's write-ahead log and shared memory too, which hold
+            # recent rows while the service runs.
+            for name in ['work.sqlite', 'work.sqlite-wal', 'work.sqlite-shm']:
+                assert ((root / name).stat().st_mode & 0o777) == 0o600, name
         process.terminate(); process.wait(timeout=5)
         # Restart preserves grouping and rotates the application credential.
         process = subprocess.Popen(command + ['serve'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
