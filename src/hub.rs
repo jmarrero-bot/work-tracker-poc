@@ -18,7 +18,7 @@ use crate::{
         valid_provider, Connection, Effort, EffortView, Item, Progress, Schedule, Snapshot,
         SyncState,
     },
-    zone::{ExternalConnection, ExternalSnapshot, Zone},
+    zone::{numeric_account_id, ExternalConnection, ExternalSnapshot, Zone},
 };
 use anyhow::{bail, Context, Result};
 use reqwest::{
@@ -386,6 +386,9 @@ pub fn checked(mut s: ExternalSnapshot) -> ConnectorResult<ExternalSnapshot> {
         if !valid_provider(&c.provider)
             || connectors::base_url(&c.base_url).ok().as_deref() != Some(c.base_url.as_str())
             || !text_ok(&[&c.label, &c.account_name])
+            || c.account_id
+                .as_deref()
+                .is_some_and(|id| numeric_account_id(id).is_none())
         {
             return fail("has a connection that isn't valid");
         }
@@ -483,14 +486,20 @@ pub fn is_from_hub(id: &str) -> bool {
 }
 
 /// Whether the companion's own connection `mine` is to the same account on
-/// the same instance as the hub's `theirs`. The export carries the
-/// account's name, not its ID, so the name decides, as the instance shows
-/// it, without regard to case.
+/// the same instance as the hub's `theirs`. The account's numeric ID
+/// decides when both know it, since an account keeps its ID when renamed,
+/// and a name freed by a rename can be taken by another account.
+/// Otherwise, for a hub that doesn't export IDs or an account whose ID
+/// isn't numeric, the name does, as the instance shows it, without regard
+/// to case.
 fn same_account(mine: &Connection, theirs: &ExternalConnection) -> bool {
-    !mine.from_hub
-        && mine.provider == theirs.provider
-        && mine.base_url == theirs.base_url
-        && mine.account_name.eq_ignore_ascii_case(&theirs.account_name)
+    if mine.from_hub || mine.provider != theirs.provider || mine.base_url != theirs.base_url {
+        return false;
+    }
+    match (numeric_account_id(&mine.account_id), &theirs.account_id) {
+        (Some(mine), Some(theirs)) => mine == *theirs,
+        _ => mine.account_name.eq_ignore_ascii_case(&theirs.account_name),
+    }
 }
 
 /// Add the hub's work in `export`, as of the pulls in `status`, to the
@@ -532,7 +541,7 @@ pub fn merge(snapshot: &mut Snapshot, export: &ExternalSnapshot, status: &Status
             provider: c.provider.clone(),
             label: c.label.clone(),
             base_url: c.base_url.clone(),
-            account_id: String::new(),
+            account_id: c.account_id.clone().unwrap_or_default(),
             account_name: c.account_name.clone(),
             zone: Zone::External,
             watch_user: None,
@@ -636,6 +645,7 @@ pub mod tests {
             label: "GitHub".into(),
             base_url: "https://github.com/".into(),
             account_name: "someone".into(),
+            account_id: Some("7".into()),
             last_success: Some(Timestamp::from_unix(1_791_763_200)),
             stale: false,
             error_kind: None,
@@ -692,7 +702,8 @@ pub mod tests {
         }
     }
 
-    /// The companion's own connection to `account` on GitHub.
+    /// The companion's own connection to `account` on GitHub, whose ID it
+    /// doesn't know.
     fn own(account: &str) -> Connection {
         Connection {
             id: "c0ffee00-0000-4000-8000-000000000001".into(),
@@ -715,8 +726,14 @@ pub mod tests {
             panic!("{board:?}")
         };
         assert_eq!(
-            (c.id.as_str(), c.from_hub, c.zone, c.schedule.stale),
-            ("hub:hub-connection", true, Zone::External, false)
+            (
+                c.id.as_str(),
+                c.from_hub,
+                c.zone,
+                c.schedule.stale,
+                c.account_id.as_str()
+            ),
+            ("hub:hub-connection", true, Zone::External, false, "7")
         );
         let items: Vec<_> = board
             .items
@@ -818,6 +835,42 @@ pub mod tests {
         };
         merge(&mut board, &export(2), &status(false));
         assert_eq!(board.items.len(), 2);
+    }
+
+    #[test]
+    fn the_account_id_decides_when_both_sides_know_it() {
+        // (the companion's own account ID and name, the hub's ID, whether
+        // the hub's copy shows)
+        for (mine, name, theirs, shown) in [
+            ("7", "someone", Some("7"), false),
+            // Renamed since: the same account.
+            ("7", "renamed", Some("7"), false),
+            // Another account, which took the name a rename freed.
+            ("8", "someone", Some("7"), true),
+            // A hub that doesn't export IDs: the name decides.
+            ("8", "someone", None, false),
+            ("8", "someone-else", None, true),
+            // An ID that isn't numeric: the name decides.
+            ("JIRAUSER7", "someone", Some("7"), false),
+            ("JIRAUSER7", "someone-else", Some("7"), true),
+        ] {
+            let mut export = export(1);
+            export.connections[0].account_id = theirs.map(str::to_string);
+            let mut board = Snapshot {
+                connections: vec![Connection {
+                    account_id: mine.into(),
+                    ..own(name)
+                }],
+                items: vec![],
+                efforts: vec![],
+            };
+            merge(&mut board, &export, &status(false));
+            assert_eq!(
+                board.items.len(),
+                usize::from(shown),
+                "{mine} {name} {theirs:?}"
+            );
+        }
     }
 
     #[test]
@@ -1179,7 +1232,7 @@ pub mod tests {
     #[test]
     fn exports_are_checked_whole() {
         type Break = fn(&mut ExternalSnapshot);
-        let cases: [(&str, Break); 17] = [
+        let cases: [(&str, Break); 19] = [
             ("snapshot zone", |s| s.zone = Zone::Internal),
             ("connection zone", |s| {
                 s.connections[0].zone = Zone::Internal
@@ -1223,6 +1276,12 @@ pub mod tests {
             }),
             ("overlong title", |s| {
                 s.items[0].title = "x".repeat(MAX_FIELD + 1)
+            }),
+            ("account ID that isn't a number", |s| {
+                s.connections[0].account_id = Some("someone@example.com".into())
+            }),
+            ("overlong account ID", |s| {
+                s.connections[0].account_id = Some("1".repeat(21))
             }),
         ];
         assert!(checked(export(2)).is_ok());

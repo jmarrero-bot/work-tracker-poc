@@ -115,7 +115,7 @@ The board, the Mine view and the CLI show the hub's connections, items and effor
 
 The hub's work is as fresh as the hub's connection that synced it was at the last pull. It is stale as soon as a pull fails, not only after three intervals as a connection's work: while the hub can't be reached, its work is never shown as current. The companion's own work isn't affected.
 
-If the companion connects an account the hub also connects, the hub's copy of that connection and its items is left out, and so is a hub effort left with none of its work, so nothing shows twice or empty: the companion's own copy is shown, being synced right on the laptop. The same account is the same provider, the same instance, and the same account name, without regard to case, since the export carries the account's name and not its ID.
+If the companion connects an account the hub also connects, the hub's copy of that connection and its items is left out, and so is a hub effort left with none of its work, so nothing shows twice or empty: the companion's own copy is shown, being synced right on the laptop. The same account is the same provider, the same instance, and the same numeric account ID, which the export carries for GitHub, GitLab, Fedora Forge and the bot, and which survives a rename. Where either side doesn't know it, such as from an older hub, or for an account whose ID isn't a number, the account name decides instead, without regard to case.
 
 ## Trust model
 
