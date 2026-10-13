@@ -51,7 +51,7 @@ Upgrade the companions before the hub. A companion checks the hub's export whole
 
 ## Run the hub from its image
 
-CI publishes the hub's image, `ghcr.io/jmarrero-bot/work-tracker-poc`, for each `v*` tag ([release.md](release.md)). Run it from a quadlet, or any container runner, that pins the image by digest and holds only the wiring: the volume, the secrets and the port. The hub's code and its image stay here, and moving the pin is a change you review in your own deployment.
+CI publishes the hub's image, `ghcr.io/jmarrero-bot/work-tracker-poc`, for each `v*` tag ([release.md](release.md)); a build of your own publishes its own ([run-your-own.md](run-your-own.md)). Run it from a quadlet, or any container runner, that pins the image by digest and holds only the wiring: the volume, the secrets and the port. The hub's code and its image stay here, and moving the pin is a change you review in your own deployment.
 
 The image runs `workboard serve --hub` as an unprivileged user, from a distroless base with no shell. Its data directory is the volume at `/var/lib/workboard`, which the CLI finds without `--data-dir` (the image sets `XDG_DATA_HOME`). Its health check is an authenticated `workboard connections`, which reads the service's token from that directory.
 

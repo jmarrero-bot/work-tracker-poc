@@ -56,6 +56,8 @@ flatpak-builder --user --install --force-clean build-dir gnome/io.github.jmarrer
 flatpak run io.github.jmarrero_bot.Workboard
 ```
 
+That is this repository's app ID. A build of your own takes its own, from `make -C gnome APP_ID=...` or a copy of the manifest with another `id` ([run-your-own.md](run-your-own.md#build-the-gnome-app-with-your-own-app-id)).
+
 The build fetches the crates in `Cargo.lock` itself (`--share=network` while building); a Flathub build would vendor them instead. The sandbox gets two permissions beyond a display:
 
 - **The network.** The app only talks to `127.0.0.1`, but Flatpak can't limit it to loopback: without network access the sandbox has a loopback of its own, where the service isn't. So it shares the host's whole network. A Unix socket in the runtime directory would drop this too ([#36](https://github.com/jmarrero-bot/work-tracker-poc/issues/36)).

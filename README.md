@@ -2,7 +2,7 @@
 
 A local work inbox with a Rust API/CLI, React + TypeScript dashboard, and SQLite storage. It connects related tickets, merge requests, and release advisories into an **effort** while keeping every source's status and URL.
 
-This is an initial single-user prototype for Linux and macOS, not a hosted team service. No connection to your real accounts has been made.
+This is an initial single-user prototype for Linux and macOS, not a hosted team service. No connection to your real accounts has been made. Nothing in it is tied to one person: to run your own hub and companion, see [docs/run-your-own.md](docs/run-your-own.md).
 
 ## Status and roadmap
 
