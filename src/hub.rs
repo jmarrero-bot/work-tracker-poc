@@ -1090,7 +1090,7 @@ pub mod tests {
             "interval": 5,
         });
         let answers = Arc::new(Mutex::new(vec![
-            axum::Json(serde_json::json!({"status": "done", "token": "test-only-credential", "login": "jm\u{1b}arrero"})).into_response(),
+            axum::Json(serde_json::json!({"status": "done", "token": "test-only-credential", "login": "octo\u{1b}cat"})).into_response(),
             axum::Json(serde_json::json!({"status": "pending", "interval": 10})).into_response(),
             axum::Json(start.clone()).into_response(),
         ]));
@@ -1106,7 +1106,7 @@ pub mod tests {
             done,
             DevicePoll::Done {
                 token: "test-only-credential".into(),
-                login: "jmarrero".into()
+                login: "octocat".into()
             }
         );
         let seen = seen.lock().unwrap().clone();

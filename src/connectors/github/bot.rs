@@ -1,5 +1,6 @@
-//! The bot connector: what a harness bot such as jmarrero-bot works on,
-//! read through GitHub's read-only client like everything else on GitHub.
+//! The bot connector: what a harness bot works on, as its operator
+//! configured it, read through GitHub's read-only client like everything
+//! else on GitHub.
 //!
 //! - The items on its Projects (v2) board, which only GraphQL serves, so
 //!   they are read with queries, which the client checks: their title,
@@ -767,7 +768,7 @@ mod tests {
         format!("http://{host}/")
     }
     fn board_url(base: &str) -> String {
-        format!("{base}orgs/jmarrero-forge/projects/1")
+        format!("{base}orgs/example-org/projects/1")
     }
     /// An issue on the board.
     fn issue(base: &str, n: u64, state: &str, reason: Option<&str>) -> Value {
@@ -821,7 +822,7 @@ mod tests {
                     "b",
                     issue(base, 2, "OPEN", None),
                     Some("Draft"),
-                    Some("BASE/jmarrero-forge/r/pull/11"),
+                    Some("BASE/example-org/r/pull/11"),
                 ),
                 node(base, "c", pr(3, "o/r", "MERGED", true), Some("Done"), None),
                 node(
@@ -873,7 +874,7 @@ mod tests {
                 node(
                     base,
                     "l",
-                    pr(12, "jmarrero-forge/homegit", "OPEN", false),
+                    pr(12, "example-org/homegit", "OPEN", false),
                     Some("Draft"),
                     None,
                 ),
@@ -929,7 +930,7 @@ mod tests {
         assert!(query.contains("organization(login: $owner)"), "{query}");
         assert_eq!(
             (&variables["owner"], &variables["number"]),
-            (&json!("jmarrero-forge"), &json!(1))
+            (&json!("example-org"), &json!(1))
         );
         let [first, second] = board(&base);
         let (nodes, next) = match variables["after"].as_str() {
@@ -951,23 +952,23 @@ mod tests {
             "repository_url": format!("{base}api/v3/repos/{repo}"),
             "state": "open", "draft": draft, "updated_at": "2026-10-12T00:00:00Z",
             "pull_request": {"merged_at": null},
-            "user": {"login": "jmarrero-bot", "id": 7},
+            "user": {"login": "example-bot", "id": 7},
         })
     }
     async fn search(headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
         let base = base(&headers);
         assert_eq!(
             q["q"],
-            "is:pr author:jmarrero-bot org:jmarrero-forge is:open archived:false"
+            "is:pr author:example-bot org:example-org is:open archived:false"
         );
         // By another account that took the bot's login: not the bot's.
-        let mut squatter = found_pr(&base, "jmarrero-forge/r", 19, false);
+        let mut squatter = found_pr(&base, "example-org/r", 19, false);
         squatter["user"]["id"] = 666.into();
         let items = [
-            found_pr(&base, "jmarrero-forge/r", 11, true),
+            found_pr(&base, "example-org/r", 11, true),
             // On the board itself, as item l.
-            found_pr(&base, "jmarrero-forge/homegit", 12, false),
-            found_pr(&base, "jmarrero-forge/r", 14, false),
+            found_pr(&base, "example-org/homegit", 12, false),
+            found_pr(&base, "example-org/r", 14, false),
             squatter,
         ];
         Json(json!({"total_count": 4, "incomplete_results": false, "items": items})).into_response()
@@ -981,11 +982,11 @@ mod tests {
         Router::new()
             .route(
                 "/api/v3/user",
-                get(|| async { Json(json!({"id": 7, "login": "jmarrero-bot"})) }),
+                get(|| async { Json(json!({"id": 7, "login": "example-bot"})) }),
             )
             .route(
-                "/api/v3/users/jmarrero-bot",
-                get(|| async { Json(json!({"id": 7, "login": "jmarrero-bot", "type": "User"})) }),
+                "/api/v3/users/example-bot",
+                get(|| async { Json(json!({"id": 7, "login": "example-bot", "type": "User"})) }),
             )
             .route("/api/graphql", post(graphql))
             .route("/api/v3/search/issues", get(search))
@@ -993,33 +994,33 @@ mod tests {
             .route("/api/v3/repos/o/r/pulls/6", pull(false))
             // Closed since, without merging.
             .route(
-                "/api/v3/repos/jmarrero-forge/r/issues/15",
+                "/api/v3/repos/example-org/r/issues/15",
                 get(|headers: HeaderMap| async move {
-                    let mut pr = found_pr(&base(&headers), "jmarrero-forge/r", 15, false);
+                    let mut pr = found_pr(&base(&headers), "example-org/r", 15, false);
                     pr["state"] = "closed".into();
                     Json(pr)
                 }),
             )
             .route(
-                "/api/v3/repos/jmarrero-forge/r/issues/16",
+                "/api/v3/repos/example-org/r/issues/16",
                 get(|headers: HeaderMap| async move {
-                    let mut pr = found_pr(&base(&headers), "jmarrero-forge/r", 16, false);
+                    let mut pr = found_pr(&base(&headers), "example-org/r", 16, false);
                     pr["state"] = "closed".into();
                     Json(pr)
                 }),
             )
             .route(
-                "/api/v3/repos/jmarrero-forge/r/issues/18",
+                "/api/v3/repos/example-org/r/issues/18",
                 get(|headers: HeaderMap| async move {
-                    let mut pr = found_pr(&base(&headers), "jmarrero-forge/r", 18, false);
+                    let mut pr = found_pr(&base(&headers), "example-org/r", 18, false);
                     pr["state"] = "locked".into();
                     Json(pr)
                 }),
             )
             .route(
-                "/api/v3/repos/jmarrero-forge/r/issues/17",
+                "/api/v3/repos/example-org/r/issues/17",
                 get(|headers: HeaderMap| async move {
-                    Json(found_pr(&base(&headers), "jmarrero-forge/r", 17, false))
+                    Json(found_pr(&base(&headers), "example-org/r", 17, false))
                 }),
             )
     }
@@ -1027,7 +1028,7 @@ mod tests {
         Connection {
             provider: "bot".into(),
             account_id: "7".into(),
-            account_name: "jmarrero-bot".into(),
+            account_name: "example-bot".into(),
             bot: Some(config()),
             ..test_connection()
         }
@@ -1059,11 +1060,11 @@ mod tests {
             ("o/r#6", "Done", ClosedWithoutDelivery, "", false),
             ("o/r#7", "Done", Unknown, "", false),
             ("o/r#10", "In Progress", Open, "waiting", false),
-            ("jmarrero-forge/homegit#12", "Draft", Open, "review", true),
+            ("example-org/homegit#12", "Draft", Open, "review", true),
             ("o/r#13", "No status", Open, "waiting", false),
             // The fork pull requests.
-            ("jmarrero-forge/r#11", "draft", Open, "review", false),
-            ("jmarrero-forge/r#14", "open", Open, "review", false),
+            ("example-org/r#11", "draft", Open, "review", false),
+            ("example-org/r#14", "open", Open, "review", false),
         ] {
             let i = by_key(key);
             assert_eq!(
@@ -1089,7 +1090,7 @@ mod tests {
             (b.kind, b.priority.as_deref(), b.why.as_deref(), b.news),
             (BotKind::BoardItem, Some("P1"), Some("Why b"), None)
         );
-        let fork = by_key("jmarrero-forge/r#11").bot.clone().unwrap();
+        let fork = by_key("example-org/r#11").bot.clone().unwrap();
         assert_eq!(fork.kind, BotKind::ForkPr);
         assert_eq!(
             fork.board_item.as_deref(),
@@ -1097,9 +1098,9 @@ mod tests {
         );
         assert_eq!(
             b.branch.as_deref(),
-            Some(by_key("jmarrero-forge/r#11").url.as_str())
+            Some(by_key("example-org/r#11").url.as_str())
         );
-        assert!(by_key("jmarrero-forge/r#14")
+        assert!(by_key("example-org/r#14")
             .bot
             .as_ref()
             .unwrap()
@@ -1132,7 +1133,7 @@ mod tests {
         let mine = crate::mine::mine(&snapshot, &[]);
         let mut keys: Vec<_> = mine.mine.iter().map(|r| r.key.as_str()).collect();
         keys.sort();
-        assert_eq!(keys, ["jmarrero-forge/homegit#12", "o/r#1", "o/r#2"]);
+        assert_eq!(keys, ["example-org/homegit#12", "o/r#1", "o/r#2"]);
         assert!(mine
             .mine
             .iter()
@@ -1147,8 +1148,7 @@ mod tests {
         assert_eq!(view.asks.len(), items.len());
         let ask = &view.asks[&by_key("o/r#1").id];
         assert!(
-            ask.issue_url
-                .contains("/jmarrero-forge/tracker/issues/new?"),
+            ask.issue_url.contains("/example-org/tracker/issues/new?"),
             "{ask:?}"
         );
         assert_eq!(
@@ -1182,25 +1182,25 @@ mod tests {
                     tracked("PVTI_z", "o/r#20"),
                     tracked("PVTI_y", "o/r#21"),
                     tracked("PVTI_x", "o/r#22"),
-                    tracked("5015", "jmarrero-forge/r#15"),
+                    tracked("5015", "example-org/r#15"),
                     linked(
                         "5016",
-                        "jmarrero-forge/r#16",
+                        "example-org/r#16",
                         "https://github.com/o/r/issues/2",
                     ),
                     linked(
                         "5017",
-                        "jmarrero-forge/r#17",
+                        "example-org/r#17",
                         "https://github.com/o/r/issues/3",
                     ),
                     linked(
                         "5018",
-                        "jmarrero-forge/r#18",
+                        "example-org/r#18",
                         "https://github.com/o/r/issues/4",
                     ),
                     linked(
                         "5019",
-                        "jmarrero-forge/r#19",
+                        "example-org/r#19",
                         "https://github.com/o/r/issues/5",
                     ),
                 ],
@@ -1268,7 +1268,7 @@ mod tests {
         // say is closed or merged (18), and gone (19).
         let stored = |n: u64| {
             let mut remote = github_item(
-                &found_pr("https://github.com/", "jmarrero-forge/r", n, false),
+                &found_pr("https://github.com/", "example-org/r", n, false),
                 "review",
             )
             .unwrap();
@@ -1381,7 +1381,7 @@ mod tests {
             let router = Router::new()
                 .route(
                     "/api/v3/user",
-                    get(|| async { Json(json!({"id": 7, "login": "jmarrero-bot"})) }),
+                    get(|| async { Json(json!({"id": 7, "login": "example-bot"})) }),
                 )
                 .route(
                     "/api/graphql",
@@ -1398,7 +1398,7 @@ mod tests {
             task.abort();
             assert_eq!(error.kind, ErrorKind::Auth, "{error}");
             assert!(
-                error.message.contains("orgs/jmarrero-forge/projects/1"),
+                error.message.contains("orgs/example-org/projects/1"),
                 "{error}"
             );
         }
@@ -1432,7 +1432,7 @@ mod tests {
                 "schema": "bot-heartbeat/v1", "updated_at": "2026-10-12T03:58:44Z",
                 "coordinator": {"session": "s1", "loop_state": "working"},
                 "workers": [
-                    {"name": "wtp-slice8", "item_url": format!("{base}jmarrero-bot/work-tracker-poc/issues/9"),
+                    {"name": "wtp-slice8", "item_url": format!("{base}example-org/app/issues/9"),
                      "started_at": "2026-10-12T03:28:44Z", "status": "working"},
                     // Not on this instance.
                     {"name": "elsewhere", "item_url": "https://github.com/o/r/issues/1",
@@ -1445,12 +1445,12 @@ mod tests {
             );
             Json(json!([
                 {"user": {"login": "someone", "id": 9}, "body": "Hi"},
-                {"user": {"login": "jmarrero-bot", "id": 7}, "body": body,
-                 "html_url": format!("{base}jmarrero-forge/tracker/issues/1#issuecomment-1")},
+                {"user": {"login": "example-bot", "id": 7}, "body": body,
+                 "html_url": format!("{base}example-org/tracker/issues/1#issuecomment-1")},
             ]))
         };
         let with_comments = router().route(
-            "/api/v3/repos/jmarrero-forge/tracker/issues/1/comments",
+            "/api/v3/repos/example-org/tracker/issues/1/comments",
             get(comments),
         );
         let (target, task) = crate::connectors::fixture(with_comments, "test-only-token").await;
@@ -1470,7 +1470,7 @@ mod tests {
         };
         assert_eq!(
             (run.name.as_str(), run.item_key.as_str()),
-            ("wtp-slice8", "jmarrero-bot/work-tracker-poc#9")
+            ("wtp-slice8", "example-org/app#9")
         );
         assert_eq!((runs.last_success, runs.error.as_deref()), (Some(at), None));
         task.abort();
@@ -1486,7 +1486,7 @@ mod tests {
         assert_eq!(kept.last_success, Some(at));
         let error = kept.error.unwrap();
         assert!(
-            error.contains("heartbeat issue jmarrero-forge/tracker#1"),
+            error.contains("heartbeat issue example-org/tracker#1"),
             "{error}"
         );
         // Only GETs of the comments went out.
@@ -1505,7 +1505,7 @@ mod tests {
             Json(json!(comments))
         };
         let router = Router::new().route(
-            "/api/v3/repos/jmarrero-forge/tracker/issues/1/comments",
+            "/api/v3/repos/example-org/tracker/issues/1/comments",
             get(full),
         );
         let (target, task) = crate::connectors::fixture(router, "test-only-token").await;

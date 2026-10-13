@@ -232,7 +232,7 @@ mod tests {
             url: format!("https://github.com/org/repo/pull/{id}"),
             status: "Open".into(),
             waits_on: vec![WaitsOn {
-                account: "jmarrero".into(),
+                account: "octocat".into(),
                 reasons: vec![Reason::ReviewRequested, Reason::Assigned],
                 ..WaitsOn::default()
             }],

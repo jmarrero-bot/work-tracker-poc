@@ -322,8 +322,8 @@ mod tests {
     fn github_logins() {
         let (longest, too_long) = ("a".repeat(39), "a".repeat(40));
         for (login, valid) in [
-            ("jmarrero", true),
-            ("jmarrero-bot", true),
+            ("octocat", true),
+            ("example-bot", true),
             ("a", true),
             (longest.as_str(), true),
             (too_long.as_str(), false),

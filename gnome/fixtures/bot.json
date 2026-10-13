@@ -2,8 +2,8 @@
   {
     "connection_id": "b1",
     "label": "Bot",
-    "bot_login": "jmarrero-bot",
-    "board_url": "https://github.com/orgs/jmarrero-forge/projects/1",
+    "bot_login": "example-bot",
+    "board_url": "https://github.com/orgs/example-org/projects/1",
     "agents": {
       "connection_id": "b1",
       "heartbeat": {
@@ -12,11 +12,11 @@
         "loop_state": "sleeping",
         "next_wake_at": "2026-10-12T12:05:00Z",
         "runs": [
-          {"name": "wtp-gnome", "item_url": "https://github.com/jmarrero-bot/work-tracker-poc/issues/10", "item_key": "jmarrero-bot/work-tracker-poc#10", "status": "working", "started_at": "2026-10-12T09:00:00Z", "devspace": null},
-          {"name": "wtp-login", "item_url": "https://github.com/jmarrero-bot/work-tracker-poc/issues/12", "item_key": "jmarrero-bot/work-tracker-poc#12", "status": "testing", "started_at": "2026-10-12T09:10:00Z", "devspace": "devspace-3"}
+          {"name": "wtp-gnome", "item_url": "https://github.com/example-org/app/issues/10", "item_key": "example-org/app#10", "status": "working", "started_at": "2026-10-12T09:00:00Z", "devspace": null},
+          {"name": "wtp-login", "item_url": "https://github.com/example-org/app/issues/12", "item_key": "example-org/app#12", "status": "testing", "started_at": "2026-10-12T09:10:00Z", "devspace": "devspace-3"}
         ],
         "skipped": 0,
-        "comment_url": "https://github.com/jmarrero-forge/tracker/issues/1#issuecomment-1",
+        "comment_url": "https://github.com/example-org/tracker/issues/1#issuecomment-1",
         "stale": false
       },
       "error": null,
@@ -24,7 +24,7 @@
       "stale": false,
       "board": {"statuses": {"Draft": 2, "In Progress": 3, "Todo": 5}, "fork_prs": 4, "unreadable": 0}
     },
-    "ask": {"issue_url": "https://github.com/jmarrero-forge/tracker/issues/new?labels=ask&body=x", "comment_url": null, "comment": null},
+    "ask": {"issue_url": "https://github.com/example-org/tracker/issues/new?labels=ask&body=x", "comment_url": null, "comment": null},
     "asks": {}
   }
 ]
