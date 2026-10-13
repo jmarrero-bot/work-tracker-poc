@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -52,8 +53,6 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
             time.sleep(.05)
         else: raise RuntimeError('Service did not start')
         token = (root / 'service.token').read_text().strip()
-        # A copy in the session's runtime directory, by port, for sandboxed
-        # clients, as private as the data directory's.
         # One service, or credentials migration, per data directory.
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
@@ -62,19 +61,73 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         assert second.returncode != 0 and 'Another Workboard service' in second.stderr, second
         migrating = subprocess.run(command + ['credentials', 'migrate', '--to', 'files'], capture_output=True, text=True)
         assert migrating.returncode != 0 and 'Another Workboard service' in migrating.stderr, migrating
-        published = runtime / 'workboard' / f'service-{port}.token'
-        assert published.read_text().strip() == token
-        assert published.stat().st_mode & 0o777 == 0o600 and published.parent.stat().st_mode & 0o777 == 0o700
+        # No copy of the token in the runtime directory: the GNOME app uses
+        # the socket.
+        assert not (runtime / 'workboard' / f'service-{port}.token').exists()
+        assert (runtime / 'workboard').stat().st_mode & 0o777 == 0o700
+        # The CLI's private socket, by port in the runtime directory, which
+        # the data directory names: this user's alone, and no token needed.
+        unix_socket = runtime / 'workboard' / f'service-{port}.sock'
+        named, instance = (root / 'socket-path').read_text().split()
+        assert named == str(unix_socket) and instance, named
+        assert stat.S_ISSOCK(unix_socket.stat().st_mode) and unix_socket.stat().st_mode & 0o777 == 0o600
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.connect(str(unix_socket))
+            sock.sendall(b'GET /api/snapshot HTTP/1.1\r\nHost: anything\r\nConnection: close\r\n\r\n')
+            answer = b''
+            while chunk := sock.recv(65536): answer += chunk
+        assert answer.startswith(b'HTTP/1.1 200'), answer[:200]
+        (root / 'service.token').rename(root / 'service.token.aside')
+        assert isinstance(json.loads(subprocess.check_output(command + ['inbox', '--json'])), list)
+        (root / 'service.token.aside').rename(root / 'service.token')
+        # Another service on that socket, as after this one was killed and
+        # another data directory's took its port, gets nothing.
+        (root / 'socket-path').write_text(f'{named}\nanother-service\n')
+        other = subprocess.run(command + ['inbox'], capture_output=True, text=True)
+        assert other.returncode != 0 and "isn't the one of this data directory" in other.stderr, other
+        (root / 'socket-path').write_text(f'{named}\n{instance}\n')
         assert call('/api/snapshot')[0] == 401
         assert call('/api/snapshot', token='invalid')[0] == 401
         assert call('/api/snapshot', token=token, host='attacker.example')[0] == 403
-        status, headers, body = call('/api/session', 'POST', token=token)
-        assert status == 200
+        # A browser pairs with a one-time code, which only the CLI gets,
+        # never with the token.
+        [url] = subprocess.check_output(command + ['pair'], text=True).split()
+        code = url.removeprefix(f'{base}/#pair=')
+        assert code != url and token not in url, url
+        def pair(code, origin=base):
+            return call('/auth/pair', 'POST', {'code': code}, origin=origin)
+        assert pair(code, origin='https://attacker.example')[0] == 403
+        status, headers, body = pair(code)
+        assert status == 200, body
         assert 'HttpOnly' in headers['Set-Cookie'] and 'SameSite=Strict' in headers['Set-Cookie']
         cookie = headers['Set-Cookie'].split(';')[0]
+        assert token not in cookie and code not in cookie
+        # Used once: used again, as by someone who read it too, it ends the
+        # session it opened, and says so.
+        status, _, body = pair(code)
+        assert status == 400 and b'already used' in body, body
+        assert call('/api/snapshot', cookie=cookie)[0] == 401
+        [again] = subprocess.check_output(command + ['pair'], text=True).split()
+        cookie = pair(again.removeprefix(f'{base}/#pair='))[1]['Set-Cookie'].split(';')[0]
+        assert call('/api/pairing', 'POST', {}, cookie=cookie, origin=base)[0] == 403, 'not for a browser'
+        assert call('/api/snapshot', cookie='workboard_session=' + token)[0] == 401, 'the token is no cookie'
         assert call('/api/snapshot', cookie=cookie)[0] == 200
         assert call('/api/efforts', 'POST', {'title':'CSRF'}, cookie=cookie, origin='https://attacker.example')[0] == 403
         assert call('/api/efforts', 'POST', {'title':'Missing origin'}, cookie=cookie)[0] == 403
+        # Rotating the application token ends it, every paired browser and
+        # every pairing URL not yet used, without a restart.
+        [unused] = subprocess.check_output(command + ['pair'], text=True).split()
+        rotated = subprocess.run(command + ['app-token', '--rotate'], capture_output=True, text=True)
+        assert rotated.returncode == 0 and 'pair again' in rotated.stdout, rotated
+        fresh = (root / 'service.token').read_text().strip()
+        assert fresh != token and fresh not in rotated.stdout
+        assert call('/api/snapshot', token=token)[0] == 401 and call('/api/snapshot', token=fresh)[0] == 200
+        assert call('/api/snapshot', cookie=cookie)[0] == 401
+        assert pair(unused.removeprefix(f'{base}/#pair='))[0] == 400
+        assert call('/api/app-token', 'POST', {}, token=token)[0] == 401
+        token = fresh
+        [again] = subprocess.check_output(command + ['pair'], text=True).split()
+        cookie = pair(again.removeprefix(f'{base}/#pair='))[1]['Set-Cookie'].split(';')[0]
         status, _, body = call('/api/snapshot', token=token)
         snapshot = json.loads(body)
         assert len(snapshot['items']) == 7 and len(snapshot['efforts']) == 1
@@ -338,6 +391,11 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
             for name in ['work.sqlite', 'work.sqlite-wal', 'work.sqlite-shm']:
                 assert ((root / name).stat().st_mode & 0o777) == 0o600, name
         process.terminate(); process.wait(timeout=5)
+        # A stop takes the socket with it, and the CLI says to start the
+        # service.
+        assert not unix_socket.exists() and not (root / 'socket-path').exists()
+        stopped = subprocess.run(command + ['inbox'], capture_output=True, text=True)
+        assert stopped.returncode != 0 and 'workboard serve' in stopped.stderr, stopped
         # Restart preserves grouping and rotates the application credential.
         process = subprocess.Popen(command + ['serve'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         for _ in range(100):
@@ -354,7 +412,72 @@ with tempfile.TemporaryDirectory(prefix='workboard-smoke-') as folder:
         for c in snapshot['connections']:
             if c['id'] in last_success:
                 assert c['sync']['last_success'] == states[c['id']]['last_success'], (c, states)
-        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin and its pinning, the external export, the Mine view, scheduled sync and freshness, permissions and restart persistence')
+        # A service killed outright, as by SIGKILL or the OOM killer, holds
+        # the data directory's lock no longer: a service starts, and once
+        # that one is killed too, so does a migration.
+        process.kill(); process.wait(timeout=5)
+        process = subprocess.Popen(command + ['serve'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(100):
+            if process.poll() is not None:
+                raise RuntimeError('No start after a killed service: ' + process.stderr.read().decode())
+            try:
+                if call('/')[0] == 200: break
+            except OSError: pass
+            time.sleep(.05)
+        else: raise RuntimeError('No start after a killed service')
+        # The CLI reaches it: the socket the killed one left was replaced.
+        assert subprocess.run(command + ['inbox'], capture_output=True).returncode == 0
+        process.kill(); process.wait(timeout=5)
+        migrated = subprocess.run(command + ['credentials', 'migrate', '--to', 'files'], capture_output=True, text=True, timeout=20)
+        assert migrated.returncode == 0, migrated
+        # A service on another data directory that takes over the socket
+        # of one that was killed, here while the CLI waits for a token on
+        # standard input, gets nothing: the CLI checks the service on its
+        # connection before it sends a request there.
+        process.terminate(); process.wait(timeout=5)
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            swap_port = sock.getsockname()[1]
+        swap_env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime))
+        swap_socket = runtime / 'workboard' / f'service-{swap_port}.sock'
+        def serve_on(data_dir):
+            served = subprocess.Popen([binary, '--data-dir', str(data_dir), '--port', str(swap_port), 'serve'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=swap_env)
+            for _ in range(200):
+                if served.poll() is not None:
+                    raise RuntimeError('Service exited: ' + served.stderr.read().decode())
+                if (data_dir / 'socket-path').exists() and swap_socket.exists(): return served
+                time.sleep(.05)
+            raise RuntimeError('Service did not start')
+        process = serve_on(root)
+        waiting = subprocess.Popen(command + ['connect', 'errata', '--url', 'https://swapped.example/', '--token-stdin'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(.5)
+        process.kill(); process.wait(timeout=5)
+        other_root = Path(folder) / 'other'
+        process = serve_on(other_root)
+        out, err = waiting.communicate('test-only-swapped-token', timeout=30)
+        assert waiting.returncode != 0 and "isn't the one of this data directory" in err, (out, err)
+        other = subprocess.run([binary, '--data-dir', str(other_root), 'connections'], capture_output=True, text=True)
+        assert other.returncode == 0 and 'swapped' not in other.stdout, other
+        for path in other_root.rglob('*'):
+            if path.is_file():
+                assert b'test-only-swapped-token' not in path.read_bytes(), path
+        process.terminate(); process.wait(timeout=5)
+        # Another user can't connect, even to a socket opened to everyone,
+        # where a second user can be had (`podman unshare`, with subuids).
+        if shutil.which('podman') and subprocess.run(['podman', 'unshare', 'true'], capture_output=True).returncode == 0:
+            process = serve_on(root)
+            opened = [Path(folder), runtime, swap_socket.parent]
+            for path in opened: path.chmod(0o755)
+            swap_socket.chmod(0o666)
+            probe = 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print("connected", flush=True); s.sendall(b"GET /api/ping HTTP/1.1\\r\\nHost: x\\r\\nConnection: close\\r\\n\\r\\n"); print(s.recv(100))'
+            stranger = subprocess.run(['podman', 'unshare', 'setpriv', '--reuid=1', '--regid=1', '--clear-groups', sys.executable, '-c', probe, str(swap_socket)], capture_output=True, text=True, timeout=20)
+            for path in opened: path.chmod(0o700)
+            assert 'connected' in stranger.stdout and 'HTTP' not in stranger.stdout, stranger
+            process.terminate(); process.wait(timeout=5)
+            print('Checked that another user is refused on the socket')
+        else:
+            print('Not checking another user on the socket: no `podman unshare` here')
+        print('PASS: authentication, CSRF, host checks, CLI, outcomes and effort progress, grouping, rollback, source links, manual outcomes, a connector plugin and its pinning, the external export, the Mine view, scheduled sync and freshness, permissions, restart persistence, the lock of a killed service, and a socket another service took over')
     finally:
         if process.poll() is None:
             process.terminate()

@@ -536,6 +536,95 @@ async function authStep(path: string): Promise<Record<string, string>> {
 // The header of the page's own refreshes, which a hub doesn't count as a
 // use of the session, so an open page left alone still goes idle.
 const BACKGROUND = { "X-Workboard-Background": "1" };
+// A companion's sign-in waiting on the hub for a signed-in user to approve.
+type DeviceRequest = {
+  id: string;
+  user_code: string;
+  started: string;
+  expires: string;
+  peer: string;
+  tailnet_user: string | null;
+  github_login: string | null;
+  approved: boolean;
+};
+// The companions' sign-ins waiting on this hub: each completes only once
+// someone signed in here approves it, after checking its code is the one
+// their own `workboard hub login` printed.
+function CompanionSignIns() {
+  const [requests, setRequests] = useState<DeviceRequest[]>([]);
+  // Sign-ins nobody has entered the code of yet, which nobody is shown.
+  const [unentered, setUnentered] = useState(0);
+  const [problem, setProblem] = useState("");
+  async function load() {
+    const response = await fetch("/auth/devices", {
+      credentials: "same-origin",
+      headers: BACKGROUND,
+    });
+    if (!response.ok) return;
+    const data = (await response.json()) as {
+      requests: DeviceRequest[];
+      waiting: number;
+    };
+    setRequests(data.requests);
+    setUnentered(data.waiting);
+  }
+  useEffect(() => {
+    load().catch(() => undefined);
+    // Often enough for someone waiting on their companion.
+    const timer = window.setInterval(
+      () => load().catch(() => undefined),
+      5000,
+    );
+    return () => window.clearInterval(timer);
+  }, []);
+  async function choose(id: string, choice: "approve" | "deny") {
+    setProblem("");
+    try {
+      const response = await fetch(`/auth/devices/${choice}`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error ?? `Request failed (${response.status})`);
+      }
+    } catch (e) {
+      setProblem((e as Error).message);
+    }
+    await load().catch(() => undefined);
+  }
+  const waiting = requests.filter((r) => !r.approved);
+  if (!waiting.length && !unentered && !problem) return null;
+  return (
+    <div className="message sign-ins" role="status">
+      <UserCheck size={17} />
+      <span>
+        <strong>Companion sign-ins waiting for approval.</strong> Approve only a
+        sign-in whose code your own <code>workboard hub login</code> printed.
+        {waiting.map((r) => (
+          <span className="sign-in" key={r.id}>
+            <code>{r.user_code}</code> from{" "}
+            {r.tailnet_user ? <strong>{r.tailnet_user}</strong> : "an unnamed peer"}{" "}
+            at {r.peer}, started{" "}
+            {new Date(r.started).toLocaleTimeString()}, code entered on GitHub
+            as <strong>{r.github_login}</strong>
+            <button onClick={() => choose(r.id, "approve")}>Approve</button>
+            <button onClick={() => choose(r.id, "deny")}>Deny</button>
+          </span>
+        ))}
+        {unentered > 0 && (
+          <span className="sign-in">
+            {unentered} more waiting for their code to be entered on GitHub;
+            each shows here once your account has entered it.
+          </span>
+        )}
+        {problem && <span className="sign-in">{problem}</span>}
+      </span>
+    </div>
+  );
+}
 async function api<T>(
   path: string,
   body?: unknown,
@@ -980,17 +1069,24 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const token = new URLSearchParams(location.hash.slice(1)).get("token");
-        if (token) {
-          history.replaceState(null, "", location.pathname);
-          const response = await fetch("/api/session", {
+        const fragment = new URLSearchParams(location.hash.slice(1));
+        const code = fragment.get("pair");
+        // Out of the address bar, and so of the history, at once.
+        if (location.hash) history.replaceState(null, "", location.pathname);
+        if (code) {
+          const response = await fetch("/auth/pair", {
             method: "POST",
-            headers: { Authorization: `Bearer ${token}` },
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code }),
           });
-          if (!response.ok)
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
             throw new Error(
-              "Pairing expired. Reopen the URL printed by the service.",
+              data.error ??
+                "This pairing URL was used or expired; run workboard pair for a new one.",
             );
+          }
         }
         setAuth(await authStatus().catch(() => null));
         await reload();
@@ -1272,8 +1368,11 @@ function App() {
       <div className="pair-screen">
         <div className="brand-symbol">w</div>
         <h1>Pair your browser</h1>
-        <p>Start your local service and open the private URL it prints.</p>
-        <code>workboard serve</code>
+        <p>
+          Open the one-time pairing URL the service printed when it started,
+          or get a new one, which works once, within 10 minutes:
+        </p>
+        <code>workboard pair --open</code>
         <p className="muted">{error}</p>
         <button onClick={() => location.reload()}>Try again</button>
       </div>
@@ -1491,6 +1590,7 @@ function App() {
               </span>
             </div>
           )}
+          {hub && auth?.github_app && auth.user && <CompanionSignIns />}
           {error && !modal && (
             <div className="message error" role="alert">
               <AlertCircle size={17} />

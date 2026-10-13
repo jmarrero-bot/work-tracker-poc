@@ -96,8 +96,8 @@ The scheduler's tests run it with a clock they move by hand and fake connectors,
 
 - **Mode:** `Db::open_as` records the data directory's mode the first time it is opened (`settings`, schema version 6), and refuses to open it as the other. A directory from before modes were recorded becomes a hub only while empty, with no work, watch list, hub or credential in it. A hub checks its database holds nothing but external work before it starts: external connections, their external items and watch lists, links to its own efforts, and no hub to pull from.
 - **Writes:** the SQL connection is private to `Db`, and each write method states what it writes as a `Write`, which `Db::admit` checks first. On a hub it passes only what is shown to be external: an external connection, what a sync of a stored external connection found if every item and watch list belongs to it and says external, and its agent runs are its own, efforts and links over its external items, and writes that add no work (sync state, decisions, disconnecting). Manual links, the demo and pulling from a hub are refused. The match lists every kind, so a new one has to be decided.
-- **Access:** `Access` in `src/server.rs` checks every API request: its Host must be the loopback address or one of the hub's `--allowed-host` names, and it needs a credential. That is the application token as a bearer (on loopback only once a hub has its GitHub App), a session of the hub's GitHub App sign-in (`src/login.rs`), the paired cookie on a local service or a hub started with `--pairing`, or, only for `GET /api/export/external`, a hub's companion token or a companion credential its device flow gave. A browser's change needs the origin of the name it came by, HTTPS under a hub's names. A pairing cookie set under those names is Secure; a sign-in's cookies always are, and `__Host-` names keep them to the hub's exact name.
-- **Sign-in:** the routes under `/auth` check themselves, since they come before any credential: a browser's steps only under the callback's name, its changes only from that name's page; a companion's only without a browser's `Origin`. All of them count against one rate limit.
+- **Access:** a request through the service's private Unix socket (`src/socket.rs`) is the CLI's or the GNOME app's: the socket is mode `0600` in a `0700` directory, its connections are checked to come from the service's own user, and they need nothing else. `Access` in `src/server.rs` checks every other API request: its Host must be the loopback address or one of the hub's `--allowed-host` names, and it needs a credential. That is the application token as a bearer, on loopback only, without a proxy's headers, a session of the hub's GitHub App sign-in (`src/login.rs`), the session cookie of a browser paired with a one-time code, on a local service or a hub started with `--pairing`, or, only for `GET /api/export/external`, a hub's companion token or a companion credential its device flow gave. A browser's change needs the origin of the name it came by, HTTPS under a hub's names. A pairing cookie set under those names is Secure; a sign-in's cookies always are, and `__Host-` names keep them to the hub's exact name.
+- **Sign-in:** the routes under `/auth` check themselves, since they come before any credential: a browser's steps only under the callback's name, its changes only from that name's page; a companion's only without a browser's `Origin`. All of them count against one rate limit. A companion's sign-in completes only once a browser signed in with the App approves it, from the hub's page.
 - **Pulls:** `src/hub.rs` is the companion's only way to its hub. Its one send passes a `GET` of the export at the hub's exact address without a body, and to sign in, `POST`s of the hub's device-flow start and poll without a body, and refuses everything else before it is sent, counting it; redirects are never followed, and clippy refuses the other ways to send. What comes back is checked whole (`hub::checked`) before anything is kept.
 - **Board:** `hub::merge` adds the hub's connections, items and efforts to what the companion shows, under IDs starting with `hub:`, marked `from_hub`, read-only, and leaves out a hub connection to an account the companion connects too, with its items. It is only for showing: the snapshot and Mine view use it, the export never does.
 
@@ -117,17 +117,22 @@ A GitHub connection can also watch another login's activity (`connect --watch-us
 
 ## API
 
-All `/api` routes require the local application's bearer credential, a browser session (signed in with a hub's GitHub App, or paired), or for `GET /api/export/external` only, a companion's credential. The `/auth` routes are a hub's sign-in. JSON responses never serialize provider credentials.
+All `/api` routes require the service's private socket, which only its own user can connect to, the local application's bearer credential, a browser session (signed in with a hub's GitHub App, or paired), or for `GET /api/export/external` only, a companion's credential. The `/auth` routes are a hub's sign-in. JSON responses never serialize provider credentials.
 
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /auth/status` | How this service signs browsers in, and who this browser is signed in as |
 | `POST /auth/github/login` | Start a browser's sign-in with the hub's GitHub App: where to send it, and a cookie binding it to the browser |
 | `GET /auth/github/callback` | Where GitHub sends the browser back: finish the sign-in and set the session cookie |
+| `POST /auth/pair` | Pair the browser with a one-time code (`code`), from the page: a session cookie |
 | `POST /auth/logout` | End the browser's session |
 | `POST /auth/device` | Start a companion's sign-in with GitHub's device flow |
-| `POST /auth/device/poll` | Poll it with its handle; once done, a companion credential |
-| `POST /api/session` | Establish a browser cookie using the pairing credential, where pairing is on |
+| `POST /auth/device/poll` | Poll it with its handle; once GitHub has the code and a signed-in browser approved it, a companion credential |
+| `GET /auth/devices` | The companions' sign-ins waiting for approval whose code the signed-in browser's account entered, and how many wait for their code |
+| `POST /auth/devices/approve` | Approve one (`id`), from the hub's page, as the GitHub account that entered its code; once only |
+| `POST /auth/devices/deny` | Deny one (`id`), from the hub's page, as the GitHub account that entered its code |
+| `POST /api/app-token` | Rotate the application token, and unpair every browser; for the CLI and the GNOME app only |
+| `POST /api/pairing` | A one-time pairing URL for each of the service's names, where pairing is on; for the CLI and the GNOME app only |
 | `GET /api/snapshot` | Connections, items, efforts, the service's mode, and on a companion the hub's work and how its pulls go |
 | `GET /api/export/external` | The external zone only, as a hub serves it to its companions |
 | `GET /api/hub` | The hub a companion pulls from, and how its pulls go |
@@ -135,12 +140,12 @@ All `/api` routes require the local application's bearer credential, a browser s
 | `DELETE /api/hub` | Stop pulling from the hub, and forget its token and work |
 | `POST /api/hub/login` | Sign in to a hub (`url`) with GitHub's device flow: the code to enter, and where |
 | `POST /api/hub/login/poll` | Whether that sign-in is done; once it is, pull from the hub with what it gave |
-| `GET /api/companion-token` | A hub's companion token |
-| `POST /api/companion-token` | Replace a hub's companion token, and revoke the companion credentials its sign-ins gave |
+| `GET /api/companion-token` | A hub's companion token; for the CLI only |
+| `POST /api/companion-token` | Replace a hub's companion token, and revoke the companion credentials its sign-ins gave; for the CLI only |
 | `GET /api/mine` | What waits on each connection's account, and apart from it what watching found |
 | `GET /api/bot` | Each bot connection: its board's counts, its heartbeat's agent runs, and links that ask it for something |
-| `POST /api/connections` | Verify an account and store its credential |
-| `PATCH /api/connections/:id` | Watch another GitHub user from a connection, or stop; change how often it syncs (`sync_interval` in seconds, null for the default); for a plugin, which variables of the service's environment it gets (`plugin_env`) |
+| `POST /api/connections` | Verify an account and store its credential; to a plugin's source, for the CLI and the GNOME app only |
+| `PATCH /api/connections/:id` | Watch another GitHub user from a connection, or stop; change how often it syncs (`sync_interval` in seconds, null for the default); for a plugin, which variables of the service's environment it gets (`plugin_env`, for the CLI and the GNOME app only) |
 | `POST /api/connections/:id/verify` | Check a connection's credential again, or replace it (`token`) with one for the same account; resumes its scheduled syncs |
 | `GET /api/connections/:id/plugin` | Which plugin file a plugin connection trusts, and what its plugin hashes to now (SHA-256) |
 | `POST /api/connections/:id/plugin` | Trust the plugin file with this SHA-256 (`sha256`), if the plugin still hashes to it, and verify the connection |

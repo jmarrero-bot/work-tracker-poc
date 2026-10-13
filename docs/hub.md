@@ -41,7 +41,7 @@ $WB connect bot --url https://github.com/ --external --token-env GH_TOKEN --boar
   --tracker OWNER/REPO --heartbeat ISSUE --bot-login BOT_LOGIN --forge-org FORGE_ORG
 ```
 
-Open `https://hub.example.ts.net/` and sign in with GitHub (or, with `--pairing`, open the pairing URL the hub printed for its tailnet name). Without the App, print the companion token for the laptop:
+Open `https://hub.example.ts.net/` and sign in with GitHub (or, with `--pairing`, open a pairing URL under its tailnet name from `podman exec workboard-hub workboard pair`). Without the App, print the companion token for the laptop:
 
 ```sh
 $WB companion-token
@@ -75,7 +75,7 @@ podman run --rm --volume workboard-hub:/var/lib/workboard \
   ghcr.io/jmarrero-bot/work-tracker-poc@sha256:DIGEST github-app set-secret --token-env WORKBOARD_GITHUB_APP_SECRET
 ```
 
-Do the same after rotating the client secret on GitHub, then restart the hub. The hub itself needs no podman secret for the App. Until the App exists, start the hub with `--pairing` instead of the three `--github-...` options; the pairing URL is then in the container's log (`podman logs workboard-hub`). With neither, browsers can't sign in at all, and only the CLI and companions with the companion token get in.
+Do the same after rotating the client secret on GitHub, then restart the hub. The hub itself needs no podman secret for the App. Until the App exists, start the hub with `--pairing` instead of the three `--github-...` options; the container's log has a pairing URL then (`podman logs workboard-hub`), which works once within 10 minutes, and `podman exec workboard-hub workboard pair` prints a new one. With neither, browsers can't sign in at all, and only the CLI and companions with the companion token get in.
 
 The CLI runs in the container, where a secret given as an environment variable is what `--token-env` reads:
 
@@ -92,7 +92,7 @@ Check through `tailscale serve` that the hub takes its tailnet name:
 curl -sS https://hub.example.ts.net/api/snapshot
 ```
 
-`` {"error":"Sign in first: with GitHub on a hub that has its App, otherwise with the pairing URL `workboard serve` printed"} `` means the name got through and the hub wants a sign-in; `{"error":"Unexpected host"}` means it isn't one of the `--allowed-host` names. `curl -sS https://hub.example.ts.net/auth/status` says whether the App is configured (`"github_app":true`) and pairing is off.
+`` {"error":"Sign in first: with GitHub on a hub that has its App, otherwise with a pairing URL from `workboard pair`"} `` means the name got through and the hub wants a sign-in; `{"error":"Unexpected host"}` means it isn't one of the `--allowed-host` names. `curl -sS https://hub.example.ts.net/auth/status` says whether the App is configured (`"github_app":true`) and pairing is off.
 
 ## Set up the companion
 
@@ -101,11 +101,11 @@ On the laptop, run Workboard as usual, connect the internal sources, and sign in
 ```sh
 workboard serve
 workboard connect jira --url https://jira.example.com/ --label 'Work Jira' --token-env WORKBOARD_JIRA_TOKEN
-workboard hub login https://hub.example.ts.net/   # enter the code it shows on github.com
+workboard hub login https://hub.example.ts.net/   # enter the code on github.com, then approve it on the hub's page
 workboard hub show
 ```
 
-`hub login` runs GitHub's device flow through the hub, which gives the laptop a credential that only reads its export, bound to the GitHub user who entered the code. Without the App, give it the companion token instead: `workboard hub set https://hub.example.ts.net/ --token-stdin`. Either pulls once to check the address and the credential before it keeps them; the credential is stored like a connection's, in a private file. From then on the companion pulls on its own schedule (every 5 minutes, or `serve --sync-interval`), with the same backoff as a connection, and `workboard sync` pulls too. `workboard hub unset` stops it and forgets the token and the hub's work.
+`hub login` runs GitHub's device flow through the hub, which gives the laptop a credential that only reads its export, bound to the GitHub user who entered the code, once that user also approves the sign-in on the hub's page, signed in there with GitHub. Without the App, give it the companion token instead: `workboard hub set https://hub.example.ts.net/ --token-stdin`. Either pulls once to check the address and the credential before it keeps them; the credential is stored like a connection's, in a private file. From then on the companion pulls on its own schedule (every 5 minutes, or `serve --sync-interval`), with the same backoff as a connection, and `workboard sync` pulls too. `workboard hub unset` stops it and forgets the token and the hub's work.
 
 A hub address is HTTPS, or plain HTTP only to the laptop's own loopback, so the token never crosses a network in the clear. A hub never pulls from another hub.
 
@@ -127,15 +127,15 @@ If the companion connects an account the hub also connects, the hub's copy of th
 
 **What comes back is checked whole.** Everything in an export must say it is external, items must belong to connections and efforts in it, links must be HTTP(S), and sizes are bounded; otherwise none of it is kept. The companion's own export is built from its own work alone, so nothing pulled from the hub leaves again through it.
 
-**People sign in with GitHub.** With its GitHub App, the hub lets in only the GitHub users on its allowlist, by numeric user ID: a browser through GitHub's web flow, which gives it a session cookie holding a random ID, never a token; a companion through GitHub's device flow, which gives it an export-only credential. [github-app.md](github-app.md) has the details: sessions, their expiry, CSRF and `state` checks, and rate limits. The CLI uses the application token, rotated on every start and read from the data directory, on loopback only.
+**People sign in with GitHub.** With its GitHub App, the hub lets in only the GitHub users on its allowlist, by numeric user ID: a browser through GitHub's web flow, which gives it a session cookie holding a random ID, never a token; a companion through GitHub's device flow, which gives it an export-only credential. [github-app.md](github-app.md) has the details: sessions, their expiry, CSRF and `state` checks, and rate limits. The CLI reaches the hub through its private Unix socket, in the data directory in the container, which only the hub's own user can connect to; the application token, rotated on every start, is taken on loopback only.
 
-**Pairing is the fallback until the App exists.** With `--pairing` and no App, a browser pairs through the printed URL: an HttpOnly, SameSite=Strict cookie holding the application token, also Secure under the hub's tailnet name. Anyone who can reach the hub on the tailnet and has the pairing URL can use it. Once the App is configured, pairing is off, and the hub won't start with `--pairing`.
+**Pairing is the fallback until the App exists.** With `--pairing` and no App, a browser pairs with a one-time code from `workboard pair`, which works once, within 10 minutes: it gets an HttpOnly, SameSite=Strict cookie holding a random session ID, never the application token, also Secure under the hub's tailnet name. Anyone who can reach the hub on the tailnet and has an unused pairing URL can use it. Once the App is configured, pairing is off, and the hub won't start with `--pairing`.
 
 **Serve nothing else under the hub's tailnet name.** Browsers scope cookies by host name, not by port. Any other service under the same name, another `tailscale serve` port or path included, would be sent the hub's session cookie, and with it the session, or with pairing the application token itself and full access to the hub. Give other services a machine of their own, or a name of their own.
 
 **The Host check is not a boundary against the tailnet.** A client on the tailnet can send `tailscale serve` any Host header, the loopback address included, so the names a hub takes keep browsers' cookies and origins straight, but only a credential lets a request in. The application token is refused through a proxy's headers as well, as defense in depth; what keeps it on the hub machine is that only the data directory holds it.
 
-**The companion's credential reads the export, and nothing else.** The application token rotates on every start, so a companion can't keep it, and it can change anything on the hub. A companion instead has the credential `hub login` gave, bound to its user, or the hub's companion token, made on its first start and kept across restarts. Both only read the external export. `workboard companion-token --rotate` replaces the companion token and revokes every credential `hub login` gave, at once, after which each companion needs `hub login` or `hub set` again.
+**The companion's credential reads the export, and nothing else.** The application token rotates on every start, and with `workboard app-token --rotate`, so a companion can't keep it, and it can change anything on the hub. A companion instead has the credential `hub login` gave, bound to its user, or the hub's companion token, made on its first start and kept across restarts. Both only read the external export. `workboard companion-token --rotate` replaces the companion token and revokes every credential `hub login` gave, at once, after which each companion needs `hub login` or `hub set` again.
 
 Tokens are files of mode `0600` in the data directory, not encrypted at rest, as every Workboard credential for now. The hub keeps the companion credentials `hub login` gave by their SHA-256 only.
 

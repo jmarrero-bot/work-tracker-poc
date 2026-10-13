@@ -15,13 +15,9 @@ finish-args:
   - --socket=fallback-x11
   - --share=ipc
   - --device=dri
-  # The app talks to the Workboard service on the host's loopback only, but
-  # Flatpak can't limit network access to loopback: without this, the
-  # sandbox has a loopback of its own, where the service isn't. So this
-  # shares the host's whole network, as for any networked app.
-  - --share=network
-  # The service's token, which it replaces on every start: the copy it
-  # puts in the session's runtime directory, read-only. The data directory,
+  # The service's private socket, in the session's runtime directory, which
+  # is all the app talks to: no network. Read-only, since connecting to a
+  # socket needs no write access to its file system. The data directory,
   # with the database and the credentials, stays out of the sandbox.
   - --filesystem=xdg-run/workboard:ro
 build-options:

@@ -47,6 +47,34 @@
 //! | No marker | Files are the store | The default |
 //! | A marker, migration done | The keyring is the store; the service refuses to start a hub with it | Set by a migration that completed |
 //! | A marker with a migration under way | The service refuses to start until `migrate` is run again, to either store | The marker says which store is the authority: the one copied from until every copy was read back, the one copied to from then on |
+//! | A marker recording another path, whose directory still has a marker naming the same store | The service and `migrate` refuse, pointing to `workboard credentials rekey` ([`rekey`]) | A copy of the data directory: its cleanup and removals would drop the original's credentials |
+//! | A marker recording another path that is gone, or names another store | The path is updated, and the store kept | The directory was moved |
+//! | A marker with a re-key under way | The service refuses to start until `rekey` is run again | The new store isn't whole until the marker switches to it; the shared store is never changed |
+//!
+//! A copy is told from the directory moved only while the original can be
+//! seen at its recorded path: a copy started while the original is out of
+//! view (its disk unmounted, or outside a container's or toolbox's mounts)
+//! is taken for the directory moved, and records its own path. So is the
+//! first of two directories to start with a marker from before paths were
+//! recorded. Keep copies of a keyring data directory out of the way of the
+//! original, or re-key them first.
+//!
+//! # A call that times out
+//!
+//! A call to the Secret Service that times out may still complete later on
+//! the bus, such as a `CreateItem` or `Delete` that GNOME Keyring finishes
+//! late. Nothing can check it then: the call still holds the thread that
+//! would ask. The next calls fail at once until it finished, so none of this
+//! service's later changes can land before it; a new service starts only
+//! once this one exited and released the data directory's lock, after the
+//! call was sent. A late landing does what its caller meant: a credential
+//! created for a connection that wasn't saved is one no connection uses, which
+//! the next start drops; a verify reported failed may still have put in place
+//! the new credential, which was checked to be the same account's; a removal
+//! finishes. The risk left is GNOME Keyring itself finishing an older call
+//! after a newer one from the next start, which would take it reordering
+//! calls, such as one held on a prompt; the service never causes a prompt
+//! once it runs.
 
 use crate::connector::{ConnectorError, ErrorKind};
 use anyhow::{bail, Context, Result};
@@ -101,6 +129,15 @@ struct Marker {
     /// to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     migrating: Option<Backend>,
+    /// The data directory's canonical path when it last used the store, to
+    /// tell a copy of it, which would share the store, from the directory
+    /// moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
+    /// While a re-key is under way: the store being given to this
+    /// directory, in place of `store`, which stays the original's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rekeying: Option<String>,
 }
 
 /// Where the credentials are kept now.
@@ -436,6 +473,70 @@ fn read_marker(dir: &Path) -> Result<Option<Marker>> {
 
 fn save_marker(dir: &Path, marker: &Marker) -> Result<()> {
     write_whole(&dir.join(MARKER), &serde_json::to_string(marker)?)
+}
+
+/// The data directory `root`'s canonical path, as its marker records it.
+fn canonical(root: &Path) -> Result<PathBuf> {
+    fs::canonicalize(root).with_context(|| format!("Cannot resolve {}", root.display()))
+}
+
+/// Whether `a` and `b` are the same directory, such as one reached through
+/// a bind mount.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (fs::metadata(a), fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    let _ = (a, b);
+    false
+}
+
+/// Whether the data directory `root` is a copy of `original`, which still
+/// uses the keyring store `store`: `original` is another directory, and its
+/// marker names the same store.
+fn copy_of(root: &Path, original: &Path, store: &str) -> Result<bool> {
+    if same_dir(root, original) {
+        return Ok(false);
+    }
+    // A marker that is there but can't be read can't be told apart from
+    // the original's: that counts as a copy, which is refused.
+    let theirs = read_marker(&original.join(DIR)).with_context(|| {
+        format!(
+            "Cannot tell whether this data directory is a copy of {}",
+            original.display()
+        )
+    })?;
+    Ok(theirs.is_some_and(|m| m.store == store))
+}
+
+/// What to do if a copy of a data directory used the keyring.
+fn refuse_copy(original: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "This data directory is a copy of {}, which keeps its credentials in the same GNOME Keyring store; with it, this copy would drop or change the original's credentials. Run `workboard credentials rekey` with the service stopped to give this copy a store of its own, or remove the original if this directory replaces it",
+        original.display()
+    )
+}
+
+/// `marker`, checked to be this data directory's own and not a copy's, with
+/// `root`'s path recorded: `None` if it already was. A directory moved
+/// takes its store along; a copy of one whose original still uses the store
+/// is refused.
+fn here(root: &Path, marker: &Marker) -> Result<Option<Marker>> {
+    let path = canonical(root)?;
+    match &marker.path {
+        Some(recorded) if *recorded == path => return Ok(None),
+        Some(recorded) if copy_of(root, recorded, &marker.store)? => {
+            return Err(refuse_copy(recorded))
+        }
+        _ => (),
+    }
+    Ok(Some(Marker {
+        path: Some(path),
+        ..marker.clone()
+    }))
 }
 
 impl Secrets {
@@ -917,10 +1018,20 @@ fn open_with(
         }) => bail!(
             "A credentials migration was cut short; run `workboard credentials migrate --to keyring` or `--to files` to finish it, then start the service"
         ),
+        Some(Marker {
+            rekeying: Some(_), ..
+        }) => bail!(
+            "A re-key of this data directory's credentials was cut short; run `workboard credentials rekey` again to finish it, then start the service"
+        ),
         Some(_) if hub => bail!(
             "A hub keeps its credentials in files; run `workboard credentials migrate --to files` first"
         ),
         Some(marker) => {
+            // Before the keyring is reached: a copy must not touch the
+            // original's store at all.
+            if let Some(updated) = here(root, &marker)? {
+                save_marker(&secrets.dir, &updated)?;
+            }
             secrets.store = match connect(&marker.store) {
                 Ok(vault) => Store::Keyring(vault),
                 Err(e) => {
@@ -974,16 +1085,25 @@ fn migrate_with(
     // Its creation is durable too.
     sync_dir(root)?;
     drop_partials(&dir)?;
-    let marker = read_marker(&dir)?;
-    // Files, with no marker, have nothing in the keyring to move or drop.
-    let Some(marker) = marker.or_else(|| {
-        (to == Backend::Keyring).then(|| Marker {
+    let marker = match read_marker(&dir)? {
+        Some(Marker {
+            rekeying: Some(_), ..
+        }) => bail!(
+            "A re-key of this data directory's credentials was cut short; run `workboard credentials rekey` again to finish it first"
+        ),
+        // A copy's migration would move or drop the original's credentials.
+        Some(marker) => here(root, &marker)?.unwrap_or(marker),
+        // Files, with no marker, have nothing in the keyring to move or drop.
+        None if to == Backend::Files => {
+            Secrets::files(root).drop_staged()?;
+            return Ok(Migrated::default());
+        }
+        None => Marker {
             store: uuid::Uuid::new_v4().to_string(),
             migrating: Some(Backend::Files),
-        })
-    }) else {
-        Secrets::files(root).drop_staged()?;
-        return Ok(Migrated::default());
+            path: Some(canonical(root)?),
+            rekeying: None,
+        },
     };
     let from = marker.migrating.unwrap_or(Backend::Keyring);
     // Reached before anything changes, so a keyring that can't be reached
@@ -1063,6 +1183,95 @@ fn migrate_with(
         )?,
     }
     Ok(migrated)
+}
+
+/// Give the data directory `root`, a copy of another that keeps its
+/// credentials in the same keyring store, a store of its own, while the
+/// service is stopped (the caller holds the data directory's lock). Returns
+/// how many credentials were copied.
+///
+/// It records the new store in the marker first, copies every credential of
+/// the shared store into it and reads each copy back, and only then makes it
+/// this directory's store. Nothing in the shared store changes: it is the
+/// original's. Cut short, running it again finishes it, with the same new
+/// store, and the service refuses to start meanwhile. What the copy's
+/// database doesn't use, its next start drops, now from its own store.
+pub fn rekey(root: &Path) -> Result<usize> {
+    rekey_with(root, secret_service)
+}
+
+/// [`rekey`], reaching the keyring's stores with `connect`.
+fn rekey_with(root: &Path, connect: impl Fn(&str) -> Result<Box<dyn Vault>>) -> Result<usize> {
+    let dir = root.join(DIR);
+    let marker = match read_marker(&dir)? {
+        None => bail!("This data directory keeps its credentials in files, not GNOME Keyring; there is no store to re-key"),
+        Some(Marker {
+            migrating: Some(_), ..
+        }) => bail!(
+            "A credentials migration was cut short; run `workboard credentials migrate --to keyring` or `--to files` to finish it first"
+        ),
+        Some(marker) => marker,
+    };
+    // Only a copy: re-keying the original would strand its credentials in a
+    // store nothing names.
+    let path = canonical(root)?;
+    let is_copy = match marker.path.as_deref() {
+        Some(recorded) if recorded != path => copy_of(root, recorded, &marker.store)?,
+        _ => false,
+    };
+    if marker.rekeying.is_none() && !is_copy {
+        bail!("This data directory isn't a copy of another that shares its GNOME Keyring store; it has nothing to re-key")
+    }
+    drop_partials(&dir)?;
+    let new = marker
+        .rekeying
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Both reached before anything changes.
+    let shared = Secrets {
+        dir: dir.clone(),
+        store: Store::Keyring(connect(&marker.store)?),
+    };
+    let own = Secrets {
+        dir: dir.clone(),
+        store: Store::Keyring(connect(&new)?),
+    };
+    save_marker(
+        &dir,
+        &Marker {
+            rekeying: Some(new.clone()),
+            ..marker.clone()
+        },
+    )?;
+    // What only the new store has: a leftover of a re-key cut short.
+    let wanted: Vec<String> = shared
+        .names()?
+        .into_iter()
+        .filter(|n| !n.ends_with(STAGED))
+        .collect();
+    for name in own.names()? {
+        if !wanted.contains(&name) {
+            own.delete(&name)?;
+        }
+    }
+    for name in &wanted {
+        let value = shared.read(name)?;
+        own.write(name, &value)?;
+        if own.read(name)? != value {
+            bail!("A credential wasn't kept as it was given; run the re-key again")
+        }
+    }
+    // The switch: this directory's store from here on.
+    save_marker(
+        &dir,
+        &Marker {
+            store: new,
+            migrating: None,
+            path: Some(path),
+            rekeying: None,
+        },
+    )?;
+    Ok(wanted.len())
 }
 
 #[cfg(test)]
@@ -1507,10 +1716,222 @@ mod tests {
         fs::rename(root.path(), &to).unwrap();
         let again = open_with(&to, false, connect).unwrap();
         assert_eq!(again.read(A).unwrap(), "token-a");
+        // The original is gone, so it was moved, not copied.
+        assert_eq!(marker_of(&to).path, Some(canonical(&to).unwrap()));
         let stores = stores.lock().unwrap();
         assert_eq!(stores.len(), 2);
         assert_eq!(stores[0], stores[1]);
         assert!(!stores[0].contains('/'));
+    }
+
+    /// Keyring stores by ID, each a vault of its own, as the Secret Service
+    /// keeps them apart by their attribute.
+    #[derive(Clone, Default)]
+    struct Stores(Arc<Mutex<BTreeMap<String, Memory>>>);
+
+    impl Stores {
+        fn get(&self, store: &str) -> Memory {
+            self.0
+                .lock()
+                .unwrap()
+                .entry(store.into())
+                .or_default()
+                .clone()
+        }
+        fn connect(&self) -> impl Fn(&str) -> Result<Box<dyn Vault>> + '_ {
+            move |store| -> Result<Box<dyn Vault>> { Ok(Box::new(self.get(store))) }
+        }
+        /// The stores holding anything, but `except`.
+        fn others(&self, except: &[&str]) -> Vec<String> {
+            let stores = self.0.lock().unwrap();
+            stores
+                .iter()
+                .filter(|(id, vault)| {
+                    !except.contains(&id.as_str()) && !vault.snapshot().is_empty()
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        }
+    }
+
+    /// A data directory with A and C, kept in a keyring store of its own,
+    /// and that store's ID.
+    fn kept_in(stores: &Stores) -> (tempfile::TempDir, String) {
+        let root = data_dir();
+        let files = Secrets::files(root.path());
+        files.create(A, CURRENT).unwrap();
+        files.create(C, "c").unwrap();
+        migrate_with(root.path(), Backend::Keyring, stores.connect()).unwrap();
+        let store = store_of(root.path());
+        (root, store)
+    }
+
+    fn marker_of(root: &Path) -> Marker {
+        read_marker(&root.join(DIR)).unwrap().unwrap()
+    }
+
+    fn store_of(root: &Path) -> String {
+        marker_of(root).store
+    }
+
+    /// A copy of the data directory `root`, as `cp -a` makes one.
+    fn copy_of_dir(root: &Path) -> tempfile::TempDir {
+        let copy = tempfile::tempdir().unwrap();
+        let dir = copy.path().join(DIR);
+        crate::db::private_dir(&dir).unwrap();
+        for entry in fs::read_dir(root.join(DIR)).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+        }
+        copy
+    }
+
+    /// A copy of a data directory whose original still uses the keyring
+    /// store is refused, by the service and by a migration, either of which
+    /// would drop the original's credentials; re-keyed, it has a store of
+    /// its own, and the original's is as it was.
+    #[test]
+    fn a_copy_is_refused_until_it_has_a_store_of_its_own() {
+        let stores = Stores::default();
+        let (root, shared) = kept_in(&stores);
+        assert_eq!(
+            marker_of(root.path()).path,
+            Some(canonical(root.path()).unwrap())
+        );
+        let copy = copy_of_dir(root.path());
+        // The original goes on, and adds B.
+        open_with(root.path(), false, stores.connect())
+            .unwrap()
+            .create(B, "b")
+            .unwrap();
+        let refusals = [
+            open_with(copy.path(), false, stores.connect()).map(drop),
+            migrate_with(copy.path(), Backend::Files, stores.connect()).map(drop),
+            migrate_with(copy.path(), Backend::Keyring, stores.connect()).map(drop),
+        ];
+        for refused in refusals {
+            let error = format!("{:#}", refused.unwrap_err());
+            assert!(error.contains("is a copy of"), "{error}");
+            assert!(error.contains("workboard credentials rekey"), "{error}");
+        }
+        let original = BTreeMap::from([
+            (A.to_string(), CURRENT.to_string()),
+            (B.to_string(), "b".to_string()),
+            (C.to_string(), "c".to_string()),
+        ]);
+        assert_eq!(stores.get(&shared).snapshot(), original);
+        // The original can't be re-keyed, nor files.
+        assert!(rekey_with(root.path(), stores.connect()).is_err());
+        let (files_dir, _) = kept_by(Backend::Files);
+        assert!(rekey_with(files_dir.path(), stores.connect()).is_err());
+
+        assert_eq!(rekey_with(copy.path(), stores.connect()).unwrap(), 3);
+        let own = store_of(copy.path());
+        assert_ne!(own, shared);
+        assert_eq!(
+            marker_of(copy.path()).path,
+            Some(canonical(copy.path()).unwrap())
+        );
+        let secrets = open_with(copy.path(), false, stores.connect()).unwrap();
+        // Its start drops what its database doesn't use, B, from its own
+        // store alone; so does a removal.
+        let live: HashSet<String> = [A.to_string(), C.to_string()].into();
+        assert_eq!(secrets.reconcile(&live).unwrap(), 1);
+        secrets.remove(A).unwrap();
+        assert_eq!(secrets.read(C).unwrap(), "c");
+        assert_eq!(
+            stores.get(&own).snapshot().into_keys().collect::<Vec<_>>(),
+            [C]
+        );
+        assert_eq!(stores.get(&shared).snapshot(), original);
+        // Once it is, there is nothing more to re-key.
+        assert!(rekey_with(copy.path(), stores.connect()).is_err());
+        let again = open_with(root.path(), false, stores.connect()).unwrap();
+        assert_eq!(again.read(A).unwrap(), CURRENT);
+    }
+
+    /// A re-key stopped or failed at each of its steps in turn: the
+    /// original's store never changes, the copy is refused or reads every
+    /// credential from its own store, and running it again finishes it,
+    /// leaving nothing in a store no directory names.
+    #[test]
+    fn every_step_of_a_rekey_can_be_the_last() {
+        let setup = || {
+            let stores = Stores::default();
+            let (root, shared) = kept_in(&stores);
+            let copy = copy_of_dir(root.path());
+            (stores, root, copy, shared)
+        };
+        let (stores, _root, copy, _) = setup();
+        let (_, steps) = fault::run(None, Mode::Stop, || {
+            rekey_with(copy.path(), stores.connect())
+        });
+        assert!(steps > 0);
+        let mut combinations = 0;
+        for at in 0..=steps {
+            for mode in [Mode::Stop, Mode::Crash, Mode::Fail] {
+                combinations += 1;
+                let case = format!("{mode:?} at step {at} of {steps}");
+                let (stores, root, copy, shared) = setup();
+                let original = stores.get(&shared).snapshot();
+                let (rekeyed, _) =
+                    fault::run(Some(at), mode, || rekey_with(copy.path(), stores.connect()));
+                assert_eq!(stores.get(&shared).snapshot(), original, "{case}");
+                match open_with(copy.path(), false, stores.connect()) {
+                    Ok(secrets) => {
+                        assert_ne!(store_of(copy.path()), shared, "{case}");
+                        assert_eq!(secrets.read(A).unwrap(), CURRENT, "{case}");
+                        assert_eq!(secrets.read(C).unwrap(), "c", "{case}");
+                    }
+                    Err(_) => {
+                        assert!(rekeyed.is_err(), "{case}: refused after it completed");
+                        rekey_with(copy.path(), stores.connect())
+                            .unwrap_or_else(|e| panic!("{case}: {e:#}"));
+                    }
+                }
+                let own = store_of(copy.path());
+                let secrets = open_with(copy.path(), false, stores.connect())
+                    .unwrap_or_else(|e| panic!("{case}: {e:#}"));
+                assert_eq!(secrets.read(A).unwrap(), CURRENT, "{case}");
+                assert_eq!(secrets.read(C).unwrap(), "c", "{case}");
+                assert_eq!(stores.get(&own).snapshot(), original, "{case}");
+                assert_eq!(stores.get(&shared).snapshot(), original, "{case}");
+                assert_eq!(
+                    stores.others(&[&shared, &own]),
+                    Vec::<String>::new(),
+                    "{case}"
+                );
+                assert_eq!(files(copy.path()), [MARKER], "{case}");
+                let reopened = open_with(root.path(), false, stores.connect()).unwrap();
+                assert_eq!(reopened.read(A).unwrap(), CURRENT, "{case}");
+            }
+        }
+        println!("{combinations} combinations");
+    }
+
+    /// The same directory by another path, such as a bind mount's, is no
+    /// copy; nor is one whose marker predates recording the path, which
+    /// records it.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_directory_by_another_path_is_no_copy() {
+        let stores = Stores::default();
+        let (root, store) = kept_in(&stores);
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("link");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        let here = canonical(root.path()).unwrap();
+        for recorded in [Some(link), None] {
+            let marker = Marker {
+                path: recorded.clone(),
+                ..marker_of(root.path())
+            };
+            save_marker(&root.path().join(DIR), &marker).unwrap();
+            let secrets = open_with(root.path(), false, stores.connect()).unwrap();
+            assert_eq!(secrets.read(A).unwrap(), CURRENT, "{recorded:?}");
+            assert_eq!(marker_of(root.path()).path.as_ref(), Some(&here));
+            assert_eq!(store_of(root.path()), store);
+        }
     }
 
     #[test]

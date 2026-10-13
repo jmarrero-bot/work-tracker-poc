@@ -39,7 +39,7 @@ workboard plugin trust CONNECTION_ID                    # shows the trusted and 
 workboard plugin trust CONNECTION_ID --sha256 NEW_HASH  # trusts that file without asking
 ```
 
-Trusting is explicit and names the file: Workboard pins the new hash only if the plugin still hashes to the one you saw, then verifies the connection with it, which brings its scheduled syncs back. Each connection trusts its own file, so several connections that share a plugin are each trusted again. A plugin connection made before plugins were pinned trusts no file, and its plugin doesn't run until you trust one the same way. `workboard connections` says which command a stopped connection needs. The API is `GET` and `POST /api/connections/:id/plugin`.
+Trusting is explicit and names the file: Workboard pins the new hash only if the plugin still hashes to the one you saw, then verifies the connection with it, which brings its scheduled syncs back. Each connection trusts its own file, so several connections that share a plugin are each trusted again. A plugin connection made before plugins were pinned trusts no file, and its plugin doesn't run until you trust one the same way. `workboard connections` says which command a stopped connection needs. The API is `GET` and `POST /api/connections/:id/plugin`, for the CLI and the GNOME app only: a browser can't trust a plugin.
 
 Pinning says which file you agreed to run with a credential, not that the file is safe: check what you trust, as you would any program you install. It covers the plugin file only, not the interpreter its first line names, nor the libraries and modules that interpreter loads, which are as trusted as anything else installed for your user.
 
@@ -79,7 +79,7 @@ workboard plugin env CONNECTION_ID                            # shows it
 workboard plugin env CONNECTION_ID --clear                    # none
 ```
 
-The API takes the same as `plugin_env`, a list of names, when connecting (`POST /api/connections`) and later (`PATCH /api/connections/:id`). A name that isn't allowed is refused, and nothing is saved. Each run passes the values the service's environment holds then; a variable the service doesn't have stays unset. The credential still reaches a plugin only on standard input: a run is refused when an allowed variable holds the connection's credential anyway, as a proxy address with it as the password would.
+The API takes the same as `plugin_env`, a list of names, when connecting (`POST /api/connections`) and later (`PATCH /api/connections/:id`). Connecting to a plugin's source, which runs and trusts the plugin file there, and changing `plugin_env`, are for the CLI and the GNOME app only: a browser can do neither. A name that isn't allowed is refused, and nothing is saved. Each run passes the values the service's environment holds then; a variable the service doesn't have stays unset. The credential still reaches a plugin only on standard input: a run is refused when an allowed variable holds the connection's credential anyway, as a proxy address with it as the password would.
 
 An error message from a plugin is shown after the plugin's name, with any copy of the credential replaced by `[redacted]`, without control characters, and cut at 500 characters. An item that contains the credential is refused.
 

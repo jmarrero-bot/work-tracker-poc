@@ -1,11 +1,11 @@
 use crate::{
     bot,
-    clock::SystemClock,
+    clock::{Clock, SystemClock},
     connector::Target,
     connectors,
     db::{self, Db, Mode},
     hub::{self, DevicePoll},
-    login::{self, AppConfig, Callback, LoginError, Logins},
+    login::{self, AppConfig, Callback, Identity, LoginError, Logins},
     model::*,
     oauth::Site,
     schedule::{self, Builtin, Policy, Scheduler, Trigger},
@@ -19,14 +19,16 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
+    future::IntoFuture,
     path::PathBuf,
-    sync::{Arc, Mutex, PoisonError, RwLock},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock},
     time::{Duration, SystemTime},
 };
 use uuid::Uuid;
@@ -85,6 +87,9 @@ const EXPORT_PATH: &str = "/api/export/external";
 const SESSION_COOKIE: &str = "workboard_session";
 /// Where a hub keeps its companion token, in the data directory.
 const COMPANION_TOKEN: &str = "companion.token";
+/// Where the service keeps its application token, in the data directory,
+/// for HTTP clients on loopback.
+const APP_TOKEN: &str = "service.token";
 
 /// Who may use the service, from where: the CLI with the application
 /// token, a browser signed in with the hub's GitHub App or, without one, a
@@ -96,18 +101,108 @@ struct Access {
     /// Other names a hub is reached by, such as its tailnet name, always
     /// through an HTTPS front such as `tailscale serve`.
     hosts: Vec<String>,
-    /// The application credential: full access. Rotated on each start.
-    token: String,
+    /// The application credential: full access. Rotated on each start, and
+    /// by `workboard app-token --rotate`.
+    token: RwLock<AppToken>,
     /// A hub's companion token, which reads the external export and
     /// nothing else. Kept across restarts.
     companion: Option<RwLock<String>>,
-    /// Whether a browser may pair with the application token: always on a
-    /// local service, and on a hub only with `--pairing`, which can't be
-    /// combined with a GitHub App.
+    /// Whether a browser may pair, with a one-time code: always on a local
+    /// service, and on a hub only with `--pairing`, which can't be combined
+    /// with a GitHub App.
     pairing: bool,
+    /// The one-time pairing codes waiting, and the browsers they paired.
+    paired: Mutex<Pairing>,
+    clock: Arc<dyn Clock>,
     /// A hub's GitHub App sign-ins, if it has one. Then the application
     /// token is the CLI's alone, on loopback.
     logins: Option<Arc<Logins>>,
+}
+
+/// How long a pairing code works, once.
+const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
+/// Most pairing codes waiting, and paired browsers; past either, the oldest
+/// makes way.
+const MAX_PAIRING_CODES: usize = 16;
+const MAX_PAIRED: usize = 64;
+
+/// Browser pairing: a one-time code, which only the CLI and the GNOME app
+/// can ask for, is exchanged for a session cookie holding a random ID. The
+/// application token never goes to a browser, and nothing in a pairing
+/// URL works twice or for long. Codes and sessions are kept by their
+/// SHA-256, in memory only: a restart, or a rotation of the application
+/// token, unpairs every browser.
+#[derive(Default)]
+struct Pairing {
+    /// When each code waiting expires.
+    codes: HashMap<String, SystemTime>,
+    /// Each code used, until it would have expired, with the session it
+    /// opened: a code that comes back was taken by someone else too, so
+    /// that session ends.
+    spent: HashMap<String, (String, SystemTime)>,
+    /// The paired browsers' sessions.
+    sessions: HashMap<String, Paired>,
+}
+
+/// A paired browser's session, which ends unused after
+/// [`login::SESSION_IDLE`], and after [`login::SESSION_MAX`] in any case,
+/// as a hub's sign-in sessions do.
+struct Paired {
+    started: SystemTime,
+    seen: SystemTime,
+}
+
+impl Paired {
+    fn live(&self, now: SystemTime) -> bool {
+        let since = |t: SystemTime| now.duration_since(t).unwrap_or_default();
+        since(self.seen) < login::SESSION_IDLE && since(self.started) < login::SESSION_MAX
+    }
+}
+
+/// Why a pairing code paired nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum Unpaired {
+    /// Not one waiting: unknown, expired, or pairing is off.
+    Unknown,
+    /// Used before: the session it opened was ended.
+    Reused,
+}
+
+/// Drop the oldest entry of `map` while it has `max` or more.
+fn make_way(map: &mut HashMap<String, SystemTime>, max: usize) {
+    while map.len() >= max {
+        let oldest = map.iter().min_by_key(|(_, t)| **t).map(|(k, _)| k.clone());
+        map.retain(|k, _| Some(k) != oldest.as_ref());
+    }
+}
+
+/// The application token, and how many rotations it has been through
+/// since the service started.
+struct AppToken {
+    value: String,
+    generation: u64,
+}
+
+impl AppToken {
+    fn new(value: String) -> Self {
+        Self {
+            value,
+            generation: 0,
+        }
+    }
+}
+
+/// Who a request came from, once [`Access`] let it in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    /// The CLI or the GNOME app: through the private socket, or with the
+    /// application token of the generation given, which stops counting
+    /// once it is rotated, even for a request let in before.
+    Local { token: Option<u64> },
+    /// A browser, paired or signed in with the hub's GitHub App.
+    Browser,
+    /// A companion, reading the hub's export.
+    Companion,
 }
 
 /// Why a request was turned away.
@@ -126,7 +221,7 @@ impl Denied {
             Self::Host => (StatusCode::FORBIDDEN, "Unexpected host"),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
-                "Sign in first: with GitHub on a hub that has its App, otherwise with the pairing URL `workboard serve` printed",
+                "Sign in first: with GitHub on a hub that has its App, otherwise with a pairing URL from `workboard pair`",
             ),
             Self::Scope => (
                 StatusCode::FORBIDDEN,
@@ -153,27 +248,49 @@ impl Access {
             .contains(&host)
             .then(|| format!("https://{host}"))
     }
+    /// Whether a request came straight to the loopback port, not through
+    /// a proxy: under the loopback name, and without any header a proxy
+    /// such as `tailscale serve` adds. A tailnet client can send the proxy
+    /// any Host header, the loopback name included, so the name alone
+    /// never says so.
+    fn direct(&self, headers: &HeaderMap) -> bool {
+        text(headers, header::HOST) == Some(self.local.as_str())
+            && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+    }
+    /// Who sent a request, as the hub's front says, for any request that
+    /// isn't [`Access::direct`], whatever name it came by.
+    fn peer(&self, headers: &HeaderMap) -> login::Peer {
+        login::peer(headers, !self.direct(headers))
+    }
     /// Whether a session cookie set for `host` is marked Secure: under one
     /// of the hub's names, which are only reached over HTTPS.
     fn secure(&self, host: &str) -> bool {
         self.origin(host)
             .is_some_and(|origin| origin.starts_with("https://"))
     }
-    /// Whether a request may go on.
-    fn check(&self, method: &Method, path: &str, headers: &HeaderMap) -> Result<(), Denied> {
+    /// Whether a request may go on, and as whom.
+    fn check(&self, method: &Method, path: &str, headers: &HeaderMap) -> Result<Caller, Denied> {
         let host = text(headers, header::HOST).ok_or(Denied::Host)?;
         let origin = self.origin(host).ok_or(Denied::Host)?;
         let bearer = text(headers, header::AUTHORIZATION).and_then(|v| v.strip_prefix("Bearer "));
-        // With a GitHub App, the application token is the CLI's, on
-        // loopback and not through a proxy; without one, also a paired
-        // browser's on the hub's names.
-        let direct = host == self.local && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h));
-        let app_token =
-            |v: &str| matches_token(v, &self.token) && (direct || self.logins.is_none());
+        // The application token is taken on loopback only, not through a
+        // proxy: no browser has it, and a tailnet client can send the proxy
+        // any Host header. Nor from a request a browser made, which says
+        // where it came from: the token is the CLI's, never a page's.
+        let direct = self.direct(headers);
+        let from_browser = BROWSER_HEADERS.iter().any(|h| headers.contains_key(*h));
+        // A copy, so the lock isn't held while a session is looked up.
+        let (token, generation) = {
+            let token = self.token.read().unwrap_or_else(PoisonError::into_inner);
+            (token.value.clone(), token.generation)
+        };
+        let app_token = |v: &str| matches_token(v, &token) && direct && !from_browser;
         let bearer_ok = bearer.is_some_and(app_token);
-        let paired = self.pairing && cookie(headers, SESSION_COOKIE).is_some_and(app_token);
+        // The page's own refreshes don't count as a use of a session.
+        let renew = !headers.contains_key(BACKGROUND_HEADER);
+        let paired =
+            self.pairing && cookie(headers, SESSION_COOKIE).is_some_and(|v| self.paired(v, renew));
         let signed_in = self.logins.as_ref().is_some_and(|logins| {
-            let renew = !headers.contains_key(BACKGROUND_HEADER);
             cookie(headers, login::SESSION_COOKIE)
                 .is_some_and(|v| logins.session(v, renew).is_some())
         });
@@ -189,7 +306,7 @@ impl Access {
                         .is_some_and(|logins| logins.companion(v))
             });
             return match companion {
-                true if method == Method::GET && path == EXPORT_PATH => Ok(()),
+                true if method == Method::GET && path == EXPORT_PATH => Ok(Caller::Companion),
                 true => Err(Denied::Scope),
                 false => Err(Denied::Unauthorized),
             };
@@ -202,7 +319,108 @@ impl Access {
         {
             return Err(Denied::CrossOrigin);
         }
-        Ok(())
+        Ok(if bearer_ok {
+            Caller::Local {
+                token: Some(generation),
+            }
+        } else {
+            Caller::Browser
+        })
+    }
+    fn pairing(&self) -> MutexGuard<'_, Pairing> {
+        self.paired.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// A new one-time pairing code, if browsers may pair here, for a caller
+    /// let in with the application token of generation `token`, if it came
+    /// that way: none once it was rotated, as a rotation unpairs every
+    /// browser that holder could have paired. Under the token's lock, so a
+    /// rotation can't come between.
+    fn pairing_code(&self, token: Option<u64>) -> Option<String> {
+        if !self.pairing {
+            return None;
+        }
+        let current = self.token.read().unwrap_or_else(PoisonError::into_inner);
+        if token.is_some_and(|generation| generation != current.generation) {
+            return None;
+        }
+        let now = self.clock.now();
+        let mut pairing = self.pairing();
+        pairing.codes.retain(|_, expires| now < *expires);
+        make_way(&mut pairing.codes, MAX_PAIRING_CODES);
+        let code = new_token();
+        pairing
+            .codes
+            .insert(login::hashed(&code), now + PAIRING_TTL);
+        Some(code)
+    }
+    /// Use up the pairing `code`: a new session's cookie value, if the code
+    /// is waiting and hasn't expired.
+    fn pair(&self, code: &str) -> Result<String, Unpaired> {
+        if !self.pairing {
+            return Err(Unpaired::Unknown);
+        }
+        let now = self.clock.now();
+        let key = login::hashed(code);
+        let mut pairing = self.pairing();
+        pairing.spent.retain(|_, (_, expires)| now < *expires);
+        // Taken twice, as by another user of this machine who read it off
+        // the browser's command line: neither keeps a session.
+        if let Some((session, _)) = pairing.spent.remove(&key) {
+            pairing.sessions.remove(&session);
+            return Err(Unpaired::Reused);
+        }
+        let expires = pairing.codes.remove(&key).ok_or(Unpaired::Unknown)?;
+        if now >= expires {
+            return Err(Unpaired::Unknown);
+        }
+        pairing.sessions.retain(|_, s| s.live(now));
+        while pairing.sessions.len() >= MAX_PAIRED {
+            let oldest = pairing
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| s.seen)
+                .map(|(k, _)| k.clone());
+            pairing.sessions.retain(|k, _| Some(k) != oldest.as_ref());
+        }
+        let session = new_token();
+        let hashed = login::hashed(&session);
+        pairing.spent.insert(key, (hashed.clone(), expires));
+        pairing.sessions.insert(
+            hashed,
+            Paired {
+                started: now,
+                seen: now,
+            },
+        );
+        Ok(session)
+    }
+    /// Unpair every browser, and spend every pairing code.
+    fn unpair_all(&self) {
+        let mut pairing = self.pairing();
+        pairing.codes.clear();
+        pairing.spent.clear();
+        pairing.sessions.clear();
+    }
+    /// Whether the cookie value `session` is a live paired browser's. A
+    /// use by the person (`renew`) renews it; the page's own refreshes
+    /// don't.
+    fn paired(&self, session: &str, renew: bool) -> bool {
+        let now = self.clock.now();
+        let key = login::hashed(session);
+        let mut pairing = self.pairing();
+        match pairing.sessions.get_mut(&key) {
+            Some(paired) if paired.live(now) => {
+                if renew {
+                    paired.seen = now;
+                }
+                true
+            }
+            Some(_) => {
+                pairing.sessions.remove(&key);
+                false
+            }
+            None => false,
+        }
     }
 }
 
@@ -213,8 +431,13 @@ const PROXY_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-for",
     "x-forwarded-host",
+    "x-forwarded-proto",
     "tailscale-user-login",
+    "tailscale-user-name",
 ];
+/// Headers only a browser sends, saying where a request came from: a
+/// request with any of them is never the CLI's, whatever it carries.
+const BROWSER_HEADERS: &[&str] = &["origin", "sec-fetch-site"];
 /// The header the page sends with its own refreshes, which don't count as
 /// a use of a session.
 const BACKGROUND_HEADER: &str = "x-workboard-background";
@@ -238,44 +461,152 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         })
 }
 
+/// Marks the requests that came through the service's private socket, which
+/// only this user can connect to ([`crate::socket`]). Only the socket's
+/// router adds it; nothing a client sends can.
+#[derive(Clone, Copy)]
+struct ViaSocket;
+
 async fn protect(State(app): State<App>, req: Request, next: Next) -> Response {
+    let mut req = req;
+    // The CLI and the GNOME app, as this user: full access, no token.
+    if req.extensions().get::<ViaSocket>().is_some() {
+        req.extensions_mut().insert(Caller::Local { token: None });
+        return next.run(req).await;
+    }
     // Routes nested under /api see their path without it.
     let path = req
         .extensions()
         .get::<OriginalUri>()
         .map_or_else(|| req.uri().path().to_string(), |u| u.path().to_string());
     match app.access.check(req.method(), &path, req.headers()) {
-        Ok(()) => next.run(req).await,
+        Ok(caller) => {
+            req.extensions_mut().insert(caller);
+            next.run(req).await
+        }
         Err(denied) => denied.response(),
     }
 }
-async fn session(State(app): State<App>, headers: HeaderMap) -> Response {
-    if !app.access.pairing {
-        let message = match app.access.logins {
-            Some(_) => "Browser pairing is off on this hub, which has its GitHub App: sign in with GitHub",
-            None => "Browser pairing is off on this hub: set up its GitHub App (docs/github-app.md), or start it with --pairing",
-        };
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": message }))).into_response();
+/// Why a browser can't pair here.
+fn no_pairing(access: &Access) -> Response {
+    let message = match access.logins {
+        Some(_) => "Browser pairing is off on this hub, which has its GitHub App: sign in with GitHub",
+        None => "Browser pairing is off on this hub: set up its GitHub App (docs/github-app.md), or start it with --pairing",
+    };
+    refused(StatusCode::FORBIDDEN, message)
+}
+/// The URLs that pair a browser with the service, each under one of its
+/// names, with a new one-time code, which the first of them used spends.
+fn pairing_urls(access: &Access, token: Option<u64>) -> Option<Vec<String>> {
+    let code = access.pairing_code(token)?;
+    let mut urls = vec![format!("http://{}/#pair={code}", access.local)];
+    urls.extend(
+        access
+            .hosts
+            .iter()
+            .map(|host| format!("https://{host}/#pair={code}")),
+    );
+    Some(urls)
+}
+/// A new one-time pairing URL, for the CLI or the GNOME app alone: never
+/// for a browser, which could pair others with it.
+async fn new_pairing(State(app): State<App>, Extension(caller): Extension<Caller>) -> Response {
+    if let Some(refused) = local_only(caller) {
+        return refused;
     }
-    let host = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default();
+    let Caller::Local { token } = caller else {
+        unreachable!("only the CLI and the GNOME app get here")
+    };
+    match pairing_urls(&app.access, token) {
+        Some(urls) => {
+            Json(json!({ "urls": urls, "expires_in": PAIRING_TTL.as_secs() })).into_response()
+        }
+        None => no_pairing(&app.access),
+    }
+}
+#[derive(Deserialize)]
+struct PairInput {
+    code: String,
+}
+/// Pair the browser that sent a one-time code from the page: a session
+/// cookie, held to the API's paths, out of the page's scripts, and sent
+/// only by the service's own pages.
+async fn pair(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<PairInput>,
+) -> Response {
+    let host = text(&headers, header::HOST).unwrap_or_default();
+    let Some(origin) = app.access.origin(host) else {
+        return Denied::Host.response();
+    };
+    // From the page of the name it came by: another site can't pair a
+    // browser, even with a code of its own.
+    if text(&headers, header::ORIGIN) != Some(origin.as_str()) {
+        return Denied::CrossOrigin.response();
+    }
+    if !app.access.pairing {
+        return no_pairing(&app.access);
+    }
+    let session = match app.access.pair(&input.code) {
+        Ok(session) => session,
+        Err(Unpaired::Unknown) => {
+            return refused(
+                StatusCode::BAD_REQUEST,
+                "This pairing URL was used or expired; run `workboard pair` for a new one",
+            )
+        }
+        Err(Unpaired::Reused) => {
+            eprintln!("A pairing URL was used twice, so the browser session it opened was ended: someone else may have read it");
+            return refused(
+                StatusCode::BAD_REQUEST,
+                "This pairing URL was already used, maybe by someone else, so the session it opened has been ended. Pair again with a new one from `workboard pair`, and paste it rather than open it if others use this machine",
+            );
+        }
+    };
     let secure = if app.access.secure(host) {
         "; Secure"
     } else {
         ""
     };
-    let mut res = Json(json!({"ok":true})).into_response();
-    res.headers_mut().insert(
+    let mut response = Json(json!({ "ok": true })).into_response();
+    response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "{SESSION_COOKIE}={}; Path=/api; HttpOnly; SameSite=Strict{secure}",
-            app.access.token
+            "{SESSION_COOKIE}={session}; Path=/api; HttpOnly; SameSite=Strict{secure}"
         ))
-        .unwrap(),
+        .expect("invariant: a cookie of a random value is header text"),
     );
-    res
+    response
+}
+/// Refuse a caller that isn't the CLI or the GNOME app: what it asked for
+/// is a credential, or makes one, that no browser should hold.
+fn local_only(caller: Caller) -> Option<Response> {
+    (!matches!(caller, Caller::Local { .. })).then(|| {
+        refused(
+            StatusCode::FORBIDDEN,
+            "Only the CLI and the GNOME app may do this",
+        )
+    })
+}
+/// The routes of the companion token, for the CLI on the hub alone.
+async fn companion_token_route(
+    State(app): State<App>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    match local_only(caller) {
+        Some(refused) => refused,
+        None => companion_token(State(app)).await.into_response(),
+    }
+}
+async fn rotate_companion_token_route(
+    State(app): State<App>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    match local_only(caller) {
+        Some(refused) => refused,
+        None => rotate_companion_token(State(app)).await.into_response(),
+    }
 }
 /// A hub's companion token, which a companion uses to read the external
 /// export.
@@ -299,6 +630,40 @@ async fn rotate_companion_token(State(app): State<App>) -> ApiResult<Value> {
     }
     Ok(Json(json!({ "token": token })))
 }
+/// Replace the application token, for the CLI or the GNOME app alone: the
+/// old one stops working at once, and so does every pairing, since a
+/// paired browser was let in by whoever held it. HTTP clients read the new
+/// one from the data directory after a refusal; the CLI and the GNOME app
+/// use the socket, and need none.
+async fn rotate_app_token(
+    State(app): State<App>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    if let Some(refused) = local_only(caller) {
+        return refused;
+    }
+    let token = new_token();
+    let root = app.db.lock().unwrap().root.clone();
+    // One rotation at a time, the file, the token in use and the pairings
+    // together, so the file always holds the token in use.
+    let mut current = app
+        .access
+        .token
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    // The file first: if writing it fails, the old token stays in use.
+    if let Err(e) = replace_secret(&root.join(APP_TOKEN), &token) {
+        return refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Cannot keep the new application token, so the old one stays: {e:#}"),
+        );
+    }
+    current.value = token;
+    current.generation += 1;
+    app.access.unpair_all();
+    drop(current);
+    Json(json!({ "ok": true })).into_response()
+}
 fn only_hubs() -> anyhow::Error {
     anyhow::anyhow!("Only a hub has a companion token")
 }
@@ -314,34 +679,19 @@ pub(crate) fn replace_secret(path: &std::path::Path, value: &str) -> Result<()> 
     std::fs::rename(&staged, path)?;
     Ok(())
 }
-/// Where in `$XDG_RUNTIME_DIR` the service also puts its token.
-const RUNTIME_DIR: &str = "workboard";
-
-/// The file in [`RUNTIME_DIR`] with the token of the service on `port`.
-/// One service listens on a port, so its token is the one there.
-fn runtime_token_name(port: u16) -> String {
-    format!("service-{port}.token")
-}
-
-/// Also put the token in the session's runtime directory, private to the
-/// user and gone at logout, so a sandboxed client such as the GNOME app's
-/// Flatpak can read it without access to the data directory, which holds
-/// the database and the credentials. Without a runtime directory, or if
-/// writing fails, clients read the data directory's copy.
-fn publish_token(port: u16, token: &str) {
-    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) else {
+/// Remove the copy of the token of the service on `port` that earlier
+/// versions put in the session's runtime directory for the GNOME app's
+/// Flatpak, which reaches the service through its socket now. Nothing reads
+/// it any more, and it is a credential.
+fn unpublish_token(port: u16) {
+    let Some(runtime) = crate::socket::runtime_dir() else {
         return;
     };
-    let dir = std::path::PathBuf::from(runtime).join(RUNTIME_DIR);
-    let path = dir.join(runtime_token_name(port));
-    let written = db::private_dir(&dir).and_then(|()| replace_secret(&path, token));
-    if let Err(e) = written {
-        // An earlier start's copy would be taken for this one's.
-        let _ = db::remove_if_there(&path);
-        eprintln!(
-            "Cannot put the service token in {}: {e:#}; clients read it from the data directory",
-            dir.display()
-        );
+    let path = runtime
+        .join(crate::socket::RUNTIME_DIR)
+        .join(format!("service-{port}.token"));
+    if let Err(e) = db::remove_if_there(&path) {
+        eprintln!("Cannot remove an earlier version's copy of the service token: {e:#}");
     }
 }
 /// A hub's companion token, made on its first start and kept.
@@ -411,6 +761,10 @@ async fn snapshot(State(app): State<App>) -> ApiResult<Board> {
         mode: app.mode,
         hub,
     }))
+}
+/// Nothing: for a client to check it reached the service it meant to.
+async fn ping() -> Json<Value> {
+    Json(json!({ "ok": true }))
 }
 /// The hub this companion pulls from, if one is set, and how its pulls go.
 async fn get_hub(State(app): State<App>) -> ApiResult<Option<hub::Status>> {
@@ -485,11 +839,13 @@ async fn hub_login_poll(State(app): State<App>) -> ApiResult<Value> {
     }
     let polled = hub::HubClient::new()?.poll_login(&url, &handle).await;
     match polled {
-        Ok(DevicePoll::Pending { interval }) => {
+        Ok(DevicePoll::Pending { interval, approve }) => {
             if let Some(waiting) = app.hub_login.lock().unwrap().as_mut() {
                 waiting.interval = interval;
             }
-            Ok(Json(json!({ "status": "pending", "interval": interval })))
+            Ok(Json(
+                json!({ "status": "pending", "interval": interval, "approve": approve }),
+            ))
         }
         Ok(DevicePoll::Done { token, login }) => {
             forget();
@@ -563,7 +919,25 @@ fn local(id: &str) -> Result<()> {
     }
     Ok(())
 }
-async fn connect(State(app): State<App>, Json(input): Json<ConnectInput>) -> ApiResult<Connection> {
+async fn connect(
+    State(app): State<App>,
+    Extension(caller): Extension<Caller>,
+    Json(input): Json<ConnectInput>,
+) -> Response {
+    // Connecting to a plugin's source runs the plugin file there now, and
+    // trusts it, with what it is given of the service's environment: the
+    // CLI's decisions, like `workboard plugin trust`. Before anything runs.
+    if connectors::is_plugin(&input.provider) {
+        if let Some(refused) = local_only(caller) {
+            return refused;
+        }
+    }
+    match connect_as_asked(app, input).await {
+        Ok(c) => c.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+async fn connect_as_asked(app: App, input: ConnectInput) -> ApiResult<Connection> {
     if input.label.trim().is_empty() || input.label.len() > 100 {
         bail_api("Enter a connection name of 1–100 characters")?
     }
@@ -683,8 +1057,26 @@ struct ConnectionPatch {
 /// finds shows as theirs, never as the connection's account's.
 async fn patch_connection(
     State(app): State<App>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(input): Json<ConnectionPatch>,
+) -> Response {
+    // What a plugin gets of the service's environment is the CLI's to
+    // decide, like trusting its file.
+    if input.plugin_env.is_some() {
+        if let Some(refused) = local_only(caller) {
+            return refused;
+        }
+    }
+    match patch_connection_as_asked(app, id, input).await {
+        Ok(c) => c.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+async fn patch_connection_as_asked(
+    app: App,
+    id: String,
+    input: ConnectionPatch,
 ) -> ApiResult<Connection> {
     local(&id)?;
     // Every field is checked before any is written.
@@ -741,13 +1133,20 @@ async fn verify(
     ))
 }
 /// Which plugin file a plugin connection trusts, and what its plugin
-/// hashes to now.
+/// hashes to now. Trust is the CLI's to decide, so this is its alone.
 async fn plugin_trust(
     State(app): State<App>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
-) -> ApiResult<schedule::PluginTrust> {
-    local(&id)?;
-    Ok(Json(app.scheduler.plugin_trust(&id)?))
+) -> Response {
+    if let Some(refused) = local_only(caller) {
+        return refused;
+    }
+    let trust = local(&id).and_then(|()| app.scheduler.plugin_trust(&id));
+    match trust {
+        Ok(trust) => Json(trust).into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
 }
 #[derive(Deserialize)]
 struct TrustInput {
@@ -758,11 +1157,20 @@ struct TrustInput {
 /// and verify the connection with it.
 async fn trust_plugin(
     State(app): State<App>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(input): Json<TrustInput>,
-) -> ApiResult<Connection> {
-    local(&id)?;
-    Ok(Json(app.scheduler.trust_plugin(&id, &input.sha256).await?))
+) -> Response {
+    if let Some(refused) = local_only(caller) {
+        return refused;
+    }
+    if let Err(e) = local(&id) {
+        return ApiError(e).into_response();
+    }
+    match app.scheduler.trust_plugin(&id, &input.sha256).await {
+        Ok(c) => Json(c).into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
 }
 async fn disconnect(State(app): State<App>, Path(id): Path<String>) -> ApiResult<Value> {
     local(&id)?;
@@ -1031,7 +1439,7 @@ async fn login_start(State(app): State<App>, headers: HeaderMap) -> Response {
     if let Some(response) = off_sign_in_name(logins, &headers, true) {
         return response;
     }
-    match logins.start(&login::peer(&headers)) {
+    match logins.start(&app.access.peer(&headers).address) {
         Ok((binding, url)) => {
             let mut response = Json(json!({ "url": url.as_str() })).into_response();
             response.headers_mut().insert(
@@ -1059,7 +1467,7 @@ async fn login_callback(
     }
     let finished = logins
         .finish(
-            &login::peer(&headers),
+            &app.access.peer(&headers).address,
             cookie(&headers, login::LOGIN_COOKIE),
             &callback,
         )
@@ -1130,7 +1538,7 @@ async fn device_start(State(app): State<App>, headers: HeaderMap) -> Response {
     if let Some(response) = not_from_companion(&app, &headers) {
         return response;
     }
-    match logins.device_start(&login::peer(&headers)).await {
+    match logins.device_start(app.access.peer(&headers)).await {
         Ok(start) => Json(start).into_response(),
         Err(e) => refusal(e),
     }
@@ -1148,10 +1556,81 @@ async fn device_poll(State(app): State<App>, headers: HeaderMap) -> Response {
     else {
         return Denied::Unauthorized.response();
     };
-    match logins.device_poll(&login::peer(&headers), handle).await {
+    match logins
+        .device_poll(&app.access.peer(&headers).address, handle)
+        .await
+    {
         Ok(poll) => Json(poll).into_response(),
         Err(e) => refusal(e),
     }
+}
+/// The GitHub user signed in on the hub's page that sent a request: under
+/// the name people sign in on and, for a change, from that name's page.
+/// Never the application token, a paired browser or a companion: only a
+/// person signed in with the App.
+fn page_user(
+    logins: &Logins,
+    headers: &HeaderMap,
+    change: bool,
+) -> Result<Identity, Box<Response>> {
+    if let Some(response) = off_sign_in_name(logins, headers, change) {
+        return Err(Box::new(response));
+    }
+    let renew = !headers.contains_key(BACKGROUND_HEADER);
+    cookie(headers, login::SESSION_COOKIE)
+        .and_then(|v| logins.session(v, renew))
+        .ok_or_else(|| Box::new(Denied::Unauthorized.response()))
+}
+/// The companions' sign-ins waiting for approval, for a signed-in user.
+async fn device_requests(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some(logins) = app.access.logins.as_ref() else {
+        return no_app();
+    };
+    match page_user(logins, &headers, false) {
+        Ok(user) => Json(logins.device_requests(&user)).into_response(),
+        Err(response) => *response,
+    }
+}
+#[derive(Deserialize)]
+struct DeviceChoice {
+    id: String,
+}
+/// Approve or deny a companion's sign-in, from the hub's page.
+async fn choose_device(
+    app: &App,
+    headers: &HeaderMap,
+    choice: &DeviceChoice,
+    approve: bool,
+) -> Response {
+    let Some(logins) = app.access.logins.as_ref() else {
+        return no_app();
+    };
+    let user = match page_user(logins, headers, true) {
+        Ok(user) => user,
+        Err(response) => return *response,
+    };
+    let chosen = match approve {
+        true => logins.approve_device(&user, &choice.id),
+        false => logins.deny_device(&user, &choice.id),
+    };
+    match chosen {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => refusal(e),
+    }
+}
+async fn approve_device(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(choice): Json<DeviceChoice>,
+) -> Response {
+    choose_device(&app, &headers, &choice, true).await
+}
+async fn deny_device(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(choice): Json<DeviceChoice>,
+) -> Response {
+    choose_device(&app, &headers, &choice, false).await
 }
 async fn assets(req: Request) -> Response {
     let path = req.uri().path().trim_start_matches('/');
@@ -1205,9 +1684,8 @@ async fn headers(req: Request, next: Next) -> Response {
     response.headers_mut().insert("content-security-policy",HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
     response
 }
-/// What the service says when it starts: how browsers get in. The pairing
-/// URL carries the application token, so it is printed only while pairing
-/// is on.
+/// What the service says when it starts: how browsers get in, with a
+/// one-time pairing URL while pairing is on.
 fn welcome(access: &Access, mode: Mode) -> String {
     let running = match mode {
         Mode::Local => "Workboard is running locally",
@@ -1221,17 +1699,10 @@ fn welcome(access: &Access, mode: Mode) -> String {
     if !access.pairing {
         return format!("{running}. No browser can sign in: set up its GitHub App (docs/github-app.md), or start it with --pairing. {cli}");
     }
-    let token = &access.token;
-    let local = &access.local;
-    let mut urls = vec![format!("http://{local}/#token={token}")];
-    urls.extend(
-        access
-            .hosts
-            .iter()
-            .map(|host| format!("https://{host}/#token={token}")),
-    );
+    let urls = pairing_urls(access, None).unwrap_or_default();
     format!(
-        "{running}. Open this private pairing URL:\n{}\nKeep this URL private. {cli}",
+        "{running}. Pair your browser with this URL, which works once, in the next {} minutes:\n{}\nFor another, run `workboard pair`. {cli}",
+        PAIRING_TTL.as_secs() / 60,
         urls.join("\n")
     )
 }
@@ -1264,17 +1735,19 @@ pub struct GitHubApp {
 /// steps, which guard themselves, and the page.
 fn router(app: App) -> Router {
     let api = Router::new()
+        .route("/ping", get(ping))
         .route("/snapshot", get(snapshot))
         .route("/mine", get(mine))
         .route("/bot", get(bot_view))
         .route("/export/external", get(export_external))
-        .route("/session", post(session))
+        .route("/pairing", post(new_pairing))
+        .route("/app-token", post(rotate_app_token))
         .route("/hub", get(get_hub).put(set_hub).delete(unset_hub))
         .route("/hub/login", post(hub_login))
         .route("/hub/login/poll", post(hub_login_poll))
         .route(
             "/companion-token",
-            get(companion_token).post(rotate_companion_token),
+            get(companion_token_route).post(rotate_companion_token_route),
         )
         .route("/connections", post(connect))
         .route(
@@ -1298,9 +1771,13 @@ fn router(app: App) -> Router {
         .route("/status", get(auth_status))
         .route("/github/login", post(login_start))
         .route("/github/callback", get(login_callback))
+        .route("/pair", post(pair))
         .route("/logout", post(logout))
         .route("/device", post(device_start))
-        .route("/device/poll", post(device_poll));
+        .route("/device/poll", post(device_poll))
+        .route("/devices", get(device_requests))
+        .route("/devices/approve", post(approve_device))
+        .route("/devices/deny", post(deny_device));
     Router::new()
         .nest("/api", api)
         .nest("/auth", auth)
@@ -1309,6 +1786,36 @@ fn router(app: App) -> Router {
         .layer(middleware::from_fn(headers))
         .layer(middleware::from_fn(refuse_funnel))
         .with_state(app)
+}
+/// `router` as the private socket serves it: as the CLI's or the GNOME
+/// app's ([`ViaSocket`]), every answer saying it is the service `instance`,
+/// and a request that means another service refused before anything acts
+/// on it ([`crate::socket::EXPECT_HEADER`]).
+fn on_socket(router: Router, instance: &str) -> Result<Router> {
+    let value = HeaderValue::from_str(instance)?;
+    let instance = instance.to_string();
+    Ok(router
+        .layer(Extension(ViaSocket))
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let (instance, value) = (instance.clone(), value.clone());
+            async move {
+                let expected = req
+                    .headers()
+                    .get(crate::socket::EXPECT_HEADER)
+                    .map(|v| v.as_bytes() == instance.as_bytes());
+                let mut response = match expected {
+                    Some(false) => refused(
+                        StatusCode::CONFLICT,
+                        "This isn't the Workboard service that request was for",
+                    ),
+                    _ => next.run(req).await,
+                };
+                response
+                    .headers_mut()
+                    .insert(crate::socket::INSTANCE_HEADER, value);
+                response
+            }
+        })))
 }
 pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     #[cfg(not(unix))]
@@ -1349,6 +1856,9 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
     db::private_dir(&root)?;
     let _lock = db::lock(&root)?;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    // With the data directory's lock and the port held, a socket there is
+    // one a service that was killed left.
+    let (socket, bound) = crate::socket::bind(&root, port)?;
     let mut db = Db::open_as(&root, mode)?;
     let secrets = crate::secrets::open(&root, mode == Mode::Hub)?;
     println!("Credentials are kept in {}", secrets.describe());
@@ -1382,12 +1892,12 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         db.seed()?
     }
     let token = new_token();
-    let path = root.join("service.token");
+    let path = root.join(APP_TOKEN);
     if path.exists() {
         std::fs::remove_file(&path)?
     }
     db::write_secret(&path, &token)?;
-    publish_token(port, &token);
+    unpublish_token(port);
     let local = format!("127.0.0.1:{port}");
     let companion = match mode {
         Mode::Hub => Some(RwLock::new(companion_token_of(&root)?)),
@@ -1410,9 +1920,11 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         access: Arc::new(Access {
             local: local.clone(),
             hosts,
-            token,
+            token: RwLock::new(AppToken::new(token)),
             companion,
             pairing: mode == Mode::Local || pairing,
+            paired: Mutex::default(),
+            clock: Arc::new(SystemClock),
             logins,
         }),
         scheduler,
@@ -1420,11 +1932,37 @@ pub async fn serve(root: PathBuf, options: Options) -> Result<()> {
         hub_login: Arc::default(),
     };
     println!("{}", welcome(&app.access, mode));
-    let stop = stop_requested()?;
-    axum::serve(listener, router(app))
-        .with_graceful_shutdown(stop)
-        .await?;
-    Ok(())
+    // Both stop together, gracefully.
+    let (stopping, stop) = tokio::sync::watch::channel(false);
+    let requested = stop_requested()?;
+    let users = root.clone();
+    tokio::spawn(async move {
+        requested.await;
+        // Sessions end with the process, and so do the user tokens kept
+        // for them: a stopped hub keeps none in its data directory until it
+        // starts again. They go as soon as the stop is asked for, since an
+        // engine or systemd kills the service if requests in flight hold it
+        // up too long.
+        if let Err(e) = login::forget_user_tokens(&users) {
+            eprintln!("{e:#}");
+        }
+        let _ = stopping.send(true);
+    });
+    let stopped = |mut stop: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = stop.wait_for(|stopped| *stopped).await;
+    };
+    let tcp = axum::serve(listener, router(app.clone()))
+        .with_graceful_shutdown(stopped(stop.clone()))
+        .into_future();
+    let unix = axum::serve(socket, on_socket(router(app), bound.instance())?)
+        .with_graceful_shutdown(stopped(stop))
+        .into_future();
+    let served = tokio::try_join!(tcp, unix);
+    drop(bound);
+    // Again, for a session a request in flight opened meanwhile.
+    let forgotten = login::forget_user_tokens(&root);
+    served?;
+    forgotten
 }
 /// Resolves once the service is asked to stop: on Ctrl-C (SIGINT), or on
 /// SIGTERM, which container engines and systemd send. Without a handler,
@@ -1465,14 +2003,29 @@ mod tests {
     /// The origin of the hub's page under its tailnet name.
     const HUB_ORIGIN: &str = "https://hub.example.ts.net";
 
-    /// A local service's or a hub's access, the hub's paired with browsers.
+    /// A paired browser's session cookie.
+    const PAIRED: &str = "test-only-paired";
+
+    /// A local service's or a hub's access, the hub's paired with browsers,
+    /// one of which is paired with [`PAIRED`].
     fn access(hub: bool) -> Access {
+        let mut pairing = Pairing::default();
+        let now = SystemTime::now();
+        pairing.sessions.insert(
+            login::hashed(PAIRED),
+            Paired {
+                started: now,
+                seen: now,
+            },
+        );
         Access {
             local: LOCAL.into(),
             hosts: if hub { vec![TAILNET.into()] } else { vec![] },
-            token: TOKEN.into(),
+            token: RwLock::new(AppToken::new(TOKEN.into())),
             companion: hub.then(|| RwLock::new(COMPANION.into())),
             pairing: true,
+            paired: Mutex::new(pairing),
+            clock: Arc::new(SystemClock),
             logins: None,
         }
     }
@@ -1525,19 +2078,24 @@ mod tests {
             (false, &get, SNAPSHOT, LOCAL, Nothing, None, Err(Unauthorized)),
             (false, &get, SNAPSHOT, LOCAL, Bearer("wrong"), None, Err(Unauthorized)),
             (false, &get, SNAPSHOT, LOCAL, Lookalike, None, Err(Unauthorized)),
+            // The application token is never a cookie, nor a browser's.
+            (false, &get, SNAPSHOT, LOCAL, Cookie(TOKEN), None, Err(Unauthorized)),
+            (false, &post, EFFORTS, LOCAL, Bearer(TOKEN), Some(LOCAL_ORIGIN), Err(Unauthorized)),
             (false, &get, SNAPSHOT, "attacker.example", Bearer(TOKEN), None, Err(Host)),
             // A local service is never reached by another name.
             (false, &get, SNAPSHOT, TAILNET, Bearer(TOKEN), None, Err(Host)),
-            (true, &get, SNAPSHOT, TAILNET, Bearer(TOKEN), None, Ok(())),
-            (true, &get, SNAPSHOT, "HUB.example.ts.net", Cookie(TOKEN), None, Ok(())),
-            (true, &get, SNAPSHOT, "other.example.ts.net", Cookie(TOKEN), None, Err(Host)),
+            // Never under another name, App or not.
+            (true, &get, SNAPSHOT, TAILNET, Bearer(TOKEN), None, Err(Unauthorized)),
+            (true, &get, SNAPSHOT, TAILNET, Bearer(TOKEN), Some(HUB_ORIGIN), Err(Unauthorized)),
+            (true, &get, SNAPSHOT, "HUB.example.ts.net", Cookie(PAIRED), None, Ok(())),
+            (true, &get, SNAPSHOT, "other.example.ts.net", Cookie(PAIRED), None, Err(Host)),
             // A browser's change needs the origin of the name it came by.
-            (true, &post, EFFORTS, TAILNET, Cookie(TOKEN), Some(HUB_ORIGIN), Ok(())),
-            (true, &post, EFFORTS, TAILNET, Cookie(TOKEN), Some(LOCAL_ORIGIN), Err(CrossOrigin)),
-            (true, &post, EFFORTS, TAILNET, Cookie(TOKEN), Some("http://hub.example.ts.net"), Err(CrossOrigin)),
-            (true, &post, EFFORTS, TAILNET, Cookie(TOKEN), None, Err(CrossOrigin)),
-            (true, &post, EFFORTS, LOCAL, Cookie(TOKEN), Some(LOCAL_ORIGIN), Ok(())),
-            (true, &post, EFFORTS, LOCAL, Cookie(TOKEN), Some(HUB_ORIGIN), Err(CrossOrigin)),
+            (true, &post, EFFORTS, TAILNET, Cookie(PAIRED), Some(HUB_ORIGIN), Ok(())),
+            (true, &post, EFFORTS, TAILNET, Cookie(PAIRED), Some(LOCAL_ORIGIN), Err(CrossOrigin)),
+            (true, &post, EFFORTS, TAILNET, Cookie(PAIRED), Some("http://hub.example.ts.net"), Err(CrossOrigin)),
+            (true, &post, EFFORTS, TAILNET, Cookie(PAIRED), None, Err(CrossOrigin)),
+            (true, &post, EFFORTS, LOCAL, Cookie(PAIRED), Some(LOCAL_ORIGIN), Ok(())),
+            (true, &post, EFFORTS, LOCAL, Cookie(PAIRED), Some(HUB_ORIGIN), Err(CrossOrigin)),
             (true, &post, EFFORTS, LOCAL, Bearer(TOKEN), None, Ok(())),
             // The companion token reads the export, and nothing else.
             (true, &get, EXPORT_PATH, TAILNET, Bearer(COMPANION), None, Ok(())),
@@ -1551,7 +2109,9 @@ mod tests {
         for (n, (hub, method, path, host, credential, origin, expected)) in
             cases.into_iter().enumerate()
         {
-            let got = access(hub).check(method, path, &headers(host, credential, origin));
+            let got = access(hub)
+                .check(method, path, &headers(host, credential, origin))
+                .map(|_| ());
             assert_eq!(got, expected, "case {n}: {method} {path} via {host}");
         }
     }
@@ -1667,22 +2227,37 @@ mod tests {
                 &get,
                 "/api/snapshot",
                 headers(TAILNET, Bearer(TOKEN), None),
+                Err(Unauthorized),
+            ),
+            (
+                &unpaired,
+                &get,
+                "/api/snapshot",
+                headers(LOCAL, Bearer(TOKEN), None),
                 Ok(()),
             ),
         ];
         for (n, (access, method, path, headers, expected)) in cases.into_iter().enumerate() {
             assert_eq!(
-                access.check(method, path, &headers),
+                access.check(method, path, &headers).map(|_| ()),
                 expected,
                 "case {n}: {method} {path}"
             );
         }
+        // A browser's request, which says where it came from, carrying the
+        // token, is no CLI's.
+        let mut fetched = headers(LOCAL, Bearer(TOKEN), None);
+        fetched.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert_eq!(
+            hub.check(&get, "/api/snapshot", &fetched).map(|_| ()),
+            Err(Unauthorized)
+        );
         // The loopback name through a proxy, as a tailnet client can send it.
         for name in PROXY_HEADERS {
-            let got = hub.check(&get, "/api/snapshot", &proxied(name));
+            let got = hub.check(&get, "/api/snapshot", &proxied(name)).map(|_| ());
             assert_eq!(got, Err(Unauthorized), "{name}");
         }
-        assert_eq!(PROXY_HEADERS.len(), 4);
+        assert_eq!(PROXY_HEADERS.len(), 6);
     }
 
     /// An app on a fresh data directory at `root`: a hub reached at `local`
@@ -2002,7 +2577,7 @@ mod tests {
             // No pairing, and the CLI's token on loopback only.
             (
                 &post,
-                "/api/session",
+                "/api/pairing",
                 vec![(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())],
                 StatusCode::FORBIDDEN,
             ),
@@ -2140,10 +2715,18 @@ mod tests {
         let Json(pending) = poll().await.ok().unwrap();
         assert_eq!(pending["status"], "pending");
         clock.advance(Duration::from_secs(5));
+        // GitHub has the code; a signed-in browser has yet to approve it.
+        let Json(waiting) = poll().await.ok().unwrap();
+        assert_eq!(
+            (waiting["status"].as_str(), waiting["approve"].as_bool()),
+            (Some("pending"), Some(true))
+        );
+        login::tests::approve(&logins, USER_CODE);
         let Json(done) = poll().await.ok().unwrap();
+        let entered = fake.lock().unwrap().users["ghu_allowed"].1.clone();
         assert_eq!(
             (done["status"].as_str(), done["login"].as_str()),
-            (Some("done"), Some("octocat"))
+            (Some("done"), Some(entered.as_str()))
         );
         assert_eq!(done["hub"]["url"], url);
         assert!(poll().await.is_err(), "nothing waits any more");
@@ -2167,7 +2750,10 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
-        assert_eq!(hub.access.check(&Method::GET, EXPORT_PATH, &bearer), Ok(()));
+        assert_eq!(
+            hub.access.check(&Method::GET, EXPORT_PATH, &bearer),
+            Ok(Caller::Companion)
+        );
         assert_eq!(
             hub.access.check(&Method::GET, "/api/snapshot", &bearer),
             Err(Denied::Scope)
@@ -2206,6 +2792,11 @@ mod tests {
         let start = logins.device_start(login::tests::PEER).await.unwrap();
         fake.lock().unwrap().polls = [token_answer("ghu_allowed")].into();
         clock.advance(Duration::from_secs(5));
+        logins
+            .device_poll(login::tests::PEER, &start.handle)
+            .await
+            .unwrap();
+        login::tests::approve(&logins, &start.user_code);
         let Ok(DevicePoll::Done { token, .. }) =
             logins.device_poll(login::tests::PEER, &start.handle).await
         else {
@@ -2217,6 +2808,747 @@ mod tests {
         assert!(rotate_companion_token(State(hub)).await.is_ok());
         let (again, _, _) = login::tests::logins(root.path()).await;
         assert!(!again.companion(&token));
+    }
+
+    /// Every sign-in waiting on `logins`, as the allowed user sees them.
+    fn all_requests(logins: &Logins) -> Vec<login::DeviceRequest> {
+        logins.device_requests(&login::tests::allowed()).requests
+    }
+
+    #[tokio::test]
+    async fn companion_sign_ins_are_approved_from_the_hubs_page_alone() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = login::tests::logins(root.path()).await;
+        let (session, _) = login::tests::sign_in(&logins, &fake, "ghu_allowed")
+            .await
+            .unwrap();
+        let router = router(test_app(
+            root.path(),
+            Mode::Hub,
+            LOCAL,
+            Some(logins.clone()),
+        ));
+        let start = logins.device_start(login::tests::PEER).await.unwrap();
+        // The code is entered on GitHub.
+        fake.lock().unwrap().polls = [crate::oauth::tests::token_answer("ghu_allowed")].into();
+        clock.advance(Duration::from_secs(5));
+        logins
+            .device_poll(login::tests::PEER, &start.handle)
+            .await
+            .unwrap();
+        let signed_in = format!("{}={session}", login::SESSION_COOKIE);
+        let bearer = format!("Bearer {TOKEN}");
+        let page = [(HOST, TAILNET), (COOKIE, signed_in.as_str())];
+        let (status, _, body) = call(&router, Method::GET, "/auth/devices", &page, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed: Value = serde_json::from_str(&body).unwrap();
+        let listed = &listed["requests"];
+        assert_eq!(listed[0]["user_code"], start.user_code.as_str());
+        assert_eq!(listed[0]["peer"], login::tests::PEER);
+        assert!(listed[0]["started"].is_string());
+        assert!(
+            !body.contains(&start.handle),
+            "the page never sees the handle"
+        );
+        let id = listed[0]["id"].as_str().unwrap().to_string();
+        let choice = || Some(json!({ "id": id }));
+        // Only a signed-in browser, under the sign-in name, from its page.
+        let elsewhere: [&[(header::HeaderName, &str)]; 6] = [
+            &[(HOST, TAILNET)],
+            &[(HOST, TAILNET), (AUTHORIZATION, bearer.as_str())],
+            &[(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())],
+            &[(HOST, TAILNET), (COOKIE, signed_in.as_str())],
+            &[
+                (HOST, TAILNET),
+                (COOKIE, signed_in.as_str()),
+                (ORIGIN, "https://attacker.example"),
+            ],
+            &[
+                (HOST, TAILNET),
+                (COOKIE, signed_in.as_str()),
+                (ORIGIN, "http://hub.example.ts.net"),
+            ],
+        ];
+        for (n, headers) in elsewhere.into_iter().enumerate() {
+            let (status, _, body) = call(
+                &router,
+                Method::POST,
+                "/auth/devices/approve",
+                headers,
+                choice(),
+            )
+            .await;
+            assert!(
+                matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+                "case {n}: {status} {body}"
+            );
+        }
+        for headers in [
+            &page[..1],
+            &[(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())],
+        ] {
+            let (status, _, _) = call(&router, Method::GET, "/auth/devices", headers, None).await;
+            assert!(matches!(
+                status,
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+            ));
+        }
+        assert!(!all_requests(&logins)[0].approved);
+        let from_page = [
+            (HOST, TAILNET),
+            (COOKIE, signed_in.as_str()),
+            (ORIGIN, HUB_ORIGIN),
+        ];
+        let approve = || {
+            call(
+                &router,
+                Method::POST,
+                "/auth/devices/approve",
+                &from_page,
+                choice(),
+            )
+        };
+        assert_eq!(approve().await.0, StatusCode::OK);
+        assert!(all_requests(&logins)[0].approved);
+        // A replay is refused.
+        assert_eq!(approve().await.0, StatusCode::CONFLICT);
+        let (status, _, _) = call(
+            &router,
+            Method::POST,
+            "/auth/devices/deny",
+            &from_page,
+            choice(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(all_requests(&logins).is_empty());
+        assert_eq!(approve().await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_through_the_front_names_its_peer_whatever_its_host() {
+        use crate::oauth::tests::token_answer;
+        use header::HOST;
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = login::tests::logins(root.path()).await;
+        let router = router(test_app(
+            root.path(),
+            Mode::Hub,
+            LOCAL,
+            Some(logins.clone()),
+        ));
+        let forwarded = header::HeaderName::from_static("x-forwarded-for");
+        let user = header::HeaderName::from_static("tailscale-user-login");
+        // Through `tailscale serve`, which a tailnet client can send the
+        // loopback name.
+        let start = |peer: &'static str| {
+            let router = router.clone();
+            let (forwarded, user) = (forwarded.clone(), user.clone());
+            async move {
+                let headers = [
+                    (HOST, LOCAL),
+                    (forwarded, peer),
+                    (user, "someone-else@example.com"),
+                ];
+                call(&router, Method::POST, "/auth/device", &headers, None).await
+            }
+        };
+        let (status, _, body) = start("100.64.0.66").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let handle = serde_json::from_str::<Value>(&body).unwrap()["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fake.lock().unwrap().polls = [token_answer("ghu_allowed")].into();
+        clock.advance(Duration::from_secs(5));
+        logins
+            .device_poll(login::tests::PEER, &handle)
+            .await
+            .unwrap();
+        let [request] = &all_requests(&logins)[..] else {
+            panic!("one waits")
+        };
+        assert_eq!(request.peer, "100.64.0.66");
+        assert_eq!(
+            request.tailnet_user.as_deref(),
+            Some("someone-else@example.com")
+        );
+        // Its attempts count as that peer's: ten a minute, and another
+        // peer, or this machine, still gets in.
+        for _ in 1..10 {
+            assert_eq!(start("100.64.0.66").await.0, StatusCode::OK);
+        }
+        assert_eq!(start("100.64.0.66").await.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(start("100.64.0.67").await.0, StatusCode::OK);
+        let (status, _, _) = call(
+            &router,
+            Method::POST,
+            "/auth/device",
+            &[(HOST, LOCAL)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_cli_never_sends_a_request_to_another_service() {
+        use crate::socket::{Client, Found, EXPECT_HEADER};
+        let root = tempfile::tempdir().unwrap();
+        let app = test_app(root.path(), Mode::Local, LOCAL, None);
+        let sockets = tempfile::tempdir().unwrap();
+        // Serve `app` as the service `instance`, on a socket of its own.
+        let serve = |name: &str, instance: &str| {
+            let path = sockets.path().join(name);
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let served = on_socket(router(app.clone()), instance).unwrap();
+            tokio::spawn(axum::serve(listener, served).into_future());
+            path
+        };
+        let client = |path| {
+            let found = Found {
+                path,
+                instance: "this-service".into(),
+            };
+            Client::new(found, Duration::from_secs(10))
+        };
+        let efforts = || app.db.lock().unwrap().efforts().unwrap().len();
+        let effort = json!({ "title": "Meant for this service" });
+        // Another service took over the socket: its connection says so
+        // before the request goes out, and nothing is done there.
+        let other = client(serve("other.sock", "another-service"));
+        let error = other
+            .call(Method::POST, "efforts", Some(&effort))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("isn't the one of this data directory"),
+            "{error}"
+        );
+        assert_eq!(efforts(), 0);
+        // This one takes it.
+        let this = client(serve("this.sock", "this-service"));
+        let (status, _) = this
+            .call(Method::POST, "efforts", Some(&effort))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(efforts(), 1);
+        // A request meant for another service is refused before anything
+        // acts on it, whoever sends it.
+        let (status, headers, _) = call(
+            &on_socket(router(app.clone()), "this-service").unwrap(),
+            Method::POST,
+            "/api/efforts",
+            &[
+                (header::HOST, "workboard"),
+                (
+                    header::HeaderName::from_static(EXPECT_HEADER),
+                    "another-service",
+                ),
+            ],
+            Some(effort.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(headers[crate::socket::INSTANCE_HEADER], "this-service");
+        assert_eq!(efforts(), 1);
+    }
+
+    /// The one-time code in a pairing URL.
+    fn code_of(url: &str) -> String {
+        url.split_once("#pair=").unwrap().1.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_pairing_code_pairs_one_browser_once_and_expires() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let clock = Arc::new(crate::clock::ManualClock::at(
+            crate::clock::Timestamp::from_unix(1_791_763_200),
+        ));
+        let mut app = test_app(root.path(), Mode::Hub, LOCAL, None);
+        app.access = Arc::new(Access {
+            clock: clock.clone(),
+            ..access(true)
+        });
+        let router = router(app.clone());
+        let bearer = format!("Bearer {TOKEN}");
+        let paired = format!("{SESSION_COOKIE}={PAIRED}");
+        let local_origin = format!("http://{LOCAL}");
+        let new_code = || async {
+            let (status, _, body) = call(
+                &router,
+                Method::POST,
+                "/api/pairing",
+                &[(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())],
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let answer: Value = serde_json::from_str(&body).unwrap();
+            let urls: Vec<String> = serde_json::from_value(answer["urls"].clone()).unwrap();
+            assert_eq!(answer["expires_in"], PAIRING_TTL.as_secs());
+            // One code, under each of the service's names; never the token.
+            let code = code_of(&urls[0]);
+            assert_eq!(
+                urls,
+                [
+                    format!("http://{LOCAL}/#pair={code}"),
+                    format!("https://{TAILNET}/#pair={code}")
+                ]
+            );
+            assert!(!body.contains(TOKEN));
+            code
+        };
+        let pair = |code: String, host: &'static str, origin: Option<String>| {
+            let router = router.clone();
+            async move {
+                let mut headers = vec![(HOST, host)];
+                if let Some(origin) = &origin {
+                    headers.push((ORIGIN, origin.as_str()));
+                }
+                call(
+                    &router,
+                    Method::POST,
+                    "/auth/pair",
+                    &headers,
+                    Some(json!({ "code": code })),
+                )
+                .await
+            }
+        };
+        // A browser, paired or not, can't ask for a code.
+        for headers in [
+            vec![
+                (HOST, LOCAL),
+                (COOKIE, paired.as_str()),
+                (ORIGIN, local_origin.as_str()),
+            ],
+            vec![(HOST, LOCAL)],
+        ] {
+            let (status, _, _) = call(&router, Method::POST, "/api/pairing", &headers, None).await;
+            assert!(
+                matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+                "{status}"
+            );
+        }
+        let code = new_code().await;
+        // Only from the page of the name it came by; that spends nothing.
+        for origin in [None, Some("https://attacker.example".to_string())] {
+            let (status, _, _) = pair(code.clone(), LOCAL, origin).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let (status, _, _) =
+            pair(code.clone(), "attacker.example", Some(local_origin.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, headers, body) = pair(code.clone(), LOCAL, Some(local_origin.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let [set] = &set_cookies(&headers)[..] else {
+            panic!("one cookie")
+        };
+        let session = set
+            .strip_prefix(&format!("{SESSION_COOKIE}="))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            set.ends_with("; Path=/api; HttpOnly; SameSite=Strict"),
+            "{set}"
+        );
+        assert!(session != TOKEN && session != code && session.len() >= 32);
+        let cookie = format!("{SESSION_COOKIE}={session}");
+        let (status, _, _) = call(
+            &router,
+            Method::GET,
+            "/api/snapshot",
+            &[(HOST, LOCAL), (COOKIE, cookie.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Used once: used again, as by someone who read it too, it ends
+        // the session it opened, and says so.
+        let (status, _, body) = pair(code.clone(), LOCAL, Some(local_origin.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("already used") && body.contains("workboard pair"),
+            "{body}"
+        );
+        let (status, _, _) = call(
+            &router,
+            Method::GET,
+            "/api/snapshot",
+            &[(HOST, LOCAL), (COOKIE, cookie.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the session it opened ended"
+        );
+        let (status, _, body) = pair(code, LOCAL, Some(local_origin.clone())).await;
+        assert!(
+            status == StatusCode::BAD_REQUEST && body.contains("expired"),
+            "{body}"
+        );
+        // A session ends unused after a while, and after a week anyway;
+        // the page's own refreshes don't keep it.
+        let session_of = |headers: &HeaderMap| {
+            set_cookies(headers)[0]
+                .split(';')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let (_, headers, _) = pair(new_code().await, LOCAL, Some(local_origin.clone())).await;
+        let fresh = session_of(&headers);
+        let use_it = || {
+            let (router, fresh) = (router.clone(), fresh.clone());
+            async move {
+                let headers = [(HOST, LOCAL), (COOKIE, fresh.as_str())];
+                call(&router, Method::GET, "/api/snapshot", &headers, None)
+                    .await
+                    .0
+            }
+        };
+        // Used every 6 hours, it lasts a week, and no longer.
+        let step = login::SESSION_IDLE / 2;
+        let uses = login::SESSION_MAX.as_secs() / step.as_secs() - 1;
+        for _ in 0..uses {
+            clock.advance(step);
+            assert_eq!(use_it().await, StatusCode::OK, "renewed by its use");
+        }
+        clock.advance(step);
+        assert_eq!(use_it().await, StatusCode::UNAUTHORIZED, "a week at most");
+        let (_, headers, _) = pair(new_code().await, LOCAL, Some(local_origin.clone())).await;
+        let idle = session_of(&headers);
+        clock.advance(login::SESSION_IDLE / 2);
+        let refresh = [
+            (HOST, LOCAL),
+            (COOKIE, idle.as_str()),
+            (header::HeaderName::from_static(BACKGROUND_HEADER), "1"),
+        ];
+        assert_eq!(
+            call(&router, Method::GET, "/api/snapshot", &refresh, None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        clock.advance(login::SESSION_IDLE / 2);
+        assert_eq!(
+            call(&router, Method::GET, "/api/snapshot", &refresh, None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED,
+            "the page's refreshes don't keep it"
+        );
+        // Under the hub's name, over HTTPS, the cookie is Secure.
+        let (status, headers, _) = pair(new_code().await, TAILNET, Some(HUB_ORIGIN.into())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(set_cookies(&headers)[0].ends_with("; Secure"));
+        // Expired.
+        let late = new_code().await;
+        clock.advance(PAIRING_TTL);
+        let (status, _, _) = pair(late, LOCAL, Some(local_origin.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // A forged code pairs nothing.
+        let (status, _, _) = pair("forged".into(), LOCAL, Some(local_origin.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Without pairing, neither step.
+        let off = router_with(
+            root.path(),
+            Access {
+                pairing: false,
+                ..access(true)
+            },
+        );
+        let (status, _, _) = call(
+            &off,
+            Method::POST,
+            "/api/pairing",
+            &[(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = call(
+            &off,
+            Method::POST,
+            "/auth/pair",
+            &[(HOST, LOCAL), (ORIGIN, local_origin.as_str())],
+            Some(json!({ "code": "anything" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// The router of a hub on a fresh data directory at `root`, with
+    /// `access`.
+    fn router_with(root: &std::path::Path, access: Access) -> Router {
+        let mut app = test_app(root, Mode::Hub, LOCAL, None);
+        app.access = Arc::new(access);
+        router(app)
+    }
+
+    #[tokio::test]
+    async fn the_socket_needs_no_token_and_asks_for_pairing_codes() {
+        let root = tempfile::tempdir().unwrap();
+        let app = test_app(root.path(), Mode::Local, LOCAL, None);
+        let via_socket = on_socket(router(app.clone()), "this-service").unwrap();
+        // Whatever name it is given: no browser reaches a socket.
+        for (method, path) in [
+            (Method::GET, "/api/snapshot"),
+            (Method::POST, "/api/pairing"),
+        ] {
+            let (status, _, body) = call(
+                &via_socket,
+                method,
+                path,
+                &[(header::HOST, "workboard")],
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        }
+        // The same requests through the port are refused.
+        let (status, _, _) = call(
+            &router(app),
+            Method::GET,
+            "/api/snapshot",
+            &[(header::HOST, LOCAL)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rotating_the_app_token_ends_it_and_every_pairing() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let app = test_app(root.path(), Mode::Local, LOCAL, None);
+        let tcp = router(app.clone());
+        let socket = router(app.clone()).layer(Extension(ViaSocket));
+        let paired = format!("{SESSION_COOKIE}={PAIRED}");
+        let origin = format!("http://{LOCAL}");
+        let snapshot = |router: Router, headers: Vec<(header::HeaderName, String)>| async move {
+            let headers: Vec<_> = headers
+                .iter()
+                .map(|(n, v)| (n.clone(), v.as_str()))
+                .collect();
+            call(&router, Method::GET, "/api/snapshot", &headers, None)
+                .await
+                .0
+        };
+        let as_bearer = |token: &str| {
+            vec![
+                (HOST, LOCAL.to_string()),
+                (AUTHORIZATION, format!("Bearer {token}")),
+            ]
+        };
+        let as_paired = vec![(HOST, LOCAL.to_string()), (COOKIE, paired.clone())];
+        assert_eq!(
+            snapshot(tcp.clone(), as_bearer(TOKEN)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            snapshot(tcp.clone(), as_paired.clone()).await,
+            StatusCode::OK
+        );
+        let waiting = app.access.pairing_code(None).unwrap();
+        // Let in with the token before the rotation.
+        let before = Some(0);
+        // Not from a browser, paired or not.
+        for headers in [
+            vec![
+                (HOST, LOCAL),
+                (COOKIE, paired.as_str()),
+                (ORIGIN, origin.as_str()),
+            ],
+            vec![(HOST, LOCAL)],
+        ] {
+            let (status, _, _) = call(&tcp, Method::POST, "/api/app-token", &headers, None).await;
+            assert!(
+                matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+                "{status}"
+            );
+        }
+        assert_eq!(
+            snapshot(tcp.clone(), as_bearer(TOKEN)).await,
+            StatusCode::OK
+        );
+        // From the CLI, on the socket or with the token.
+        let mut current = TOKEN.to_string();
+        for through_socket in [true, false] {
+            let bearer = format!("Bearer {current}");
+            let (router, headers) = match through_socket {
+                true => (&socket, vec![(HOST, "workboard")]),
+                false => (&tcp, vec![(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())]),
+            };
+            let (status, _, body) =
+                call(router, Method::POST, "/api/app-token", &headers, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let rotated = std::fs::read_to_string(root.path().join(APP_TOKEN)).unwrap();
+            assert!(rotated != current && !body.contains(&rotated), "{body}");
+            assert_eq!(
+                snapshot(tcp.clone(), as_bearer(&current)).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                snapshot(tcp.clone(), as_bearer(&rotated)).await,
+                StatusCode::OK
+            );
+            current = rotated;
+        }
+        // Every paired browser, and every code not yet used, is unpaired.
+        assert_eq!(
+            snapshot(tcp.clone(), as_paired).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(app.access.pair(&waiting), Err(Unpaired::Unknown));
+        // A request let in with the old token just before the rotation
+        // gets no code after it; one with the new token does.
+        assert!(app.access.pairing_code(before).is_none());
+        assert!(app.access.pairing_code(Some(2)).is_some());
+    }
+
+    #[tokio::test]
+    async fn only_the_cli_decides_what_a_plugin_runs_with() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path(), Mode::Local, LOCAL, None);
+        app.access = Arc::new(access(false));
+        let tcp = router(app.clone());
+        let socket = on_socket(router(app), "this-service").unwrap();
+        let paired = format!("{SESSION_COOKIE}={PAIRED}");
+        let origin = format!("http://{LOCAL}");
+        let bearer = format!("Bearer {TOKEN}");
+        let browser = [
+            (HOST, LOCAL),
+            (COOKIE, paired.as_str()),
+            (ORIGIN, origin.as_str()),
+        ];
+        let id = "00000000-0000-4000-8000-000000000001";
+        let plugin = format!("/api/connections/{id}/plugin");
+        let connection = format!("/api/connections/{id}");
+        let trust = json!({ "sha256": "0".repeat(64) });
+        let env = json!({ "plugin_env": ["HOME"] });
+        // (method, path, body)
+        // Connecting to a plugin's source, which would run it: with what
+        // it gets of the service's environment, or without.
+        let connect = |plugin_env: &[&str]| {
+            Some(json!({
+                "provider": "errata",
+                "label": "Errata",
+                "base_url": "https://errata.example/",
+                "token": "test-only-token",
+                "plugin_env": plugin_env,
+            }))
+        };
+        let asks = [
+            (Method::GET, plugin.as_str(), None),
+            (Method::POST, plugin.as_str(), Some(trust)),
+            (Method::PATCH, connection.as_str(), Some(env)),
+            (Method::POST, "/api/connections", connect(&["HTTPS_PROXY"])),
+            (Method::POST, "/api/connections", connect(&[])),
+        ];
+        for (method, path, body) in asks {
+            let (status, _, body_text) =
+                call(&tcp, method.clone(), path, &browser, body.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path}: {body_text}"
+            );
+            // The CLI gets past that, to the connection that isn't there.
+            for (router, headers) in [
+                (&socket, vec![(HOST, "workboard")]),
+                (&tcp, vec![(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())]),
+            ] {
+                let (status, _, body_text) =
+                    call(router, method.clone(), path, &headers, body.clone()).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{method} {path}: {body_text}"
+                );
+                // Without the data directory's path, which only the log has.
+                let root = root.path().to_str().unwrap();
+                assert!(!body_text.contains(root), "{body_text}");
+            }
+        }
+        // A browser still connects a source with a built-in connector: here
+        // it gets as far as the address it gave.
+        let builtin = json!({
+            "provider": "jira",
+            "label": "Jira",
+            "base_url": "not a URL",
+            "token": "test-only-token",
+        });
+        let (status, _, body_text) = call(
+            &tcp,
+            Method::POST,
+            "/api/connections",
+            &browser,
+            Some(builtin),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body_text}");
+        // A browser still changes how often a connection syncs.
+        let (status, _, body_text) = call(
+            &tcp,
+            Method::PATCH,
+            &connection,
+            &browser,
+            Some(json!({ "sync_interval": 3600 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body_text}");
+        assert!(body_text.contains("not found"), "{body_text}");
+    }
+
+    #[tokio::test]
+    async fn only_the_cli_reads_or_rotates_the_companion_token() {
+        use header::{AUTHORIZATION, COOKIE, HOST, ORIGIN};
+        let root = tempfile::tempdir().unwrap();
+        // A hub started with --pairing, with a paired browser.
+        let mut app = test_app(root.path(), Mode::Hub, LOCAL, None);
+        app.access = Arc::new(access(true));
+        let tcp = router(app.clone());
+        let paired = format!("{SESSION_COOKIE}={PAIRED}");
+        let bearer = format!("Bearer {TOKEN}");
+        let origin = format!("http://{LOCAL}");
+        let browser = [
+            (HOST, LOCAL),
+            (COOKIE, paired.as_str()),
+            (ORIGIN, origin.as_str()),
+        ];
+        for method in [Method::GET, Method::POST] {
+            let (status, _, body) =
+                call(&tcp, method.clone(), "/api/companion-token", &browser, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+            assert!(!body.contains(COMPANION), "{body}");
+        }
+        let cli = [(HOST, LOCAL), (AUTHORIZATION, bearer.as_str())];
+        let (status, _, body) = call(&tcp, Method::GET, "/api/companion-token", &cli, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(COMPANION), "{body}");
+        let socket = router(app).layer(Extension(ViaSocket));
+        let (status, _, body) = call(
+            &socket,
+            Method::POST,
+            "/api/companion-token",
+            &[(HOST, "workboard")],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// The hub credential a companion keeps, from its data directory.

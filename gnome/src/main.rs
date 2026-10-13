@@ -86,11 +86,12 @@ const WEB_SCHEMES: [&str; 2] = ["https://", "http://"];
     about = "Workboard for GNOME: what waits on you, from the local Workboard service"
 )]
 struct Args {
-    /// The local service's data directory, where its token is. The same as
-    /// the service's and the CLI's.
+    /// The local service's data directory, which names its socket. The same
+    /// as the service's and the CLI's.
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// Port of the local Workboard service.
+    /// The local Workboard service's port, which names its socket in the
+    /// session's runtime directory.
     #[arg(long, default_value_t = api::DEFAULT_PORT)]
     port: u16,
     /// Start without a window, to keep notifying, as at login.
@@ -371,10 +372,10 @@ fn add_actions(app: &adw::Application, state: &Rc<State>) {
     });
     let s = state.clone();
     add_action(app, "web", None, move |_| {
-        // The token is read off the main thread, like every request's.
+        // A one-time code, asked for off the main thread like every request.
         call(
             &s,
-            |client| async move { client.pairing_url() },
+            |client| async move { client.pairing_url().await },
             |state, result| match result {
                 Ok(url) => open_uri(state, &url),
                 Err(e) => toast(state, &format!("{e:#}")),

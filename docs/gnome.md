@@ -1,6 +1,6 @@
 # The GNOME app
 
-`workboard-gnome` is a native GNOME app for the companion's laptop, in Rust with GTK 4 and libadwaita. It is a client of the local Workboard service, like the page and the CLI: it reads everything through the service's HTTP API on `127.0.0.1`, with the service's token: the copy the service puts in the session's runtime directory (`$XDG_RUNTIME_DIR/workboard/service-PORT.token`), or else the one in its data directory, which the CLI reads; when the service refuses the first, the app tries the second. It never opens the database and keeps no work of its own; the only thing it writes is which Mine items it already announced (below).
+`workboard-gnome` is a native GNOME app for the companion's laptop, in Rust with GTK 4 and libadwaita. It is a client of the local Workboard service, like the page and the CLI: it reads everything through the service's HTTP API, on the service's private Unix socket: the one its data directory names, as the CLI finds it, checking that the service there is that data directory's, or else, as in the Flatpak, which can't read the data directory, the one the service puts in the session's runtime directory for its port (`$XDG_RUNTIME_DIR/workboard/service-PORT.sock`). Only the service's own user can connect to it, and it needs no token. It never opens the database and keeps no work of its own; the only thing it writes is which Mine items it already announced (below).
 
 It lives in `gnome/`, a crate of its own in the cargo workspace. A plain `cargo build` still builds only the service, which needs no GTK.
 
@@ -17,9 +17,9 @@ A sidebar of views, next to the chosen one; below 640 pixels wide, as on a phone
 
 Each item shows its outcome (open, delivered, closed without delivery, abandoned, unknown) next to its source's status, never instead of it. What comes from the hub is marked "From the hub, read-only", and stale data is marked stale, also when the service can't be reached: the app then shows what it last answered, with a banner.
 
-The app asks the service again every 30 seconds, like the page, and also with its window closed. A view is rebuilt only when what it shows changed; otherwise only its times ("3 min ago") are updated in place, so keyboard focus and a screen reader's place stay. Requests, reading the token, and saving what was announced run off the main thread; quitting waits a moment for that save. Its sync button asks the service to sync every source now.
+The app asks the service again every 30 seconds, like the page, and also with its window closed. A view is rebuilt only when what it shows changed; otherwise only its times ("3 min ago") are updated in place, so keyboard focus and a screen reader's place stay. Requests and saving what was announced run off the main thread; quitting waits a moment for that save. Its sync button asks the service to sync every source now.
 
-**Open the Web Page**, in the main menu, opens the same private pairing URL `workboard serve` prints, with the service token in its fragment. The page removes it once paired, but the URL can stay in the browser's history while that service runs. A one-time pairing code instead is [#40](https://github.com/jmarrero-bot/work-tracker-poc/issues/40).
+**Open the Web Page**, in the main menu, asks the service for a new pairing URL, as `workboard pair` does, and opens it: its code works once, within 10 minutes, and the page removes it from the address bar at once, so what the browser's history keeps authorizes nothing. Until it is used, the URL is in the browser's command line, which other users of the machine can see.
 
 ## Notifications and running in the background
 
@@ -58,22 +58,21 @@ flatpak run io.github.jmarrero_bot.Workboard
 
 That is this repository's app ID. A build of your own takes its own, from `make -C gnome APP_ID=...` or a copy of the manifest with another `id` ([run-your-own.md](run-your-own.md#build-the-gnome-app-with-your-own-app-id)).
 
-The build fetches the crates in `Cargo.lock` itself (`--share=network` while building); a Flathub build would vendor them instead. The sandbox gets two permissions beyond a display:
+The build fetches the crates in `Cargo.lock` itself (`--share=network` while building); a Flathub build would vendor them instead. The sandbox gets one permission beyond a display, and no network:
 
-- **The network.** The app only talks to `127.0.0.1`, but Flatpak can't limit it to loopback: without network access the sandbox has a loopback of its own, where the service isn't. So it shares the host's whole network. A Unix socket in the runtime directory would drop this too ([#36](https://github.com/jmarrero-bot/work-tracker-poc/issues/36)).
-- **The service's runtime directory, read-only** (`$XDG_RUNTIME_DIR/workboard`), for the token, which the service replaces on every start. The data directory, with the database and the credentials, stays out of the sandbox.
+- **The service's runtime directory, read-only** (`$XDG_RUNTIME_DIR/workboard`), for its socket. Connecting to a Unix socket needs no write access to the file system it is on. The data directory, with the database and the credentials, stays out of the sandbox.
 
 Notifications, opening links and running in the background go through the desktop portals. The service has to run in the same login session, so the runtime directory is the app's; a toolbox shares it.
 
 ## Testing
 
-`cargo test -p workboard-gnome` tests the API client against a local fake server, parses recorded answers of the service, and tests the view models (outcomes, reasons, freshness, sync and hub status, the inbox's groups) and which items get announced, without a display.
+`cargo test -p workboard-gnome` tests the API client against a fake service on a Unix socket, parses recorded answers of the service, and tests the view models (outcomes, reasons, freshness, sync and hub status, the inbox's groups) and which items get announced, without a display.
 
-CI also runs `tests/gnome_smoke.py`: a hub and a companion on loopback with a demo connector plugin, and the app against them on a virtual X server. It checks that the app reads what both services answer with the token from the runtime directory alone, that it starts and keeps running, that a new Mine item is announced once and not again after a restart, also with the window closed and no refresh asked for, that `--background` starts it without a window, and that GTK and libadwaita warn of nothing, such as content wider than 360 pixels. It takes screenshots of each view, in the light and dark styles and at a phone's width, uploaded as the `gnome-screenshots` artifact. CI can't reach GitHub, so the bot's part of the screenshots is canned, added by a proxy in front of the companion. The `flatpak` job builds the Flatpak; the Background portal is only reached there, and isn't tested in CI.
+CI also runs `tests/gnome_smoke.py`: a hub and a companion on loopback with a demo connector plugin, and the app against them on a virtual X server. It checks that the app reads what both services answer through their sockets in the runtime directory alone, that it starts and keeps running, that a new Mine item is announced once and not again after a restart, also with the window closed and no refresh asked for, that `--background` starts it without a window, and that GTK and libadwaita warn of nothing, such as content wider than 360 pixels. It takes screenshots of each view, in the light and dark styles and at a phone's width, uploaded as the `gnome-screenshots` artifact. CI can't reach GitHub, so the bot's part of the screenshots is canned, added by a proxy on a socket of its own in front of the companion. The `flatpak` job builds the Flatpak; the Background portal is only reached there, and isn't tested in CI.
 
 ## Credentials
 
-The app holds no credential of its own: it reads the service's token, a file, each time. The service can keep the connections' credentials in GNOME Keyring, after `workboard credentials migrate --to keyring` with the service stopped; see the README's [Authentication and storage](../README.md#authentication-and-storage).
+The app holds no credential of its own, and reads none: the service's socket takes it by its user. The service can keep the connections' credentials in GNOME Keyring, after `workboard credentials migrate --to keyring` with the service stopped; see the README's [Authentication and storage](../README.md#authentication-and-storage).
 
 ## Not done yet
 

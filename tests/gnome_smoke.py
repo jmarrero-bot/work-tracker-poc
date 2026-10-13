@@ -8,7 +8,7 @@ Run it in a session bus, with an X server it starts itself (Xvfb):
         target/debug/workboard-gnome SCREENSHOT_DIR
 
 It checks that the app reads everything the service answers (`--check`, on
-the companion and on the hub, with the token the service put in the
+the companion and on the hub, through the socket the service put in the
 session's runtime directory), that it starts and keeps running, that it
 announces a new Mine item once, and not again after a restart, also with
 its window closed, that it starts without a window with --background, and
@@ -17,19 +17,21 @@ in the light style, some in the dark one, and Mine at a phone's width.
 
 The companion and the hub get their work from a demo connector plugin.
 The bot's work comes from GitHub, which CI can't reach, so a proxy in front
-of the companion adds a canned bot connection to what the app reads; the
+of the companion, on a socket of its own where the app looks for another
+port's service, adds a canned bot connection to what the app reads; the
 `--check` runs read the services directly."""
 import json
 import os
 from pathlib import Path
 import shutil
 import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -191,9 +193,10 @@ def bot_answers(now):
 
 
 class Proxy(BaseHTTPRequestHandler):
-    """Forwards to the companion, adding the canned bot to what the app
-    reads."""
+    """Forwards to the companion's port, with its token, adding the canned
+    bot to what the app reads."""
     port = None
+    token = None
 
     def do_GET(self):
         self.forward()
@@ -204,6 +207,7 @@ class Proxy(BaseHTTPRequestHandler):
     def forward(self):
         body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
         headers = {k: v for k, v in self.headers.items() if k.lower() not in ('host', 'connection', 'content-length')}
+        headers['Authorization'] = 'Bearer ' + self.token
         request = Request(f'http://127.0.0.1:{self.port}{self.path}', data=body or None, headers=headers, method=self.command)
         try:
             response = urlopen(request, timeout=60)
@@ -230,6 +234,14 @@ class Proxy(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    def address_string(self):
+        # A Unix socket's peer has no address.
+        return 'socket'
+
+
+class UnixProxy(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
 
 
 NOTIFICATIONS_XML = '''<node><interface name="org.freedesktop.Notifications">
@@ -360,8 +372,8 @@ with tempfile.TemporaryDirectory(prefix='workboard-gnome-smoke-') as folder:
     folder = Path(folder)
     shots.mkdir(parents=True, exist_ok=True)
     display = os.environ['DISPLAY'] = ':99'
-    # The session's runtime directory, where each service also puts its
-    # token; inherited by everything below.
+    # The session's runtime directory, where each service puts its socket;
+    # inherited by everything below.
     runtime = folder / 'runtime'
     runtime.mkdir(mode=0o700)
     os.environ['XDG_RUNTIME_DIR'] = str(runtime)
@@ -380,8 +392,8 @@ with tempfile.TemporaryDirectory(prefix='workboard-gnome-smoke-') as folder:
         companion.cli('hub', 'set', f'http://127.0.0.1:{hub.port}/', '--token-stdin', input=hub.cli('companion-token'))
         companion.sync()
 
-        # The app reads what each service answers, as it is, with the token
-        # in the runtime directory: no data directory here, as in the
+        # The app reads what each service answers, as it is, through the
+        # socket in the runtime directory: no data directory here, as in the
         # Flatpak.
         nowhere = folder / 'nowhere'
         for service, expected in [(companion, 'hub set'), (hub, 'hub not set')]:
@@ -394,7 +406,11 @@ with tempfile.TemporaryDirectory(prefix='workboard-gnome-smoke-') as folder:
         assert missing.returncode != 0 and 'start `workboard serve`' in missing.stderr, missing
 
         Proxy.port = companion.port
-        proxy = ThreadingHTTPServer(('127.0.0.1', 0), Proxy)
+        Proxy.token = (companion.root / 'service.token').read_text().strip()
+        # The app finds the proxy by the port it is given, with no data
+        # directory to name the companion's own socket, as in the Flatpak.
+        proxy_port = free_port()
+        proxy = UnixProxy(str(runtime / 'workboard' / f'service-{proxy_port}.sock'), Proxy)
         threading.Thread(target=proxy.serve_forever, daemon=True).start()
         notifications = Notifications()
 
@@ -407,7 +423,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-gnome-smoke-') as folder:
         notified = folder / 'state' / 'workboard-gnome' / 'notified.json'
 
         # The first run records what waits, and announces none of it.
-        first = App(companion.root, proxy.server_address[1], env)
+        first = App(nowhere, proxy_port, env)
         wait_for('the first answer', notified.exists)
         time.sleep(1)
         assert notifications.received == [], notifications.received
@@ -433,7 +449,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-gnome-smoke-') as folder:
         first.quit()
 
         # Not again after a restart; and the dark style.
-        dark = App(companion.root, proxy.server_address[1], dict(env, ADW_DEBUG_COLOR_SCHEME='prefer-dark'))
+        dark = App(nowhere, proxy_port, dict(env, ADW_DEBUG_COLOR_SCHEME='prefer-dark'))
         dark.action('refresh')
         time.sleep(3)
         assert len(notifications.received) == 1, notifications.received
@@ -461,7 +477,7 @@ with tempfile.TemporaryDirectory(prefix='workboard-gnome-smoke-') as folder:
         dark.quit()
 
         # Started in the background, as at login: no window, but running.
-        background = App(companion.root, proxy.server_address[1], env, '--background')
+        background = App(nowhere, proxy_port, env, '--background')
         time.sleep(3)
         background.alive()
         assert window_id() is None
