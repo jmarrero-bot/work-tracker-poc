@@ -62,6 +62,8 @@ const MAX_PEER: usize = 64;
 /// The peer of a request that came straight to the loopback port, not
 /// through the front.
 const DIRECT: &str = "this machine";
+/// The peer of a request through a front that didn't name its address.
+const UNNAMED: &str = "an unnamed peer through the front";
 /// How often expired sessions and sign-ins are swept away.
 pub const SWEEP: Duration = Duration::from_secs(60);
 const MAX_DEVICES: usize = 4;
@@ -191,22 +193,69 @@ fn elapsed(now: SystemTime, then: SystemTime) -> Duration {
     now.duration_since(then).unwrap_or_default()
 }
 
-/// Who sent a request, as the hub's front says: the last `X-Forwarded-For`
-/// entry. `tailscale serve` sets that header itself, to the tailnet address
-/// of the peer, dropping any copy the peer sent, and a proxy that keeps a
-/// peer's copy appends its own entry after it, so a peer can't pass for
-/// another. A request straight to the loopback port has none.
-pub fn peer(headers: &HeaderMap) -> String {
+/// Who sent a request, as the hub's front says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    /// The tailnet address, or [`DIRECT`], or [`UNNAMED`].
+    pub address: String,
+    /// The tailnet user `tailscale serve` names, if it named one.
+    pub tailnet_user: Option<String>,
+}
+
+impl From<&str> for Peer {
+    fn from(address: &str) -> Self {
+        Self {
+            address: address.into(),
+            tailnet_user: None,
+        }
+    }
+}
+
+/// The headers `tailscale serve` names a tailnet user with: their login,
+/// and their display name. It drops any copy a peer sent.
+const TAILNET_USER: [&str; 2] = ["tailscale-user-login", "tailscale-user-name"];
+
+/// The last value of the header `name`, or of its last comma-separated
+/// entry with `last_entry`, bounded and without control characters, if
+/// there is any.
+fn front_header(headers: &HeaderMap, name: &str, last_entry: bool) -> Option<String> {
     let last = headers
-        .get_all("x-forwarded-for")
+        .get_all(name)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
+        .flat_map(|v| match last_entry {
+            true => v.split(',').collect::<Vec<_>>(),
+            false => vec![v],
+        })
         .map(str::trim)
-        .rfind(|s| !s.is_empty());
-    let mut peer = last.unwrap_or(DIRECT).to_string();
-    peer.truncate(MAX_PEER);
-    peer
+        .rfind(|s| !s.is_empty())?;
+    let mut value: String = last.chars().filter(|c| !c.is_control()).collect();
+    value.truncate(MAX_PEER);
+    Some(value)
+}
+
+/// Who sent a request, as the hub's front says: the last `X-Forwarded-For`
+/// entry, and the tailnet user it names. `tailscale serve` sets those
+/// headers itself, to the tailnet address of the peer, dropping any copy
+/// the peer sent, and a proxy that keeps a peer's copy appends its own
+/// entry after it, so a peer can't pass for another.
+///
+/// Only a request `from_front`, any that didn't come straight to the
+/// loopback port without a proxy's headers, has any; one that did is this
+/// machine's. A request through the front is never taken for this
+/// machine's, whatever Host it names, even the loopback one. The service
+/// can't tell a local process that sends a proxy's headers to the port
+/// itself from the front, which also connects on loopback.
+pub fn peer(headers: &HeaderMap, from_front: bool) -> Peer {
+    if !from_front {
+        return Peer::from(DIRECT);
+    }
+    Peer {
+        address: front_header(headers, "x-forwarded-for", true).unwrap_or_else(|| UNNAMED.into()),
+        tailnet_user: TAILNET_USER
+            .iter()
+            .find_map(|name| front_header(headers, name, false)),
+    }
 }
 
 /// Drop the attempts in `attempts` older than [`ATTEMPT_WINDOW`].
@@ -357,7 +406,7 @@ struct Device {
     /// person can tell their own sign-in from another.
     user_code: String,
     /// Who asked for it, as the hub's front says.
-    peer: String,
+    peer: Peer,
     started: SystemTime,
     interval: Duration,
     next_poll: SystemTime,
@@ -389,6 +438,9 @@ pub struct DeviceRequest {
     pub expires: Timestamp,
     /// The tailnet address it came from, or "this machine".
     pub peer: String,
+    /// The tailnet user that asked for it, as `tailscale serve` named them,
+    /// to tell a sign-in someone else started.
+    pub tailnet_user: Option<String>,
     /// The GitHub login that entered the code, once one did.
     pub github_login: Option<String>,
     pub approved: bool,
@@ -721,11 +773,12 @@ impl Logins {
 
     /// Start a companion's device flow: the code its person enters on
     /// GitHub, and the handle the companion polls with.
-    pub async fn device_start(&self, peer: &str) -> Result<DeviceStart, LoginError> {
+    pub async fn device_start(&self, peer: impl Into<Peer>) -> Result<DeviceStart, LoginError> {
+        let peer = peer.into();
         {
             let mut state = self.state();
             let now = self.now();
-            state.device.attempt(now, peer)?;
+            state.device.attempt(now, &peer.address)?;
             state.devices.retain(|_, d| now < d.expires);
         }
         let code = self
@@ -751,7 +804,7 @@ impl Logins {
                 id: new_token(),
                 code: code.device_code,
                 user_code: code.user_code.clone(),
-                peer: peer.to_string(),
+                peer: peer.clone(),
                 started: now,
                 interval: code.interval,
                 next_poll: now + code.interval,
@@ -903,7 +956,8 @@ impl Logins {
                         user_code: d.user_code.clone(),
                         started: Timestamp::of(d.started),
                         expires: Timestamp::of(d.expires),
-                        peer: d.peer.clone(),
+                        peer: d.peer.address.clone(),
+                        tailnet_user: d.peer.tailnet_user.clone(),
                         github_login: d.user.as_ref().map(|u| u.login.clone()),
                         approved: d.approved.is_some(),
                     },
@@ -1508,7 +1562,8 @@ pub mod tests {
         };
         // (X-Forwarded-For headers, the peer)
         for (values, expected) in [
-            (&[][..], DIRECT),
+            // Through a front that names no address, never this machine.
+            (&[][..], UNNAMED),
             (&["100.64.0.7"][..], "100.64.0.7"),
             // A peer's own copy can't pass for another peer: the front's
             // entry comes last.
@@ -1516,9 +1571,25 @@ pub mod tests {
             (&["100.64.0.1", "100.64.0.7"][..], "100.64.0.7"),
             (&["100.64.0.7, "][..], "100.64.0.7"),
         ] {
-            assert_eq!(peer(&headers(values)), expected, "{values:?}");
+            assert_eq!(peer(&headers(values), true).address, expected, "{values:?}");
+            // Straight to the loopback port, it says nothing.
+            assert_eq!(peer(&headers(values), false), Peer::from(DIRECT));
         }
-        assert_eq!(peer(&headers(&[&"9".repeat(500)])).len(), MAX_PEER);
+        let long = peer(&headers(&[&"9".repeat(500)]), true);
+        assert_eq!(long.address.len(), MAX_PEER);
+        // The tailnet user the front names, its login first.
+        let mut named = headers(&["100.64.0.7"]);
+        named.insert("tailscale-user-name", "Some One".parse().unwrap());
+        assert_eq!(peer(&named, true).tailnet_user.as_deref(), Some("Some One"));
+        named.insert(
+            "tailscale-user-login",
+            "someone@example.com".parse().unwrap(),
+        );
+        assert_eq!(
+            peer(&named, true).tailnet_user.as_deref(),
+            Some("someone@example.com")
+        );
+        assert_eq!(peer(&named, false).tailnet_user, None);
     }
 
     #[tokio::test]
@@ -1684,6 +1755,7 @@ pub mod tests {
                 started,
                 expires,
                 peer: PEER.into(),
+                tailnet_user: None,
                 github_login: None,
                 approved: false,
             }

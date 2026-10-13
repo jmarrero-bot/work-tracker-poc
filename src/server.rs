@@ -153,6 +153,20 @@ impl Access {
             .contains(&host)
             .then(|| format!("https://{host}"))
     }
+    /// Whether a request came straight to the loopback port, not through
+    /// a proxy: under the loopback name, and without any header a proxy
+    /// such as `tailscale serve` adds. A tailnet client can send the proxy
+    /// any Host header, the loopback name included, so the name alone
+    /// never says so.
+    fn direct(&self, headers: &HeaderMap) -> bool {
+        text(headers, header::HOST) == Some(self.local.as_str())
+            && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+    }
+    /// Who sent a request, as the hub's front says, for any request that
+    /// isn't [`Access::direct`], whatever name it came by.
+    fn peer(&self, headers: &HeaderMap) -> login::Peer {
+        login::peer(headers, !self.direct(headers))
+    }
     /// Whether a session cookie set for `host` is marked Secure: under one
     /// of the hub's names, which are only reached over HTTPS.
     fn secure(&self, host: &str) -> bool {
@@ -167,7 +181,7 @@ impl Access {
         // With a GitHub App, the application token is the CLI's, on
         // loopback and not through a proxy; without one, also a paired
         // browser's on the hub's names.
-        let direct = host == self.local && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h));
+        let direct = self.direct(headers);
         let app_token =
             |v: &str| matches_token(v, &self.token) && (direct || self.logins.is_none());
         let bearer_ok = bearer.is_some_and(app_token);
@@ -213,7 +227,9 @@ const PROXY_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-for",
     "x-forwarded-host",
+    "x-forwarded-proto",
     "tailscale-user-login",
+    "tailscale-user-name",
 ];
 /// The header the page sends with its own refreshes, which don't count as
 /// a use of a session.
@@ -1033,7 +1049,7 @@ async fn login_start(State(app): State<App>, headers: HeaderMap) -> Response {
     if let Some(response) = off_sign_in_name(logins, &headers, true) {
         return response;
     }
-    match logins.start(&login::peer(&headers)) {
+    match logins.start(&app.access.peer(&headers).address) {
         Ok((binding, url)) => {
             let mut response = Json(json!({ "url": url.as_str() })).into_response();
             response.headers_mut().insert(
@@ -1061,7 +1077,7 @@ async fn login_callback(
     }
     let finished = logins
         .finish(
-            &login::peer(&headers),
+            &app.access.peer(&headers).address,
             cookie(&headers, login::LOGIN_COOKIE),
             &callback,
         )
@@ -1132,7 +1148,7 @@ async fn device_start(State(app): State<App>, headers: HeaderMap) -> Response {
     if let Some(response) = not_from_companion(&app, &headers) {
         return response;
     }
-    match logins.device_start(&login::peer(&headers)).await {
+    match logins.device_start(app.access.peer(&headers)).await {
         Ok(start) => Json(start).into_response(),
         Err(e) => refusal(e),
     }
@@ -1150,7 +1166,10 @@ async fn device_poll(State(app): State<App>, headers: HeaderMap) -> Response {
     else {
         return Denied::Unauthorized.response();
     };
-    match logins.device_poll(&login::peer(&headers), handle).await {
+    match logins
+        .device_poll(&app.access.peer(&headers).address, handle)
+        .await
+    {
         Ok(poll) => Json(poll).into_response(),
         Err(e) => refusal(e),
     }
@@ -1769,7 +1788,7 @@ mod tests {
             let got = hub.check(&get, "/api/snapshot", &proxied(name));
             assert_eq!(got, Err(Unauthorized), "{name}");
         }
-        assert_eq!(PROXY_HEADERS.len(), 4);
+        assert_eq!(PROXY_HEADERS.len(), 6);
     }
 
     /// An app on a fresh data directory at `root`: a hub reached at `local`
@@ -2433,6 +2452,72 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(all_requests(&logins).is_empty());
         assert_eq!(approve().await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_through_the_front_names_its_peer_whatever_its_host() {
+        use crate::oauth::tests::token_answer;
+        use header::HOST;
+        let root = tempfile::tempdir().unwrap();
+        let (logins, fake, clock) = login::tests::logins(root.path()).await;
+        let router = router(test_app(
+            root.path(),
+            Mode::Hub,
+            LOCAL,
+            Some(logins.clone()),
+        ));
+        let forwarded = header::HeaderName::from_static("x-forwarded-for");
+        let user = header::HeaderName::from_static("tailscale-user-login");
+        // Through `tailscale serve`, which a tailnet client can send the
+        // loopback name.
+        let start = |peer: &'static str| {
+            let router = router.clone();
+            let (forwarded, user) = (forwarded.clone(), user.clone());
+            async move {
+                let headers = [
+                    (HOST, LOCAL),
+                    (forwarded, peer),
+                    (user, "someone-else@example.com"),
+                ];
+                call(&router, Method::POST, "/auth/device", &headers, None).await
+            }
+        };
+        let (status, _, body) = start("100.64.0.66").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let handle = serde_json::from_str::<Value>(&body).unwrap()["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fake.lock().unwrap().polls = [token_answer("ghu_allowed")].into();
+        clock.advance(Duration::from_secs(5));
+        logins
+            .device_poll(login::tests::PEER, &handle)
+            .await
+            .unwrap();
+        let [request] = &all_requests(&logins)[..] else {
+            panic!("one waits")
+        };
+        assert_eq!(request.peer, "100.64.0.66");
+        assert_eq!(
+            request.tailnet_user.as_deref(),
+            Some("someone-else@example.com")
+        );
+        // Its attempts count as that peer's: ten a minute, and another
+        // peer, or this machine, still gets in.
+        for _ in 1..10 {
+            assert_eq!(start("100.64.0.66").await.0, StatusCode::OK);
+        }
+        assert_eq!(start("100.64.0.66").await.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(start("100.64.0.67").await.0, StatusCode::OK);
+        let (status, _, _) = call(
+            &router,
+            Method::POST,
+            "/auth/device",
+            &[(HOST, LOCAL)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// The hub credential a companion keeps, from its data directory.

@@ -543,6 +543,7 @@ type DeviceRequest = {
   started: string;
   expires: string;
   peer: string;
+  tailnet_user: string | null;
   github_login: string | null;
   approved: boolean;
 };
@@ -604,7 +605,9 @@ function CompanionSignIns() {
         sign-in whose code your own <code>workboard hub login</code> printed.
         {waiting.map((r) => (
           <span className="sign-in" key={r.id}>
-            <code>{r.user_code}</code> from {r.peer}, started{" "}
+            <code>{r.user_code}</code> from{" "}
+            {r.tailnet_user ? <strong>{r.tailnet_user}</strong> : "an unnamed peer"}{" "}
+            at {r.peer}, started{" "}
             {new Date(r.started).toLocaleTimeString()}, code entered on GitHub
             as <strong>{r.github_login}</strong>
             <button onClick={() => choose(r.id, "approve")}>Approve</button>
