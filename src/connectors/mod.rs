@@ -14,7 +14,7 @@ use crate::{
     connector::{
         Account, Connector, ConnectorError, ConnectorResult, ErrorKind, Refreshed, Target,
     },
-    model::{is_gitlab, valid_provider, BotConfig},
+    model::{is_gitlab, valid_provider, BotConfig, Connection},
 };
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, Response, StatusCode};
@@ -86,12 +86,29 @@ pub struct Shared {
     forgejo: Arc<forgejo::Memory>,
 }
 
+/// What a connector is built from besides its provider: its connection's
+/// own settings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Settings<'a> {
+    /// For the bot: where its board, tracker and heartbeat are.
+    pub bot: Option<&'a BotConfig>,
+}
+
+impl<'a> Settings<'a> {
+    /// The settings of connection `c`.
+    pub fn of(c: &'a Connection) -> Self {
+        Self {
+            bot: c.bot.as_ref(),
+        }
+    }
+}
+
 /// The connector for a provider: built in for Jira, GitLab, GitHub, Fedora
-/// Forge and the bot, which reads where `bot` says, otherwise the plugin
-/// named after the provider in `plugins`, if there is one.
+/// Forge and the bot, which reads where its settings say, otherwise the
+/// plugin named after the provider in `plugins`, if there is one.
 pub fn for_provider(
     provider: &str,
-    bot: Option<&BotConfig>,
+    settings: Settings,
     plugins: &Path,
     shared: &Shared,
 ) -> Result<Box<dyn Connector>> {
@@ -100,7 +117,7 @@ pub fn for_provider(
         p if is_gitlab(p) => Box::new(gitlab::GitLab::new()?),
         "github" => Box::new(github::GitHub::new(shared.github.clone())?),
         "bot" => {
-            let config = bot.context(
+            let config = settings.bot.context(
                 "A bot connection needs the bot's board, tracker, heartbeat issue, login and forge organization",
             )?;
             Box::new(github::Bot::new(shared.github.clone(), config.clone())?)
@@ -379,8 +396,9 @@ mod tests {
             ("bot", Some(&wrong), None),
             ("bugzilla", None, None),
         ] {
+            let settings = Settings { bot };
             assert_eq!(
-                for_provider(provider, bot, plugins.path(), &Shared::default())
+                for_provider(provider, settings, plugins.path(), &Shared::default())
                     .ok()
                     .map(|c| c.kind().to_string())
                     .as_deref(),
@@ -391,8 +409,9 @@ mod tests {
         // The built-in GitHub, Forgejo and bot connectors, which count what
         // they send, and not the plugins of those names.
         for (provider, bot) in [("github", None), ("fedora", None), ("bot", Some(&config))] {
+            let settings = Settings { bot };
             let connector =
-                for_provider(provider, bot, plugins.path(), &Shared::default()).unwrap();
+                for_provider(provider, settings, plugins.path(), &Shared::default()).unwrap();
             assert!(connector.requests().is_some(), "{provider}");
         }
     }

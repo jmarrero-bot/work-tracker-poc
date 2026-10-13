@@ -14,11 +14,14 @@
 use crate::{
     bot::{self, AgentRuns, BoardSummary},
     clock::{Clock, Timestamp},
-    connector::{self, Connector, Credential, Requests, Target},
-    connectors,
+    connector::{self, Account, Connector, Credential, Requests, Target},
+    connectors::{self, Settings},
     db::Db,
     hub::{self, Pull},
-    model::{BotConfig, Connection, ErrorKind, Item, Schedule, Snapshot, SyncState, WatchList},
+    model::{
+        BotConfig, ConnectInput, Connection, ErrorKind, Item, Schedule, Snapshot, SyncState,
+        WatchList,
+    },
     zone::ExternalSnapshot,
 };
 use anyhow::{bail, Context, Result};
@@ -163,8 +166,9 @@ pub fn freshness(connections: &[Connection], items: &mut [Item]) {
 /// Where the scheduler gets a connector for a provider, and the client it
 /// reads a hub with.
 pub trait Sources: Send + Sync {
-    /// The connector for `provider`; for the bot, reading where `bot` says.
-    fn connector(&self, provider: &str, bot: Option<&BotConfig>) -> Result<Box<dyn Connector>>;
+    /// The connector for `provider`, built with its connection's
+    /// `settings`: for the bot, reading where they say.
+    fn connector(&self, provider: &str, settings: Settings) -> Result<Box<dyn Connector>>;
     fn hub(&self) -> Result<Box<dyn Pull>>;
 }
 
@@ -176,12 +180,19 @@ pub struct Builtin {
 }
 
 impl Sources for Builtin {
-    fn connector(&self, provider: &str, bot: Option<&BotConfig>) -> Result<Box<dyn Connector>> {
-        connectors::for_provider(provider, bot, &self.plugins, &self.shared)
+    fn connector(&self, provider: &str, settings: Settings) -> Result<Box<dyn Connector>> {
+        connectors::for_provider(provider, settings, &self.plugins, &self.shared)
     }
     fn hub(&self) -> Result<Box<dyn Pull>> {
         Ok(Box::new(hub::HubClient::new()?))
     }
+}
+
+/// A new connection, verified: the account its credential belongs to, and
+/// its settings as they are to be stored.
+pub struct Verified {
+    pub account: Account,
+    pub bot: Option<BotConfig>,
 }
 
 /// What started a sync.
@@ -372,9 +383,20 @@ impl Scheduler {
     pub fn now(&self) -> Timestamp {
         Timestamp::of(self.clock.now())
     }
-    /// The connector for `provider`.
-    pub fn connector(&self, provider: &str, bot: Option<&BotConfig>) -> Result<Box<dyn Connector>> {
-        self.sources.connector(provider, bot)
+    /// Check a new connection before it is stored: whose account the
+    /// credential in `target` belongs to, with the connector `input` asks
+    /// for, built with its bot settings `bot`, already checked. Its
+    /// settings come back as they are to be stored.
+    pub async fn verify_new(
+        &self,
+        input: &ConnectInput,
+        bot: Option<BotConfig>,
+        target: &Target,
+    ) -> Result<Verified> {
+        let settings = Settings { bot: bot.as_ref() };
+        let source = self.sources.connector(&input.provider, settings)?;
+        let account = connector::verify(source.as_ref(), target).await?;
+        Ok(Verified { account, bot })
     }
     /// Look at the schedule again, as after a connection was added or
     /// changed.
@@ -719,7 +741,7 @@ impl Scheduler {
             Err(e) => return Report::new(id, id, trigger).failed(&e),
         };
         let mut report = Report::new(id, &c.label, trigger);
-        let source = self.sources.connector(&c.provider, c.bot.as_ref());
+        let source = self.sources.connector(&c.provider, Settings::of(&c));
         let result = async {
             let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
             let target = Target::new(&c.base_url, &token?)?;
@@ -805,7 +827,7 @@ impl Scheduler {
                 None => stored?,
             },
         )?;
-        let source = self.sources.connector(&c.provider, c.bot.as_ref())?;
+        let source = self.sources.connector(&c.provider, Settings::of(&c))?;
         let account = connector::verify(source.as_ref(), &target).await?;
         if account.id != c.account_id {
             bail!(
@@ -1071,7 +1093,7 @@ mod tests {
     struct FakeSources(Arc<World>);
 
     impl Sources for FakeSources {
-        fn connector(&self, _: &str, _: Option<&BotConfig>) -> Result<Box<dyn Connector>> {
+        fn connector(&self, _: &str, _: Settings) -> Result<Box<dyn Connector>> {
             Ok(Box::new(Fake(self.0.clone())))
         }
         fn hub(&self) -> Result<Box<dyn Pull>> {
